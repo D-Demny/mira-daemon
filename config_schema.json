@@ -202,16 +202,6 @@
               ],
               "default": "zeroconf"
             },
-            "interactive": {
-              "type": "object",
-              "description": "Authenticate with the interactive browser UI",
-              "properties": {
-                "callback_port": {
-                  "type": "integer",
-                  "default": 0
-                }
-              }
-            },
             "spotify_token": {
               "type": "object",
               "description": "Authentication with username and access token",

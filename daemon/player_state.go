@@ -2,13 +2,12 @@ package daemon
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/dealer"
-	"github.com/devgianlu/go-librespot/player"
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
-	"github.com/devgianlu/go-librespot/tracks"
 )
 
 type State struct {
@@ -18,16 +17,124 @@ type State struct {
 	device *connectpb.DeviceInfo
 	player *connectpb.PlayerState
 
-	tracks  *tracks.List
 	queueID uint64
 
 	lastCommand           *dealer.RequestPayload
 	lastTransferTimestamp int64
+
+	// remoteState tracks what is playing on another device when in observer mode.
+	remoteState *RemoteState
 }
 
-// Set the IsPaused flag, and also the PlaybackSpeed as well.
-// PlaybackSpeed must be 0 when paused, or Spotify Android will have subtle
-// bugs.
+// RemoteState holds information about the playback state of the currently active remote device. 
+// This is populated from ClusterUpdate messages
+type RemoteState struct {
+	// DeviceId of the active device.
+	DeviceId string
+	// DeviceName of the active device (human readable).
+	DeviceName string
+	// DeviceType of the active device (e.g. "COMPUTER", "SMARTPHONE").
+	DeviceType string
+
+	// TrackUri is the Spotify URI of the current track (e.g. "spotify:track:xxx").
+	TrackUri string
+	// TrackName from the ProvidedTrack metadata.
+	TrackName string
+	// TrackArtist from the ProvidedTrack metadata.
+	TrackArtist string
+	// TrackAlbum from the ProvidedTrack metadata.
+	TrackAlbum string
+	// TrackImageUrl from the ProvidedTrack metadata.
+	TrackImageUrl string
+
+	// ContextUri is what context is playing (playlist, album, etc).
+	ContextUri string
+
+	// Duration of the current track in milliseconds.
+	Duration int64
+	// PositionAsOfTimestamp is the playback position at the time of Timestamp.
+	PositionAsOfTimestamp int64
+	// Timestamp is the server-side unix timestamp (ms) when position was captured.
+	Timestamp int64
+	// IsPlaying indicates whether the remote device is actively playing.
+	IsPlaying bool
+	// IsPaused indicates whether the remote device is paused.
+	IsPaused bool
+	// PlaybackSpeed is the playback speed (0 when paused, 1 when playing).
+	PlaybackSpeed float64
+
+	// ShuffleContext indicates whether shuffle is enabled.
+	ShuffleContext bool
+	// RepeatContext indicates whether repeat context is enabled.
+	RepeatContext bool
+	// RepeatTrack indicates whether repeat track is enabled.
+	RepeatTrack bool
+
+	// from PlayerState.Restrictions.DisallowSkipping*Reasons
+	DisallowSkipPrev bool
+	DisallowSkipNext bool
+	DisallowSeek     bool
+
+	// surrounding queue capped at QueueLimit per direction, for art/lyrics prefetch
+	PrevTracks []QueueTrack
+	NextTracks []QueueTrack
+
+	// RawMetadata contains all metadata keys from the ProvidedTrack for debugging
+	RawMetadata map[string]string
+}
+
+// lightweight projection of ProvidedTrack, just what the UI needs for thumbnails + prefetch
+type QueueTrack struct {
+	Uri      string `json:"uri"`
+	TrackId  string `json:"track_id"`
+	Name     string `json:"name"`
+	Artist   string `json:"artist"`
+	Album    string `json:"album"`
+	ImageUrl string `json:"image_url"`
+}
+
+// max entries per direction, UI only prefetches a handful
+const QueueLimit = 10
+
+// projects ProvidedTracks to QueueTracks, skips entries with no URI
+func projectQueue(tracks []*connectpb.ProvidedTrack, limit int) []QueueTrack {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]QueueTrack, 0, min(len(tracks), limit))
+	for _, t := range tracks {
+		if t == nil || t.Uri == "" {
+			continue
+		}
+		if len(out) >= limit {
+			break
+		}
+		var name, artist, album, imageUrl string
+		if t.Metadata != nil {
+			name = t.Metadata["title"]
+			artist = t.Metadata["artist_name"]
+			album = t.Metadata["album_title"]
+			if img, ok := t.Metadata["image_url"]; ok && img != "" {
+				imageUrl = convertSpotifyImageUrl(img)
+			}
+		}
+		trackId := ""
+		if parts := strings.SplitN(t.Uri, ":", 3); len(parts) == 3 {
+			trackId = parts[2]
+		}
+		out = append(out, QueueTrack{
+			Uri:      t.Uri,
+			TrackId:  trackId,
+			Name:     name,
+			Artist:   artist,
+			Album:    album,
+			ImageUrl: imageUrl,
+		})
+	}
+	return out
+}
+
+// Set the IsPaused flag
 func (s *State) setPaused(val bool) {
 	s.player.IsPaused = val
 	if val {
@@ -73,15 +180,14 @@ func (s *State) trackPosition() int64 {
 	now := time.Now().UnixMilli()
 	elapsed := now - s.player.Timestamp
 
-	// Validate timestamp freshness: if elapsed time exceeds 10 minutes (600000ms),
-	// timestamp is likely stale (e.g., from a previous session), use raw position
+	// Validate timestamp freshness
 	const maxReasonableElapsed = 10 * 60 * 1000 // 10 minutes in milliseconds
 	if elapsed > maxReasonableElapsed || elapsed < 0 {
 		return s.player.PositionAsOfTimestamp
 	}
 
 	calculated := s.player.PositionAsOfTimestamp + elapsed
-	// Ensure position is non-negative (shouldn't happen, but defensive)
+	// clamp negative positions, defensive against clock skew
 	if calculated < 0 {
 		return s.player.PositionAsOfTimestamp
 	}
@@ -89,19 +195,14 @@ func (s *State) trackPosition() int64 {
 	return calculated
 }
 
-// Update timestamp, and updating the player position timestamp according to how
-// much time has passed since the last update.
+// Update timestamp, and updating the player position timestamp
 func (s *State) updateTimestamp() {
-	// Use single timestamp throughout, for consistency.
 	now := time.Now()
 
-	// How many milliseconds the playback has advanced since the last update to
-	// PositionAsOfTimestamp.
+	// How many milliseconds the playback has advanced
 	advancedTimeMillis := now.UnixMilli() - s.player.Timestamp
 
-	// How far the playback position has advanced during that time.
-	// (For example, PlaybackSpeed is 0 when paused so the position doesn't
-	// change).
+	// How far the playback position has advanced during that time
 	advancedPositionMillis := int64(float64(advancedTimeMillis) * s.player.PlaybackSpeed)
 
 	// Update the timestamps accordingly.
@@ -114,11 +215,13 @@ func (s *State) playOrigin() string {
 }
 
 func (p *AppPlayer) initState() {
+	canBePlayer := !p.app.cfg.ObserverMode
+
 	p.state = &State{
 		lastCommand: nil,
 		device: &connectpb.DeviceInfo{
-			CanPlay:               true,
-			Volume:                player.MaxStateVolume,
+			CanPlay:               canBePlayer,
+			Volume:                MaxStateVolume,
 			Name:                  p.app.cfg.DeviceName,
 			DeviceId:              p.app.deviceId,
 			DeviceType:            p.app.deviceType,
@@ -126,23 +229,23 @@ func (p *AppPlayer) initState() {
 			ClientId:              librespot.ClientIdHex,
 			SpircVersion:          "3.2.6",
 			Capabilities: &connectpb.Capabilities{
-				CanBePlayer:                true,
+				CanBePlayer:                canBePlayer,
 				RestrictToLocal:            false,
 				GaiaEqConnectId:            true,
-				SupportsLogout:             p.app.cfg.ZeroconfEnabled,
+				SupportsLogout:             false,
 				IsObservable:               true,
-				VolumeSteps:                int32(p.app.cfg.VolumeSteps),
+				VolumeSteps:                100,
 				SupportedTypes:             []string{"audio/track", "audio/episode"},
 				CommandAcks:                true,
 				SupportsRename:             false,
-				Hidden:                     false,
-				DisableVolume:              false,
+				Hidden:                     p.app.cfg.ObserverMode,
+				DisableVolume:              p.app.cfg.ObserverMode,
 				ConnectDisabled:            false,
 				SupportsPlaylistV2:         true,
-				IsControllable:             true,
+				IsControllable:             !p.app.cfg.ObserverMode,
 				SupportsExternalEpisodes:   false, // TODO: support external episodes
 				SupportsSetBackendMetadata: true,
-				SupportsTransferCommand:    true,
+				SupportsTransferCommand:    !p.app.cfg.ObserverMode,
 				SupportsCommandRequest:     true,
 				IsVoiceEnabled:             false,
 				NeedsFullPlayerState:       false,
@@ -156,9 +259,27 @@ func (p *AppPlayer) initState() {
 	p.state.reset()
 }
 
+// RemotePosition computes the current playback position of the remote device
+func (rs *RemoteState) RemotePosition() int64 {
+	if rs == nil {
+		return 0
+	}
+	if rs.IsPaused || !rs.IsPlaying {
+		return rs.PositionAsOfTimestamp
+	}
+
+	now := time.Now().UnixMilli()
+	elapsed := now - rs.Timestamp
+	if elapsed < 0 || elapsed > 10*60*1000 {
+		return rs.PositionAsOfTimestamp
+	}
+
+	return rs.PositionAsOfTimestamp + int64(float64(elapsed)*rs.PlaybackSpeed)
+}
+
 func (p *AppPlayer) updateState(ctx context.Context) {
 	if err := p.putConnectState(ctx, connectpb.PutStateReason_PLAYER_STATE_CHANGED); err != nil {
-		p.app.log.WithError(err).Error("failed put state after update")
+		p.app.log.Errorf("failed put state after update: %v", err)
 	}
 }
 
@@ -176,9 +297,6 @@ func (p *AppPlayer) putConnectState(ctx context.Context, reason connectpb.PutSta
 	if t := p.state.activeSince; !t.IsZero() {
 		putStateReq.StartedPlayingAt = uint64(t.UnixMilli())
 	}
-	if t := p.player.HasBeenPlayingFor(); t > 0 {
-		putStateReq.HasBeenPlayingForMs = uint64(t.Milliseconds())
-	}
 
 	putStateReq.IsActive = p.state.active
 	putStateReq.Device = &connectpb.Device{
@@ -191,6 +309,6 @@ func (p *AppPlayer) putConnectState(ctx context.Context, reason connectpb.PutSta
 		putStateReq.LastCommandSentByDeviceId = p.state.lastCommand.SentByDeviceId
 	}
 
-	// finally send the state update
+	// send the state update
 	return p.sess.Spclient().PutConnectState(ctx, p.spotConnId, putStateReq)
 }

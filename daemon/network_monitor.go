@@ -1,0 +1,86 @@
+package daemon
+
+import (
+	"context"
+	"os/exec"
+	"time"
+
+	librespot "github.com/devgianlu/go-librespot"
+)
+
+// pinged once a second to test internet reachability
+const networkMonitorTarget = "1.1.1.1"
+
+// startNetworkMonitor pings + emits network_status on transition
+func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition func(online bool)) {
+	const (
+		interval       = 1 * time.Second
+		failThreshold  = 5
+		rebroadcastSec = 15
+	)
+
+	go func() {
+		var (
+			online        bool
+			failCount     int
+			emitted       bool
+			tickSinceEmit int
+		)
+
+		ping := func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "1", networkMonitorTarget)
+			return cmd.Run() == nil
+		}
+
+		emit := func(status string) {
+			server.Emit(&ApiEvent{
+				Type: ApiEventTypeNetworkStatus,
+				Data: map[string]string{"status": status},
+			})
+			tickSinceEmit = 0
+		}
+
+		for {
+			ok := ping()
+			if ok {
+				failCount = 0
+				if !online || !emitted {
+					online = true
+					emitted = true
+					log.Info("network: online")
+					emit("online")
+					if onTransition != nil {
+						onTransition(true)
+					}
+				}
+			} else {
+				failCount++
+				if failCount >= failThreshold && (online || !emitted) {
+					online = false
+					emitted = true
+					log.Warn("network: offline")
+					emit("offline")
+					if onTransition != nil {
+						onTransition(false)
+					}
+				}
+			}
+
+			// re-broadcast for late WS clients, only once we've determined a state
+			if emitted {
+				tickSinceEmit++
+				if tickSinceEmit >= rebroadcastSec {
+					if online {
+						emit("online")
+					} else {
+						emit("offline")
+					}
+				}
+			}
+
+			time.Sleep(interval)
+		}
+	}()
+}

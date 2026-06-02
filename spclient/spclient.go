@@ -3,7 +3,6 @@ package spclient
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,14 +14,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	librespot "github.com/devgianlu/go-librespot"
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
-	storagepb "github.com/devgianlu/go-librespot/proto/spotify/download"
-	eventsenderpb "github.com/devgianlu/go-librespot/proto/spotify/event_sender"
 	extmetadatapb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
-	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
-	netfortunepb "github.com/devgianlu/go-librespot/proto/spotify/netfortune"
-	playerpb "github.com/devgianlu/go-librespot/proto/spotify/player"
-	playlist4pb "github.com/devgianlu/go-librespot/proto/spotify/playlist4"
-	streamingpb "github.com/devgianlu/go-librespot/proto/spotify/streaming"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -74,7 +66,10 @@ func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.
 	req.Header.Set("Client-Token", c.clientToken)
 
 	if body != nil {
-		req.Header.Set("Content-Type", "application/x-protobuf")
+		// default protobuf, caller can pin json (used by connect-state commands)
+		if _, ok := req.Header["Content-Type"]; !ok {
+			req.Header.Set("Content-Type", "application/x-protobuf")
+		}
 
 		req.GetBody = func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(body)), nil
@@ -202,46 +197,36 @@ func (c *Spclient) PutConnectState(ctx context.Context, spotConnId string, reqPr
 	return nil
 }
 
-func (c *Spclient) ResolveStorageInteractive(ctx context.Context, fileId []byte, format *metadatapb.AudioFile_Format, prefetch bool) (*storagepb.StorageResolveResponse, error) {
-	var path string
-	if prefetch {
-		path = fmt.Sprintf("/storage-resolve/v2/files/audio/interactive_prefetch/%d/%s", format.Number(), hex.EncodeToString(fileId))
-	} else {
-		path = fmt.Sprintf("/storage-resolve/v2/files/audio/interactive/%d/%s", format.Number(), hex.EncodeToString(fileId))
+// SendPlayerCommand sends a Spotify Connect remote-control command,
+// used by observer mode to drive playback without going through the Web API
+func (c *Spclient) SendPlayerCommand(ctx context.Context, fromDeviceId, toDeviceId, spotConnId string, body []byte) error {
+	if fromDeviceId == "" || toDeviceId == "" {
+		return fmt.Errorf("send player command: missing device id (from=%q to=%q)", fromDeviceId, toDeviceId)
 	}
-
-	resp, err := c.Request(ctx, "GET", path, nil, nil, nil)
+	if spotConnId == "" {
+		return fmt.Errorf("send player command: missing spotify-connection-id")
+	}
+	resp, err := c.Request(
+		ctx,
+		"POST",
+		fmt.Sprintf("/connect-state/v1/player/command/from/%s/to/%s", fromDeviceId, toDeviceId),
+		nil,
+		http.Header{
+			"X-Spotify-Connection-Id": []string{spotConnId},
+			"Content-Type":            []string{"application/json"},
+		},
+		body,
+	)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == 503 {
-		c.log.Debugf("storage resolve returned service unavailable, retrying...")
-		_ = resp.Body.Close()
-
-		resp, err = c.Request(ctx, "GET", path, nil, nil, nil)
-		if err != nil {
-			return nil, err
-		}
+	if resp.StatusCode/100 != 2 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("send player command: status %d: %s", resp.StatusCode, string(respBody))
 	}
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("invalid status code from storage resolve: %d", resp.StatusCode)
-	}
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed reading response body: %w", err)
-	}
-
-	var protoResp storagepb.StorageResolveResponse
-	if err := proto.Unmarshal(respBytes, &protoResp); err != nil {
-		return nil, fmt.Errorf("failed unmarshalling StorageResolveResponse: %w", err)
-	}
-
-	return &protoResp, nil
+	return nil
 }
 
 func (c *Spclient) ExtendedMetadata(ctx context.Context, req *extmetadatapb.BatchedEntityRequest) (*extmetadatapb.BatchedExtensionResponse, error) {
@@ -312,184 +297,6 @@ func (c *Spclient) ExtendedMetadataSimple(ctx context.Context, id librespot.Spot
 	return fmt.Errorf("extended metadata with kind %s not found", ext)
 }
 
-func (c *Spclient) PlaylistSignals(ctx context.Context, playlist librespot.SpotifyId, reqProto *playlist4pb.ListSignals, lenses []string) (*playlist4pb.SelectedListContent, error) {
-	if playlist.Type() != librespot.SpotifyIdTypePlaylist {
-		panic(fmt.Sprintf("invalid type: %s", playlist.Type()))
-	}
-
-	reqBody, err := proto.Marshal(reqProto)
-	if err != nil {
-		return nil, fmt.Errorf("failed marshalling ListSignals: %w", err)
-	}
-
-	resp, err := c.Request(ctx, "POST", fmt.Sprintf("/playlist/v2/playlist/%s/signals", playlist.Base62()), nil, http.Header{
-		"Spotify-Apply-Lenses": lenses,
-	}, reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("invalid status code from playlist signals: %d", resp.StatusCode)
-	}
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed reading response body: %w", err)
-	}
-
-	var protoResp playlist4pb.SelectedListContent
-	if err := proto.Unmarshal(respBytes, &protoResp); err != nil {
-		return nil, fmt.Errorf("failed unmarshalling SelectedListContent: %w", err)
-	}
-
-	return &protoResp, nil
-}
-
-func (c *Spclient) ContextResolve(ctx context.Context, uri string) (*connectpb.Context, error) {
-	resp, err := c.Request(ctx, "GET", fmt.Sprintf("/context-resolve/v1/%s", uri), nil, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("invalid status code from context resolve: %d", resp.StatusCode)
-	}
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed reading response body: %w", err)
-	}
-
-	var context connectpb.Context
-	if err := json.Unmarshal(respBytes, &context); err != nil {
-		return nil, fmt.Errorf("failed json unmarshalling Context: %w", err)
-	}
-
-	return &context, nil
-}
-
-func (c *Spclient) ContextResolveAutoplay(ctx context.Context, reqProto *playerpb.AutoplayContextRequest) (*connectpb.Context, error) {
-	reqBody, err := proto.Marshal(reqProto)
-	if err != nil {
-		return nil, fmt.Errorf("failed marshalling AutoplayContextRequest: %w", err)
-	}
-
-	resp, err := c.Request(ctx, "POST", "/context-resolve/v1/autoplay", nil, nil, reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("invalid status code from context resolve autoplay: %d", resp.StatusCode)
-	}
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed reading response body: %w", err)
-	}
-
-	var context connectpb.Context
-	if err := json.Unmarshal(respBytes, &context); err != nil {
-		return nil, fmt.Errorf("failed json unmarshalling Context: %w", err)
-	}
-
-	return &context, nil
-}
-
 func (c *Spclient) GetAccessToken(ctx context.Context, force bool) (string, error) {
 	return c.accessToken(ctx, force)
-}
-
-func (c *Spclient) NetFortune(ctx context.Context, bandwidth int) (*netfortunepb.NetFortuneV2Response, error) {
-	resp, err := c.Request(ctx, "GET", "/net-fortune/v2/fortune", url.Values{
-		"bandwidth": []string{fmt.Sprintf("%d", bandwidth)},
-	}, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("invalid status code from net fortune: %d", resp.StatusCode)
-	}
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed reading response body: %w", err)
-	}
-
-	var fortune netfortunepb.NetFortuneV2Response
-	if err := proto.Unmarshal(respBytes, &fortune); err != nil {
-		return nil, fmt.Errorf("failed json unmarshalling NetFortuneV2Response: %w", err)
-	}
-
-	return &fortune, nil
-}
-
-func (c *Spclient) PublishEvents(ctx context.Context, reqProto *eventsenderpb.PublishEventsRequest) (*eventsenderpb.PublishEventsResponse, error) {
-	reqBody, err := proto.Marshal(reqProto)
-	if err != nil {
-		return nil, fmt.Errorf("failed marshalling PublishEventsRequest: %w", err)
-	}
-
-	resp, err := c.Request(ctx, "POST", "/gabo-receiver-service/v3/events/", nil, nil, reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("invalid status code from gabo events receiver: %d", resp.StatusCode)
-	}
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed reading response body: %w", err)
-	}
-
-	var respProto eventsenderpb.PublishEventsResponse
-	if err := proto.Unmarshal(respBytes, &respProto); err != nil {
-		return nil, fmt.Errorf("failed json unmarshalling PublishEventsResponse: %w", err)
-	}
-
-	return &respProto, nil
-}
-
-func (c *Spclient) PlayPlayRequest(ctx context.Context, fileId []byte, reqProto *streamingpb.PlayPlayLicenseRequest) (*streamingpb.PlayPlayLicenseResponse, error) {
-	reqBody, err := proto.Marshal(reqProto)
-	if err != nil {
-		return nil, fmt.Errorf("failed marshalling PlayPlayLicenseRequest: %w", err)
-	}
-
-	resp, err := c.Request(ctx, "POST", fmt.Sprintf("/playplay/v1/key/%x", fileId), nil, nil, reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("invalid status code from playplay license request: %d", resp.StatusCode)
-	}
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed reading response body: %w", err)
-	}
-
-	var respProto streamingpb.PlayPlayLicenseResponse
-	if err := proto.Unmarshal(respBytes, &respProto); err != nil {
-		return nil, fmt.Errorf("failed json unmarshalling PlayPlayLicenseResponse: %w", err)
-	}
-
-	return &respProto, nil
 }

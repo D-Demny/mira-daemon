@@ -1,6 +1,9 @@
 # IDE files
 *.iml
 /.idea
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
 
 # Configuration files
 /config.yml
@@ -8,8 +11,31 @@
 /state.json
 /lockfile
 
+# Env files (local dev only, never committed)
+.env
+.env.*
+
+# local-only debug probe, gated behind -tags lyricsprobe
+daemon/lyrics_probe.go
+
 # Build files
 /.gocache
 /vcpkg
 /vcpkg_installed
 /dist
+
+# Compiled binaries
+/thing-daemon
+/go-librespot
+/go-librespot-*
+
+# Dev artifacts
+*.cpuprofile
+*.heapsnapshot
+*.heapprofile
+coverage.out
+coverage.html
+
+# OS junk
+.DS_Store
+Thumbs.db

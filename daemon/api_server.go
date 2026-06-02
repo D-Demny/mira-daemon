@@ -9,8 +9,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -22,10 +24,30 @@ import (
 
 const timeout = 10 * time.Second
 
+// returns (required, url, known). known=false while we haven't yet determined auth state
+type AuthStatusFunc func() (required bool, url string, known bool)
+
 type ApiServer interface {
 	Emit(ev *ApiEvent)
 	Receive() <-chan ApiRequest
 	Close() error
+
+	// /auth/status uses this, nil = endpoint returns 503
+	SetAuthHandler(fn AuthStatusFunc)
+
+	// /bluetooth/* uses this, nil = 503
+	SetBluetoothHandler(bm BluetoothHandler)
+
+	// while false, fast-fail 503 instead of hanging during OAuth pairing
+	SetPlayerReady(ready bool)
+
+	// /system/* uses this, nil = 503
+	SetSystemHandler(h SystemHandler)
+}
+
+// destructive whole-device actions
+type SystemHandler interface {
+	PerformReset()
 }
 
 type ConcreteApiServer struct {
@@ -42,6 +64,18 @@ type ConcreteApiServer struct {
 
 	clients     []*websocket.Conn
 	clientsLock sync.RWMutex
+
+	authMu sync.RWMutex
+	authFn AuthStatusFunc
+
+	btMu sync.RWMutex
+	btFn BluetoothHandler
+
+	// read on every channel-bound HTTP request
+	playerReady atomic.Bool
+
+	sysMu sync.RWMutex
+	sysFn SystemHandler
 }
 
 var (
@@ -66,7 +100,6 @@ const (
 	ApiRequestTypePrev                ApiRequestType = "prev"
 	ApiRequestTypeNext                ApiRequestType = "next"
 	ApiRequestTypePlay                ApiRequestType = "play"
-	ApiRequestTypeStop                ApiRequestType = "stop"
 	ApiRequestTypeGetVolume           ApiRequestType = "get_volume"
 	ApiRequestTypeSetVolume           ApiRequestType = "set_volume"
 	ApiRequestTypeSetRepeatingContext ApiRequestType = "repeating_context"
@@ -74,26 +107,38 @@ const (
 	ApiRequestTypeSetShufflingContext ApiRequestType = "shuffling_context"
 	ApiRequestTypeAddToQueue          ApiRequestType = "add_to_queue"
 	ApiRequestTypeToken               ApiRequestType = "token"
-	ApiRequestSetDeviceName           ApiRequestType = "set_device_name"
+	ApiRequestTypeObserverStatus      ApiRequestType = "observer_status"
+	ApiRequestTypeLyrics              ApiRequestType = "lyrics"
 )
 
 type ApiEventType string
 
 const (
-	ApiEventTypePlaying        ApiEventType = "playing"
-	ApiEventTypeNotPlaying     ApiEventType = "not_playing"
-	ApiEventTypeWillPlay       ApiEventType = "will_play"
-	ApiEventTypePaused         ApiEventType = "paused"
-	ApiEventTypeActive         ApiEventType = "active"
-	ApiEventTypeInactive       ApiEventType = "inactive"
-	ApiEventTypeMetadata       ApiEventType = "metadata"
-	ApiEventTypeVolume         ApiEventType = "volume"
-	ApiEventTypeSeek           ApiEventType = "seek"
-	ApiEventTypeStopped        ApiEventType = "stopped"
-	ApiEventTypeRepeatTrack    ApiEventType = "repeat_track"
-	ApiEventTypeRepeatContext  ApiEventType = "repeat_context"
-	ApiEventTypeShuffleContext ApiEventType = "shuffle_context"
-	ApiEventTypePlaybackReady  ApiEventType = "playback_ready"
+	ApiEventTypePlaying              ApiEventType = "playing"
+	ApiEventTypeNotPlaying           ApiEventType = "not_playing"
+	ApiEventTypeWillPlay             ApiEventType = "will_play"
+	ApiEventTypePaused               ApiEventType = "paused"
+	ApiEventTypeActive               ApiEventType = "active"
+	ApiEventTypeInactive             ApiEventType = "inactive"
+	ApiEventTypeMetadata             ApiEventType = "metadata"
+	ApiEventTypeVolume               ApiEventType = "volume"
+	ApiEventTypeSeek                 ApiEventType = "seek"
+	ApiEventTypeStopped              ApiEventType = "stopped"
+	ApiEventTypeRepeatTrack          ApiEventType = "repeat_track"
+	ApiEventTypeRepeatContext        ApiEventType = "repeat_context"
+	ApiEventTypeShuffleContext       ApiEventType = "shuffle_context"
+	ApiEventTypePlaybackReady        ApiEventType = "playback_ready"
+	ApiEventTypeObserverTrackChanged ApiEventType = "observer_track_changed"
+	ApiEventTypeObserverStateChanged ApiEventType = "observer_state_changed"
+
+	ApiEventTypeBluetoothPairing           ApiEventType = "bluetooth/pairing"
+	ApiEventTypeBluetoothPairingCancelled  ApiEventType = "bluetooth/pairing/cancelled"
+	ApiEventTypeBluetoothPaired            ApiEventType = "bluetooth/paired"
+	ApiEventTypeBluetoothConnect           ApiEventType = "bluetooth/connect"
+	ApiEventTypeBluetoothDisconnect        ApiEventType = "bluetooth/disconnect"
+	ApiEventTypeBluetoothNetworkConnect    ApiEventType = "bluetooth/network/connect"
+	ApiEventTypeBluetoothNetworkDisconnect ApiEventType = "bluetooth/network/disconnect"
+	ApiEventTypeNetworkStatus              ApiEventType = "network_status"
 )
 
 type ApiRequest struct {
@@ -137,6 +182,14 @@ type ApiRequestDataWebApi struct {
 	Method string
 	Path   string
 	Query  url.Values
+}
+
+type ApiRequestDataLyrics struct {
+	TrackId    string
+	TrackName  string
+	ArtistName string
+	AlbumName  string
+	DurationMs int
 }
 
 type ApiRequestDataPlay struct {
@@ -378,7 +431,62 @@ func (s *StubApiServer) Close() error {
 	return nil
 }
 
+func (s *StubApiServer) SetAuthHandler(_ AuthStatusFunc) {}
+
+func (s *StubApiServer) SetPlayerReady(_ bool) {}
+
+func (s *StubApiServer) SetSystemHandler(_ SystemHandler) {}
+
+func (s *StubApiServer) SetBluetoothHandler(_ BluetoothHandler) {}
+
+func (s *ConcreteApiServer) SetAuthHandler(fn AuthStatusFunc) {
+	s.authMu.Lock()
+	s.authFn = fn
+	s.authMu.Unlock()
+}
+
+func (s *ConcreteApiServer) getAuthHandler() AuthStatusFunc {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.authFn
+}
+
+// while false, channel-bound endpoints short-circuit instead of blocking
+func (s *ConcreteApiServer) SetPlayerReady(ready bool) {
+	s.playerReady.Store(ready)
+}
+
+func (s *ConcreteApiServer) SetBluetoothHandler(bm BluetoothHandler) {
+	s.btMu.Lock()
+	s.btFn = bm
+	s.btMu.Unlock()
+}
+
+func (s *ConcreteApiServer) getBluetoothHandler() BluetoothHandler {
+	s.btMu.RLock()
+	defer s.btMu.RUnlock()
+	return s.btFn
+}
+
+func (s *ConcreteApiServer) SetSystemHandler(h SystemHandler) {
+	s.sysMu.Lock()
+	s.sysFn = h
+	s.sysMu.Unlock()
+}
+
+func (s *ConcreteApiServer) getSystemHandler() SystemHandler {
+	s.sysMu.RLock()
+	defer s.sysMu.RUnlock()
+	return s.sysFn
+}
+
 func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter) {
+	// pre-session, nobody is reading the channel yet, fail fast
+	if !s.playerReady.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
 	req.resp = make(chan apiResponse, 1)
 	s.requests <- req
 	resp := <-req.resp
@@ -461,6 +569,80 @@ func (s *ConcreteApiServer) serve() {
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeStatus}, w)
 	})
+	m.HandleFunc("/observer/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		// pre-session fast path so the frontend can route to auth/idle
+		if !s.playerReady.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"active":  false,
+				"message": "starting up",
+			})
+			return
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeObserverStatus}, w)
+	})
+	// /auth/status must answer before any AppPlayer exists
+	m.HandleFunc("/auth/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		fn := s.getAuthHandler()
+		if fn == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		required, url, known := fn()
+		resp := map[string]any{
+			"required": required,
+			"loading":  !known,
+		}
+		if required && url != "" {
+			resp["url"] = url
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	m.HandleFunc("/lyrics/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		// extract track ID from path: /lyrics/{trackId}
+		trackId := strings.TrimPrefix(r.URL.Path, "/lyrics/")
+		if trackId == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// get track metadata from query params
+		trackName := r.URL.Query().Get("track")
+		artistName := r.URL.Query().Get("artist")
+		albumName := r.URL.Query().Get("album")
+		durationMs := 0
+		if d := r.URL.Query().Get("duration"); d != "" {
+			if v, err := strconv.Atoi(d); err == nil {
+				durationMs = v
+			}
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeLyrics, Data: ApiRequestDataLyrics{
+			TrackId:    trackId,
+			TrackName:  trackName,
+			ArtistName: artistName,
+			AlbumName:  albumName,
+			DurationMs: durationMs,
+		}}, w)
+	})
 	m.HandleFunc("/player/play", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -495,14 +677,6 @@ func (s *ConcreteApiServer) serve() {
 		}
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypePause}, w)
-	})
-	m.HandleFunc("/player/stop", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-
-		s.handleRequest(ApiRequest{Type: ApiRequestTypeStop}, w)
 	})
 	m.HandleFunc("/player/playpause", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
@@ -649,27 +823,23 @@ func (s *ConcreteApiServer) serve() {
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeToken}, w)
 	})
-	m.HandleFunc("/set_device_name", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+	registerBluetoothRoutes(s.log, m, s.getBluetoothHandler)
+
+	// factory reset, 200 + flush first so the frontend gets a clean response before reboot
+	m.HandleFunc("POST /system/reset", func(w http.ResponseWriter, r *http.Request) {
+		h := s.getSystemHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-
-		var data struct {
-			Name string `json:"name"`
+		s.log.Warn("system: factory reset requested via HTTP")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
 		}
-		if err := jsonDecode(r, &data); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		if len(data.Name) == 0 {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		s.handleRequest(ApiRequest{Type: ApiRequestSetDeviceName, Data: data.Name}, w)
+		go h.PerformReset()
 	})
+
 	m.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		opts := &websocket.AcceptOptions{}
 		if len(s.allowOrigin) > 0 {
