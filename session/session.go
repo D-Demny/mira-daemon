@@ -7,21 +7,13 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/devgianlu/go-librespot/events"
-	"github.com/devgianlu/go-librespot/mercury"
-	"github.com/devgianlu/go-librespot/player"
-
-	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/ap"
 	"github.com/devgianlu/go-librespot/apresolve"
-	"github.com/devgianlu/go-librespot/audio"
 	"github.com/devgianlu/go-librespot/dealer"
 	"github.com/devgianlu/go-librespot/login5"
 	devicespb "github.com/devgianlu/go-librespot/proto/spotify/connectstate/devices"
 	credentialspb "github.com/devgianlu/go-librespot/proto/spotify/login5/v3/credentials"
 	"github.com/devgianlu/go-librespot/spclient"
-	"golang.org/x/oauth2"
-	spotifyoauth2 "golang.org/x/oauth2/spotify"
 )
 
 type Session struct {
@@ -34,12 +26,9 @@ type Session struct {
 	resolver *apresolve.ApResolver
 	login5   *login5.Login5
 
-	ap       *ap.Accesspoint
-	hg       *mercury.Client
-	sp       *spclient.Spclient
-	dealer   *dealer.Dealer
-	audioKey *audio.KeyProvider
-	events   player.EventManager
+	ap     *ap.Accesspoint
+	sp     *spclient.Spclient
+	dealer *dealer.Dealer
 }
 
 func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error) {
@@ -102,62 +91,14 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 			return nil, fmt.Errorf("failed authenticating accesspoint with stored credentials: %w", err)
 		}
 	case InteractiveCredentials:
-		ctx := context.Background()
-		serverCtx, serverCancel := context.WithCancel(ctx)
-
-		callbackPort, codeCh, err := NewOAuth2Server(serverCtx, opts.Log, creds.CallbackPort)
+		// device flow, user authorizes via the QR URL we send to AuthURLCallback.
+		// username left empty, AP fills it via APWelcome from the token itself
+		accessToken, err := runDeviceAuthFlow(ctx, opts.Log, s.client, opts.AuthURLCallback)
 		if err != nil {
-			serverCancel()
-			return nil, fmt.Errorf("failed initializing oauth2 server: %w", err)
+			return nil, fmt.Errorf("device authorization flow failed: %w", err)
 		}
 
-		oauthConf := &oauth2.Config{
-			ClientID:    librespot.ClientIdHex,
-			RedirectURL: fmt.Sprintf("http://127.0.0.1:%d/login", callbackPort),
-			Scopes: []string{
-				"app-remote-control",
-				"playlist-modify",
-				"playlist-modify-private",
-				"playlist-modify-public",
-				"playlist-read",
-				"playlist-read-collaborative",
-				"playlist-read-private",
-				"streaming",
-				"ugc-image-upload",
-				"user-follow-modify",
-				"user-follow-read",
-				"user-library-modify",
-				"user-library-read",
-				"user-modify",
-				"user-modify-playback-state",
-				"user-modify-private",
-				"user-personalized",
-				"user-read-birthdate",
-				"user-read-currently-playing",
-				"user-read-email",
-				"user-read-play-history",
-				"user-read-playback-position",
-				"user-read-playback-state",
-				"user-read-private",
-				"user-read-recently-played",
-				"user-top-read",
-			},
-			Endpoint: spotifyoauth2.Endpoint,
-		}
-
-		verifier := oauth2.GenerateVerifier()
-		url := oauthConf.AuthCodeURL("", oauth2.S256ChallengeOption(verifier))
-		opts.Log.Infof("to complete authentication visit the following link: %s", url)
-
-		code := <-codeCh
-		serverCancel()
-
-		token, err := oauthConf.Exchange(ctx, code, oauth2.VerifierOption(verifier))
-		if err != nil {
-			return nil, fmt.Errorf("failed exchanging oauth2 code: %w", err)
-		}
-
-		if err := s.ap.ConnectSpotifyToken(ctx, token.Extra("username").(string), token.AccessToken); err != nil {
+		if err := s.ap.ConnectSpotifyToken(ctx, "", accessToken); err != nil {
 			return nil, fmt.Errorf("failed authenticating accesspoint interactively: %w", err)
 		}
 	case SpotifyTokenCredentials:
@@ -194,23 +135,10 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 	}
 	s.dealer = dealer.NewDealer(opts.Log, s.client, dealerAddr, s.login5.AccessToken())
 
-	// initialize mercury/hermes
-	s.hg = mercury.NewClient(opts.Log, s.ap)
-
-	// init audio key provider
-	s.audioKey = audio.NewAudioKeyProvider(opts.Log, s.ap)
-
-	// init event sender
-	s.events, err = events.Plugin.NewEventManager(opts.Log, opts.AppState, s.hg, s.sp, s.ap.Username())
-	if err != nil {
-		return nil, fmt.Errorf("failed initializing event sender: %w", err)
-	}
-
 	return &s, nil
 }
 
 func (s *Session) Close() {
-	s.events.Close()
 	s.dealer.Close()
 	s.ap.Close()
 }

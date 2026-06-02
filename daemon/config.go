@@ -7,32 +7,8 @@ type Config struct {
 	DeviceType  string
 	ClientToken string
 
-	AudioBackend              string
-	AudioBackendRuntimeSocket string
-	AudioDevice               string
-	MixerDevice               string
-	MixerControlName          string
-	AudioBufferTime           int
-	AudioPeriodCount          int
-	AudioOutputPipe           string
-	AudioOutputPipeFormat     string
-
-	Bitrate                   int
-	VolumeSteps               uint32
-	InitialVolume             uint32
-	IgnoreLastVolume          bool
-	NormalisationDisabled     bool
-	NormalisationUseAlbumGain bool
-	NormalisationPregain      float32
-	ExternalVolume            bool
-	DisableAutoplay           bool
-
-	ZeroconfEnabled               bool
-	ZeroconfPort                  int
-	ZeroconfBackend               string
-	ZeroconfInterfacesToAdvertise []string
-
-	FlacEnabled bool
+	// ObserverMode when true prevents this device from becoming the active playback device
+	ObserverMode bool
 
 	// ImageSize selects which cover-art image variant the API server returns:
 	// "default", "small", "medium", "large", "xlarge".
@@ -43,20 +19,10 @@ type Config struct {
 
 type CredentialsConfig struct {
 	Type         string
-	Interactive  InteractiveCredentials
 	SpotifyToken SpotifyTokenCredentials
-	Zeroconf     ZeroconfCredentials
-}
-
-type InteractiveCredentials struct {
-	CallbackPort int
 }
 
 type SpotifyTokenCredentials struct {
 	Username    string
 	AccessToken string
-}
-
-type ZeroconfCredentials struct {
-	PersistCredentials bool
 }

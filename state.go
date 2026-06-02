@@ -15,4 +15,7 @@ type AppState struct {
 		Data     []byte `json:"data"`
 	} `json:"credentials"`
 	LastVolume *uint32 `json:"last_volume"`
+
+	// LastBluetoothPanAddress is the MAC of the most recently PAN paired device
+	LastBluetoothPanAddress string `json:"last_bluetooth_pan_address,omitempty"`
 }

@@ -28,11 +28,13 @@ type Options struct {
 
 	// AppState is the app state to use.
 	AppState *librespot.AppState
+
+	// fired with the device-flow verification URL when auth blocks for the user
+	AuthURLCallback func(url string)
 }
 
-type InteractiveCredentials struct {
-	CallbackPort int
-}
+// InteractiveCredentials picks the OAuth2 device flow (RFC 8628), no fields needed
+type InteractiveCredentials struct{}
 
 type SpotifyTokenCredentials struct {
 	Username string

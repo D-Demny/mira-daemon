@@ -1,9 +1,0 @@
-syntax = "proto3";
-
-package spotify.playlist.signal;
-
-message Signal {
-  string identifier = 1;
-  bytes data = 2;
-  bytes client_payload = 3;
-}
