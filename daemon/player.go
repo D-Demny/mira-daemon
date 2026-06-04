@@ -154,9 +154,17 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 
 	activeDeviceId := cluster.ActiveDeviceId
 	var deviceName, deviceType string
+	var volume uint32
+	var volumeDisabled bool
+	var volumeSteps int32
 	if dev, ok := cluster.Device[activeDeviceId]; ok {
 		deviceName = dev.Name
 		deviceType = dev.DeviceType.String()
+		volume = dev.Volume
+		if dev.Capabilities != nil {
+			volumeDisabled = dev.Capabilities.DisableVolume
+			volumeSteps = dev.Capabilities.VolumeSteps
+		}
 	}
 
 	trackUri := ""
@@ -195,6 +203,9 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 		IsPlaying:             !ps.IsPaused && ps.IsPlaying,
 		IsPaused:              ps.IsPaused,
 		PlaybackSpeed:         ps.PlaybackSpeed,
+		Volume:                volume,
+		VolumeDisabled:        volumeDisabled,
+		VolumeSteps:           volumeSteps,
 		ShuffleContext:        ps.Options != nil && ps.Options.ShufflingContext,
 		RepeatContext:         ps.Options != nil && ps.Options.RepeatingContext,
 		RepeatTrack:           ps.Options != nil && ps.Options.RepeatingTrack,
@@ -436,6 +447,10 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			"position":       rs.RemotePosition(),
 			"is_playing":     rs.IsPlaying,
 			"is_paused":      rs.IsPaused,
+			"volume":          rs.Volume,
+			"volume_max":      MaxStateVolume,
+			"volume_disabled": rs.VolumeDisabled,
+			"volume_steps":    rs.VolumeSteps,
 			"shuffle":        rs.ShuffleContext,
 			"repeat_context": rs.RepeatContext,
 			"repeat_track":   rs.RepeatTrack,
@@ -517,8 +532,35 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		val, _ := req.Data.(bool)
 		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "set_repeating_track", Value: val})
 
-	case ApiRequestTypePlay, ApiRequestTypeGetVolume, ApiRequestTypeSetVolume,
-		ApiRequestTypeAddToQueue:
+	case ApiRequestTypeGetVolume:
+		rs := p.state.remoteState
+		if rs == nil || rs.DeviceId == "" {
+			return nil, fmt.Errorf("no active remote device known yet")
+		}
+		return &ApiResponseVolume{Value: rs.Volume, Max: MaxStateVolume}, nil
+
+	case ApiRequestTypeSetVolume:
+		data, _ := req.Data.(ApiRequestDataVolume)
+		rs := p.state.remoteState
+		if rs == nil || rs.DeviceId == "" {
+			return nil, fmt.Errorf("no active remote device known yet")
+		}
+		target := int64(data.Volume)
+		if data.Relative {
+			target = int64(rs.Volume) + int64(data.Volume)
+		}
+		if target < 0 {
+			target = 0
+		}
+		if target > MaxStateVolume {
+			target = MaxStateVolume
+		}
+		// TEMP diagnostic logging while calibrating the volume knob.
+		p.app.log.Infof("set_volume: req={vol:%d rel:%v} deviceVol:%d -> target:%d (%s)",
+			data.Volume, data.Relative, rs.Volume, target, rs.DeviceName)
+		return nil, p.sendActiveDeviceVolume(ctx, target)
+
+	case ApiRequestTypePlay, ApiRequestTypeAddToQueue:
 		return nil, fmt.Errorf("not yet available in observer mode")
 
 	default:
@@ -526,7 +568,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 	}
 }
 
-// connectCommand is the JSON shape of a single Spotify Connect remote-control command
+// connectCommand is the JSON shape of a single Spotify Connect remote-control command.
+// The payload always rides in `value` — there is no dedicated per-command field
+// (see the incoming command schema in dealer/recv.go: RequestPayload.Command has
+// `value`, `position`, etc. but no `volume`). set_volume puts the 0..MaxStateVolume
+// integer in `value` just like seek_to puts the position there.
 type connectCommand struct {
 	Endpoint string `json:"endpoint"`
 	Value    any    `json:"value,omitempty"`
@@ -558,6 +604,31 @@ func (p *AppPlayer) sendActiveDeviceCommand(ctx context.Context, cmd connectComm
 		return fmt.Errorf("send %s to %s: %w", cmd.Endpoint, rs.DeviceId, err)
 	}
 	p.app.log.Debugf("observer: sent %s to %s (%s)", cmd.Endpoint, rs.DeviceId, rs.DeviceName)
+	return nil
+}
+
+// sendActiveDeviceVolume sets the active device's volume using a connect-state endpoint
+func (p *AppPlayer) sendActiveDeviceVolume(ctx context.Context, volume int64) error {
+	rs := p.state.remoteState
+	if rs == nil || rs.DeviceId == "" {
+		return fmt.Errorf("no active remote device known yet")
+	}
+	if rs.DeviceId == p.app.deviceId {
+		return fmt.Errorf("active device is us; cannot remote-control self")
+	}
+	if !p.hasSpotConnId {
+		return fmt.Errorf("dealer not connected (no spotify-connection-id)")
+	}
+
+	body, err := json.Marshal(map[string]int64{"volume": volume})
+	if err != nil {
+		return fmt.Errorf("marshal volume: %w", err)
+	}
+
+	if err := p.sess.Spclient().SetConnectVolume(ctx, p.app.deviceId, rs.DeviceId, p.spotConnId, body); err != nil {
+		return fmt.Errorf("set volume on %s: %w", rs.DeviceId, err)
+	}
+	p.app.log.Debugf("observer: set volume %d on %s (%s)", volume, rs.DeviceId, rs.DeviceName)
 	return nil
 }
 
