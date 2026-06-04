@@ -52,7 +52,12 @@ type LyricsProvider struct {
 	lpMu    sync.Mutex
 	lpToken string
 	lpExp   time.Time
+	// skip primary until this time if we get rate limited
+	lpCooldownUntil time.Time
 }
+
+// how long to skip the primary source after a rate-limit before retrying
+const primaryCooldown = 60 * time.Second
 
 func NewLyricsProvider(logger librespot.Logger) *LyricsProvider {
 	jar, jarErr := cookiejar.New(nil)
@@ -218,11 +223,20 @@ func (lp *LyricsProvider) invalidatePrimaryToken() {
 	defer lp.lpMu.Unlock()
 	lp.lpToken = ""
 	lp.lpExp = time.Time{}
+	// back off so we don't hammer Musixmatch / its token endpoint while rate-limited
+	lp.lpCooldownUntil = time.Now().Add(primaryCooldown)
 }
 
 func (lp *LyricsProvider) fetchPrimary(ctx context.Context, trackName, artistName, albumName string, durationMs int) (*LyricsResult, error) {
 	if lp.lpTokenURL == "" || lp.lpSubtitleURL == "" {
 		return nil, errors.New("primary disabled (no env config)")
+	}
+
+	lp.lpMu.Lock()
+	cooling := time.Now().Before(lp.lpCooldownUntil)
+	lp.lpMu.Unlock()
+	if cooling {
+		return nil, errors.New("primary cooling down after auth/rate-limit error")
 	}
 
 	token, err := lp.getPrimaryToken(ctx)
@@ -300,6 +314,12 @@ func (lp *LyricsProvider) parsePrimaryResponse(body []byte) (*LyricsResult, erro
 	}
 
 	if msg.Header.StatusCode != 200 {
+		// Musixmatch signals a dead/rate-limited usertoken via the in-body
+		// status_code (HTTP stays 200), so the HTTP-level 401 check above never
+		// fires. Invalidate here too, or we reuse the dead token forever.
+		if msg.Header.StatusCode == 401 || msg.Header.StatusCode == 403 {
+			lp.invalidatePrimaryToken()
+		}
 		return nil, fmt.Errorf("primary status %d", msg.Header.StatusCode)
 	}
 
