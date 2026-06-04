@@ -63,6 +63,13 @@ type RemoteState struct {
 	// PlaybackSpeed is the playback speed (0 when paused, 1 when playing).
 	PlaybackSpeed float64
 
+	// Volume of the active device, 0..MaxStateVolume (65535). 0 if unknown.
+	Volume uint32
+	// VolumeDisabled is true when the active device doesn't accept remote volume changes (usually phones with their own speaker)
+	VolumeDisabled bool
+	// VolumeSteps is the devicess advertised volume granularitys
+	VolumeSteps int32
+
 	// ShuffleContext indicates whether shuffle is enabled.
 	ShuffleContext bool
 	// RepeatContext indicates whether repeat context is enabled.

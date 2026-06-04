@@ -229,6 +229,37 @@ func (c *Spclient) SendPlayerCommand(ctx context.Context, fromDeviceId, toDevice
 	return nil
 }
 
+// sets the volume of a remote device
+func (c *Spclient) SetConnectVolume(ctx context.Context, fromDeviceId, toDeviceId, spotConnId string, body []byte) error {
+	if fromDeviceId == "" || toDeviceId == "" {
+		return fmt.Errorf("set connect volume: missing device id (from=%q to=%q)", fromDeviceId, toDeviceId)
+	}
+	if spotConnId == "" {
+		return fmt.Errorf("set connect volume: missing spotify-connection-id")
+	}
+	resp, err := c.Request(
+		ctx,
+		"PUT",
+		fmt.Sprintf("/connect-state/v1/connect/volume/from/%s/to/%s", fromDeviceId, toDeviceId),
+		nil,
+		http.Header{
+			"X-Spotify-Connection-Id": []string{spotConnId},
+			"Content-Type":            []string{"application/json"},
+		},
+		body,
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode/100 != 2 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("set connect volume: status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 func (c *Spclient) ExtendedMetadata(ctx context.Context, req *extmetadatapb.BatchedEntityRequest) (*extmetadatapb.BatchedExtensionResponse, error) {
 	reqBody, err := proto.Marshal(req)
 	if err != nil {
