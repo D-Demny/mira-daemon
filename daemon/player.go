@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -560,7 +562,38 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			data.Volume, data.Relative, rs.Volume, target, rs.DeviceName)
 		return nil, p.sendActiveDeviceVolume(ctx, target)
 
-	case ApiRequestTypePlay, ApiRequestTypeAddToQueue:
+	case ApiRequestTypePlay:
+		// tell the active device to start a context
+		data, _ := req.Data.(ApiRequestDataPlay)
+		if data.Uri == "" {
+			return nil, fmt.Errorf("play requires a context uri")
+		}
+		cmd := connectCommand{
+			Endpoint: "play",
+			Context: &connectContext{
+				Uri: data.Uri,
+				Url: "context://" + data.Uri,
+			},
+			Options: &connectOptions{License: "tft"},
+			PlayOrigin: &connectOrigin{
+				FeatureIdentifier:  "your_library",
+				FeatureVersion:     "go-librespot",
+				ReferrerIdentifier: "your_library",
+			},
+			LoggingParams: &connectLogging{
+				PageInstanceIds: []string{},
+				InteractionIds:  []string{},
+				CommandId:       randomCommandId(),
+			},
+		}
+		if data.SkipToUri != "" {
+			cmd.Options.SkipTo = connectSkipTo{TrackUri: data.SkipToUri}
+		}
+		// TEMP diagnostic logging while verifying the play envelope on hardware.
+		p.app.log.Infof("play: context=%s skipTo=%q -> active device", data.Uri, data.SkipToUri)
+		return nil, p.sendActiveDeviceCommand(ctx, cmd)
+
+	case ApiRequestTypeAddToQueue:
 		return nil, fmt.Errorf("not yet available in observer mode")
 
 	default:
@@ -568,14 +601,52 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 	}
 }
 
-// connectCommand is the JSON shape of a single Spotify Connect remote-control command.
-// The payload always rides in `value` — there is no dedicated per-command field
-// (see the incoming command schema in dealer/recv.go: RequestPayload.Command has
-// `value`, `position`, etc. but no `volume`). set_volume puts the 0..MaxStateVolume
-// integer in `value` just like seek_to puts the position there.
+// connectCommand is the JSON shape of a single Spotify Connect remote-control command
 type connectCommand struct {
-	Endpoint string `json:"endpoint"`
-	Value    any    `json:"value,omitempty"`
+	Endpoint      string          `json:"endpoint"`
+	Value         any             `json:"value,omitempty"`
+	Context       *connectContext `json:"context,omitempty"`
+	Options       *connectOptions `json:"options,omitempty"`
+	PlayOrigin    *connectOrigin  `json:"play_origin,omitempty"`
+	LoggingParams *connectLogging `json:"logging_params,omitempty"`
+}
+
+// connectContext/connectOptions/connectOrigin/connectLogging are the play-command sub-objects
+type connectContext struct {
+	Uri      string   `json:"uri"`
+	Url      string   `json:"url,omitempty"`
+	Metadata struct{} `json:"metadata"`
+}
+
+type connectOptions struct {
+	License               string        `json:"license,omitempty"`
+	SkipTo                connectSkipTo `json:"skip_to"`
+	PlayerOptionsOverride struct{}      `json:"player_options_override"`
+}
+
+type connectSkipTo struct {
+	TrackUri string `json:"track_uri,omitempty"`
+}
+
+type connectOrigin struct {
+	FeatureIdentifier  string `json:"feature_identifier"`
+	FeatureVersion     string `json:"feature_version,omitempty"`
+	ReferrerIdentifier string `json:"referrer_identifier,omitempty"`
+}
+
+type connectLogging struct {
+	PageInstanceIds []string `json:"page_instance_ids"`
+	InteractionIds  []string `json:"interaction_ids"`
+	CommandId       string   `json:"command_id"`
+}
+
+// randomCommandId returns a 32-char hex id
+func randomCommandId() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "00000000000000000000000000000000"
+	}
+	return hex.EncodeToString(b)
 }
 
 type connectCommandEnvelope struct {
