@@ -319,7 +319,9 @@ func TestAuthStatus_RequiredWithURLExposesQRTarget(t *testing.T) {
 
 type fakeSystemHandler struct{ called atomic.Bool }
 
-func (f *fakeSystemHandler) PerformReset() { f.called.Store(true) }
+func (f *fakeSystemHandler) PerformReset()   { f.called.Store(true) }
+func (f *fakeSystemHandler) PerformRestart() { f.called.Store(true) }
+func (f *fakeSystemHandler) PerformSuspend() { f.called.Store(true) }
 
 func TestSystemReset_POSTCallsPerformReset(t *testing.T) {
 	t.Parallel()

@@ -81,3 +81,17 @@ func (s *FileStateStore) Save(state *librespot.AppState) error {
 
 	return nil
 }
+
+// wipe deletes the persisted state + credentials files for a full factory reset
+func (s *FileStateStore) Wipe() error {
+	var firstErr error
+	for _, p := range []string{s.statePath, s.credentialsPath} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.log.Warnf("failed removing %s during wipe: %v", p, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}

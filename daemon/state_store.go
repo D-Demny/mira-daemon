@@ -8,4 +8,6 @@ import (
 type StateStore interface {
 	Load() (*librespot.AppState, error)
 	Save(*librespot.AppState) error
+	// Wipe removes all persisted state
+	Wipe() error
 }
