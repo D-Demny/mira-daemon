@@ -191,6 +191,11 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 		contextUri = ps.ContextUri
 	}
 
+	var contextName string
+	if ps.ContextMetadata != nil {
+		contextName = ps.ContextMetadata["context_description"]
+	}
+
 	return &RemoteState{
 		DeviceId:              activeDeviceId,
 		DeviceName:            deviceName,
@@ -199,6 +204,7 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 		TrackName:             trackName,
 		TrackImageUrl:         imageUrl,
 		ContextUri:            contextUri,
+		ContextName:           contextName,
 		Duration:              int64(ps.Duration),
 		PositionAsOfTimestamp: ps.PositionAsOfTimestamp,
 		Timestamp:             ps.Timestamp,
@@ -445,6 +451,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			"track_album":    rs.TrackAlbum,
 			"track_image":    rs.TrackImageUrl,
 			"context_uri":    rs.ContextUri,
+			"context_name":   rs.ContextName,
 			"duration":       rs.Duration,
 			"position":       rs.RemotePosition(),
 			"is_playing":     rs.IsPlaying,

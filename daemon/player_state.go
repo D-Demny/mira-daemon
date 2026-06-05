@@ -49,6 +49,8 @@ type RemoteState struct {
 
 	// ContextUri is what context is playing (playlist, album, etc).
 	ContextUri string
+	// ContextName playlist title etc, may be empty.
+	ContextName string
 
 	// Duration of the current track in milliseconds.
 	Duration int64
