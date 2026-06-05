@@ -277,9 +277,27 @@ func (app *App) persistState() error {
 	return nil
 }
 
-// PerformReset wipes user data (creds, last PAN address, BT bondings) and reboots
+// PerformReset wipes the device to a full factory state and reboots
 func (app *App) PerformReset() {
 	app.log.Warn("system: performing factory reset")
+
+	// 02a-firstboot runs reset-data + reset-settings before /var is
+	// mounted, reformatting /dev/data (and /dev/settings) which wipes everything
+	if err := exec.Command("/usr/bin/uenv", "set", "firstboot", "1").Run(); err != nil {
+		app.log.WithError(err).Error("system: 'uenv set firstboot 1' failed — falling back to surgical wipe")
+		app.surgicalWipe()
+	} else {
+		app.log.Warn("system: firstboot=1 flagged — /dev/data will be reformatted on next boot")
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	app.log.Warn("system: rebooting for factory reset")
+	app.reboot()
+}
+
+// fallback when the full reformat cant be flagged (uenv missing/failed)
+func (app *App) surgicalWipe() {
+	app.log.Warn("system: surgical wipe (reformat unavailable)")
 
 	// BT bondings via BlueZ RemoveDevice (cleaner than rm'ing /var/lib/bluetooth)
 	if app.bt != nil {
@@ -300,24 +318,42 @@ func (app *App) PerformReset() {
 		}
 	}
 
-	// clear creds + last PAN address
-	app.state.Credentials.Username = ""
-	app.state.Credentials.Data = nil
-	app.state.LastBluetoothPanAddress = ""
-	if err := app.persistState(); err != nil {
-		app.log.WithError(err).Warn("system: failed to persist post-reset state")
+	if err := app.stateStore.Wipe(); err != nil {
+		app.log.WithError(err).Warn("system: failed to wipe persisted state")
 	}
+	if err := exec.Command("sh", "-c", "rm -rf /var/cache/chrome_storage/* 2>/dev/null").Run(); err != nil {
+		app.log.WithError(err).Warn("system: failed to wipe chromium profile")
+	}
+}
 
-	// let disk writes flush + BlueZ finish propagating RemoveDevice
-	time.Sleep(500 * time.Millisecond)
-
-	app.log.Warn("system: rebooting")
+// reboot runs the reboot command with a busybox fallback.
+func (app *App) reboot() {
 	if err := exec.Command("/sbin/reboot").Run(); err != nil {
 		app.log.WithError(err).Warn("system: /sbin/reboot failed, trying busybox reboot")
 		if err := exec.Command("reboot").Run(); err != nil {
 			app.log.WithError(err).Error("system: reboot command failed; user must power-cycle manually")
 		}
 	}
+}
+
+// PerformRestart reboots without wiping any state.
+func (app *App) PerformRestart() {
+	app.log.Warn("system: restarting")
+	time.Sleep(200 * time.Millisecond) // let the HTTP 200 flush before we go down
+	app.reboot()
+}
+
+// backlight is off for an extra second so a visual glitch doesnt show 
+func (app *App) PerformSuspend() {
+	app.log.Info("system: suspending")
+	script := `for bl in /sys/class/backlight/*/bl_power; do echo 4 > "$bl" 2>/dev/null; done
+echo mem > /sys/power/state
+sleep 1
+for bl in /sys/class/backlight/*/bl_power; do echo 0 > "$bl" 2>/dev/null; done`
+	if err := exec.Command("sh", "-c", script).Run(); err != nil {
+		app.log.WithError(err).Warn("system: suspend script failed")
+	}
+	app.log.Info("system: resumed from suspend")
 }
 
 func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err error) {

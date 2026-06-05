@@ -48,6 +48,8 @@ type ApiServer interface {
 // destructive whole-device actions
 type SystemHandler interface {
 	PerformReset()
+	PerformRestart()
+	PerformSuspend()
 }
 
 type ConcreteApiServer struct {
@@ -838,6 +840,36 @@ func (s *ConcreteApiServer) serve() {
 			f.Flush()
 		}
 		go h.PerformReset()
+	})
+
+	// restart (reboot, no wipe)
+	m.HandleFunc("POST /system/restart", func(w http.ResponseWriter, r *http.Request) {
+		h := s.getSystemHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		s.log.Warn("system: restart requested via HTTP")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		go h.PerformRestart()
+	})
+
+	// suspend (sleep to ram)
+	m.HandleFunc("POST /system/suspend", func(w http.ResponseWriter, r *http.Request) {
+		h := s.getSystemHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		s.log.Info("system: suspend requested via HTTP")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		go h.PerformSuspend()
 	})
 
 	m.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
