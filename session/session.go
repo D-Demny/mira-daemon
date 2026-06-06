@@ -62,7 +62,7 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 			return nil, fmt.Errorf("failed obtaining client token: %w", err)
 		}
 
-		opts.Log.Debugf("obtained new client token: %s", s.clientToken)
+		opts.Log.Debugf("obtained new client token (%d chars)", len(s.clientToken))
 	} else {
 		s.clientToken = opts.ClientToken
 	}

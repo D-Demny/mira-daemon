@@ -7,8 +7,8 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 )
 
-func newTestLyricsProvider() *LyricsProvider {
-	return &LyricsProvider{log: &librespot.NullLogger{}}
+func newTestSecondaryProvider() *secondaryLyricProvider {
+	return &secondaryLyricProvider{log: &librespot.NullLogger{}}
 }
 
 // parseLRC, synced-lyric file parser
@@ -101,7 +101,7 @@ func TestParseLRC_AllMalformedReturnsError(t *testing.T) {
 func TestParseLRC_PreservesUnicodeAndSpecialChars(t *testing.T) {
 	t.Parallel()
 
-	// Lyrics span every language Spotify ship
+	// lyrics span every language
 	input := `[00:01.000]こんにちは ♪ café - naïve résumé`
 	result, err := parseLRC(input)
 	if err != nil {
@@ -158,10 +158,8 @@ func TestPlainTextToResult_AllWhitespaceReturnsNil(t *testing.T) {
 	}
 }
 
-// parsePrimaryResponse, top-level macro-call envelope
-
-// primaryEnvelope builds the deeply-nested wrapper primary source returns
-func primaryEnvelope(statusCode int, macroCalls map[string]any) []byte {
+// builds the deeply-nested wrapper the secondary source returns
+func secondaryEnvelope(statusCode int, macroCalls map[string]any) []byte {
 	body, _ := json.Marshal(map[string]any{
 		"message": map[string]any{
 			"header": map[string]any{"status_code": statusCode},
@@ -173,8 +171,8 @@ func primaryEnvelope(statusCode int, macroCalls map[string]any) []byte {
 	return body
 }
 
-// primarySubtitleCall builds a successful track.subtitles.get 
-func primarySubtitleCall(subtitleBody string) map[string]any {
+// secondarySubtitleCall builds a successful track.subtitles.get 
+func secondarySubtitleCall(subtitleBody string) map[string]any {
 	return map[string]any{
 		"message": map[string]any{
 			"header": map[string]any{"status_code": 200},
@@ -191,18 +189,18 @@ func primarySubtitleCall(subtitleBody string) map[string]any {
 	}
 }
 
-func TestParsePrimaryResponse_HappyPathSyncedLyrics(t *testing.T) {
+func TestParseSecondaryResponse_HappyPathSyncedLyrics(t *testing.T) {
 	t.Parallel()
 
-	body := primaryEnvelope(200, map[string]any{
-		"track.subtitles.get": primarySubtitleCall(
+	body := secondaryEnvelope(200, map[string]any{
+		"track.subtitles.get": secondarySubtitleCall(
 			`[{"text":"L0","time":{"total":0}},{"text":"L1","time":{"total":1.5}}]`,
 		),
 	})
 
-	result, err := newTestLyricsProvider().parsePrimaryResponse(body)
+	result, err := newTestSecondaryProvider().parseResponse(body)
 	if err != nil {
-		t.Fatalf("parsePrimaryResponse: %v", err)
+		t.Fatalf("parseResponse: %v", err)
 	}
 	if got, want := result.SyncType, "LINE_SYNCED"; got != want {
 		t.Errorf("SyncType: got %q want %q", got, want)
@@ -215,7 +213,7 @@ func TestParsePrimaryResponse_HappyPathSyncedLyrics(t *testing.T) {
 	}
 }
 
-func TestParsePrimaryResponse_FallsBackToPlainWhenSubtitlesFail(t *testing.T) {
+func TestParseSecondaryResponse_FallsBackToPlainWhenSubtitlesFail(t *testing.T) {
 	t.Parallel()
 
 	// subtitle macro has the "no synced", should fall through to plain
@@ -236,14 +234,14 @@ func TestParsePrimaryResponse_FallsBackToPlainWhenSubtitlesFail(t *testing.T) {
 		},
 	}
 
-	body := primaryEnvelope(200, map[string]any{
+	body := secondaryEnvelope(200, map[string]any{
 		"track.subtitles.get": subtitleCallWithArrayBody,
 		"track.lyrics.get":    plainCall,
 	})
 
-	result, err := newTestLyricsProvider().parsePrimaryResponse(body)
+	result, err := newTestSecondaryProvider().parseResponse(body)
 	if err != nil {
-		t.Fatalf("parsePrimaryResponse: %v", err)
+		t.Fatalf("parseResponse: %v", err)
 	}
 	if got, want := result.SyncType, "UNSYNCED"; got != want {
 		t.Errorf("SyncType: got %q want %q (subtitles failed, should fall back to UNSYNCED plain)", got, want)
@@ -253,54 +251,53 @@ func TestParsePrimaryResponse_FallsBackToPlainWhenSubtitlesFail(t *testing.T) {
 	}
 }
 
-func TestParsePrimaryResponse_TopLevelNon200StatusReturnsError(t *testing.T) {
+func TestParseSecondaryResponse_TopLevelNon200StatusReturnsError(t *testing.T) {
 	t.Parallel()
 
 	// 401 = trial token expired, 429 = rate-limited
-	body := primaryEnvelope(401, map[string]any{})
+	body := secondaryEnvelope(401, map[string]any{})
 
-	if _, err := newTestLyricsProvider().parsePrimaryResponse(body); err == nil {
-		t.Error("parsePrimaryResponse of 401 envelope should error, got nil")
+	if _, err := newTestSecondaryProvider().parseResponse(body); err == nil {
+		t.Error("parseResponse of 401 envelope should error, got nil")
 	}
 }
 
-func TestParsePrimaryResponse_MissingMessageFieldReturnsError(t *testing.T) {
+func TestParseSecondaryResponse_MissingMessageFieldReturnsError(t *testing.T) {
 	t.Parallel()
 
 	// Some primary source error pages return JSON like `{"error":"..."}` 
-	if _, err := newTestLyricsProvider().parsePrimaryResponse([]byte(`{"error":"bad"}`)); err == nil {
-		t.Error("parsePrimaryResponse without message field should error, got nil")
+	if _, err := newTestSecondaryProvider().parseResponse([]byte(`{"error":"bad"}`)); err == nil {
+		t.Error("parseResponse without message field should error, got nil")
 	}
 }
 
-func TestParsePrimaryResponse_EmptyBodyReturnsError(t *testing.T) {
+func TestParseSecondaryResponse_EmptyBodyReturnsError(t *testing.T) {
 	t.Parallel()
 
-	if _, err := newTestLyricsProvider().parsePrimaryResponse([]byte("")); err == nil {
-		t.Error("parsePrimaryResponse of empty body should error, got nil")
+	if _, err := newTestSecondaryProvider().parseResponse([]byte("")); err == nil {
+		t.Error("parseResponse of empty body should error, got nil")
 	}
 }
 
-func TestParsePrimaryResponse_MalformedJSONReturnsError(t *testing.T) {
+func TestParseSecondaryResponse_MalformedJSONReturnsError(t *testing.T) {
 	t.Parallel()
 
-	if _, err := newTestLyricsProvider().parsePrimaryResponse([]byte(`not json`)); err == nil {
-		t.Error("parsePrimaryResponse of malformed JSON should error, got nil")
+	if _, err := newTestSecondaryProvider().parseResponse([]byte(`not json`)); err == nil {
+		t.Error("parseResponse of malformed JSON should error, got nil")
 	}
 }
 
-// parsePrimarySubtitles, handles primary source's variable body shape
-
-func TestParsePrimarySubtitles_HappyPathDecodesSubtitleArray(t *testing.T) {
+// handles primary source's variable body shape
+func TestParseSecondarySubtitles_HappyPathDecodesSubtitleArray(t *testing.T) {
 	t.Parallel()
 
-	raw, _ := json.Marshal(primarySubtitleCall(
+	raw, _ := json.Marshal(secondarySubtitleCall(
 		`[{"text":"L0","time":{"total":0}},{"text":"L1","time":{"total":17.33}}]`,
 	))
 
-	result, err := newTestLyricsProvider().parsePrimarySubtitles(raw)
+	result, err := newTestSecondaryProvider().parseSubtitles(raw)
 	if err != nil {
-		t.Fatalf("parsePrimarySubtitles: %v", err)
+		t.Fatalf("parseSubtitles: %v", err)
 	}
 	if got, want := result.SyncType, "LINE_SYNCED"; got != want {
 		t.Errorf("SyncType: got %q want %q", got, want)
@@ -314,106 +311,105 @@ func TestParsePrimarySubtitles_HappyPathDecodesSubtitleArray(t *testing.T) {
 	}
 }
 
-func TestParsePrimarySubtitles_BodyIsArraySentinel(t *testing.T) {
+func TestParseSecondarySubtitles_BodyIsArraySentinel(t *testing.T) {
 	t.Parallel()
 
 	// regression, instead of object, two-step decode catches it
 	raw := []byte(`{"message":{"header":{"status_code":200},"body":[]}}`)
 
-	if _, err := newTestLyricsProvider().parsePrimarySubtitles(raw); err == nil {
+	if _, err := newTestSecondaryProvider().parseSubtitles(raw); err == nil {
 		t.Error("body=[] should error with 'no synced subtitles', got nil")
 	}
 }
 
-func TestParsePrimarySubtitles_BodyIsNullSentinel(t *testing.T) {
+func TestParseSecondarySubtitles_BodyIsNullSentinel(t *testing.T) {
 	t.Parallel()
 
 	raw := []byte(`{"message":{"header":{"status_code":200},"body":null}}`)
 
-	if _, err := newTestLyricsProvider().parsePrimarySubtitles(raw); err == nil {
+	if _, err := newTestSecondaryProvider().parseSubtitles(raw); err == nil {
 		t.Error("body=null should error, got nil")
 	}
 }
 
-func TestParsePrimarySubtitles_EmptySubtitleList(t *testing.T) {
+func TestParseSecondarySubtitles_EmptySubtitleList(t *testing.T) {
 	t.Parallel()
 
 	// Body is the object shape but subtitle_list is empty
 	raw := []byte(`{"message":{"header":{"status_code":200},"body":{"subtitle_list":[]}}}`)
 
-	if _, err := newTestLyricsProvider().parsePrimarySubtitles(raw); err == nil {
+	if _, err := newTestSecondaryProvider().parseSubtitles(raw); err == nil {
 		t.Error("empty subtitle_list should error, got nil")
 	}
 }
 
-func TestParsePrimarySubtitles_EmptySubtitleBody(t *testing.T) {
+func TestParseSecondarySubtitles_EmptySubtitleBody(t *testing.T) {
 	t.Parallel()
 
 	// subtitle_body is a string field, if it's empty, there's nothing so should error 
-	raw, _ := json.Marshal(primarySubtitleCall(""))
+	raw, _ := json.Marshal(secondarySubtitleCall(""))
 
-	if _, err := newTestLyricsProvider().parsePrimarySubtitles(raw); err == nil {
+	if _, err := newTestSecondaryProvider().parseSubtitles(raw); err == nil {
 		t.Error("empty subtitle_body should error, got nil")
 	}
 }
 
-func TestParsePrimarySubtitles_MalformedSubtitleBodyJSON(t *testing.T) {
+func TestParseSecondarySubtitles_MalformedSubtitleBodyJSON(t *testing.T) {
 	t.Parallel()
 
-	raw, _ := json.Marshal(primarySubtitleCall("not [a valid] json array"))
+	raw, _ := json.Marshal(secondarySubtitleCall("not [a valid] json array"))
 
-	if _, err := newTestLyricsProvider().parsePrimarySubtitles(raw); err == nil {
+	if _, err := newTestSecondaryProvider().parseSubtitles(raw); err == nil {
 		t.Error("malformed subtitle_body JSON should error, got nil")
 	}
 }
 
-func TestParsePrimarySubtitles_InnerNon200StatusReturnsError(t *testing.T) {
+func TestParseSecondarySubtitles_InnerNon200StatusReturnsError(t *testing.T) {
 	t.Parallel()
 
 	raw := []byte(`{"message":{"header":{"status_code":404},"body":{}}}`)
 
-	if _, err := newTestLyricsProvider().parsePrimarySubtitles(raw); err == nil {
+	if _, err := newTestSecondaryProvider().parseSubtitles(raw); err == nil {
 		t.Error("inner status 404 should error, got nil")
 	}
 }
 
-func TestParsePrimarySubtitles_PreservesUnicodeInText(t *testing.T) {
+func TestParseSecondarySubtitles_PreservesUnicodeInText(t *testing.T) {
 	t.Parallel()
 
 	// same UTF-8 round-trip contract as parseLRC
-	raw, _ := json.Marshal(primarySubtitleCall(
+	raw, _ := json.Marshal(secondarySubtitleCall(
 		`[{"text":"こんにちは ♪","time":{"total":0}}]`,
 	))
 
-	result, err := newTestLyricsProvider().parsePrimarySubtitles(raw)
+	result, err := newTestSecondaryProvider().parseSubtitles(raw)
 	if err != nil {
-		t.Fatalf("parsePrimarySubtitles: %v", err)
+		t.Fatalf("parseSubtitles: %v", err)
 	}
 	if got, want := result.Lines[0].Words, "こんにちは ♪"; got != want {
 		t.Errorf("Words: got %q want %q", got, want)
 	}
 }
 
-func TestParsePrimarySubtitles_FloatToMillisecondTruncation(t *testing.T) {
+func TestParseSecondarySubtitles_FloatToMillisecondTruncation(t *testing.T) {
 	t.Parallel()
 
 	// int() truncates, not rounds. 0.999s = 999ms
-	raw, _ := json.Marshal(primarySubtitleCall(
+	raw, _ := json.Marshal(secondarySubtitleCall(
 		`[{"text":"L0","time":{"total":0.999}}]`,
 	))
 
-	result, err := newTestLyricsProvider().parsePrimarySubtitles(raw)
+	result, err := newTestSecondaryProvider().parseSubtitles(raw)
 	if err != nil {
-		t.Fatalf("parsePrimarySubtitles: %v", err)
+		t.Fatalf("parseSubtitles: %v", err)
 	}
 	if got, want := result.Lines[0].StartTimeMs, "999"; got != want {
 		t.Errorf("StartTimeMs: got %q want %q", got, want)
 	}
 }
 
-// parsePrimaryPlain - the UNSYNCED fallback path
-
-func TestParsePrimaryPlain_HappyPathYieldsUnsynced(t *testing.T) {
+// UNSYNCED fallback path
+func TestParseSecondaryPlain_HappyPathYieldsUnsynced(t *testing.T) {
 	t.Parallel()
 
 	raw := []byte(`{
@@ -427,9 +423,9 @@ func TestParsePrimaryPlain_HappyPathYieldsUnsynced(t *testing.T) {
 		}
 	}`)
 
-	result, err := newTestLyricsProvider().parsePrimaryPlain(raw)
+	result, err := newTestSecondaryProvider().parsePlain(raw)
 	if err != nil {
-		t.Fatalf("parsePrimaryPlain: %v", err)
+		t.Fatalf("parsePlain: %v", err)
 	}
 	if got, want := result.SyncType, "UNSYNCED"; got != want {
 		t.Errorf("SyncType: got %q want %q", got, want)
@@ -439,31 +435,88 @@ func TestParsePrimaryPlain_HappyPathYieldsUnsynced(t *testing.T) {
 	}
 }
 
-func TestParsePrimaryPlain_Non200StatusReturnsError(t *testing.T) {
+func TestParseSecondaryPlain_Non200StatusReturnsError(t *testing.T) {
 	t.Parallel()
 
 	raw := []byte(`{"message":{"header":{"status_code":404},"body":{"lyrics":{"lyrics_body":"x"}}}}`)
 
-	if _, err := newTestLyricsProvider().parsePrimaryPlain(raw); err == nil {
+	if _, err := newTestSecondaryProvider().parsePlain(raw); err == nil {
 		t.Error("non-200 status should error, got nil")
 	}
 }
 
-func TestParsePrimaryPlain_EmptyBodyReturnsError(t *testing.T) {
+func TestParseSecondaryPlain_EmptyBodyReturnsError(t *testing.T) {
 	t.Parallel()
 
 	// 200 status but no lyrics_body = "we have a record but no text" should error so we can try LRCLIB
 	raw := []byte(`{"message":{"header":{"status_code":200},"body":{"lyrics":{"lyrics_body":""}}}}`)
 
-	if _, err := newTestLyricsProvider().parsePrimaryPlain(raw); err == nil {
+	if _, err := newTestSecondaryProvider().parsePlain(raw); err == nil {
 		t.Error("empty lyrics_body should error, got nil")
 	}
 }
 
-func TestParsePrimaryPlain_MalformedJSONReturnsError(t *testing.T) {
+func TestParseSecondaryPlain_MalformedJSONReturnsError(t *testing.T) {
 	t.Parallel()
 
-	if _, err := newTestLyricsProvider().parsePrimaryPlain([]byte("not json")); err == nil {
+	if _, err := newTestSecondaryProvider().parsePlain([]byte("not json")); err == nil {
 		t.Error("malformed JSON should error, got nil")
+	}
+}
+
+// the primary source 
+func TestParsePrimary_MapsSyncedLinesAndKeepsMsStrings(t *testing.T) {
+	t.Parallel()
+
+	// real shape from the primary source
+	body := []byte(`{
+		"lyrics": {
+			"syncType": "LINE_SYNCED",
+			"lines": [
+				{"startTimeMs": "22290", "words": "first line", "syllables": [], "endTimeMs": "0", "transliteratedWords": ""},
+				{"startTimeMs": "27830", "words": "second line", "syllables": [], "endTimeMs": "0", "transliteratedWords": ""},
+				{"startTimeMs": "33680", "words": "", "syllables": [], "endTimeMs": "0", "transliteratedWords": ""}
+			],
+			"language": "en"
+		}
+	}`)
+
+	result, err := parsePrimary(body)
+	if err != nil {
+		t.Fatalf("parsePrimary: %v", err)
+	}
+	if result.SyncType != "LINE_SYNCED" {
+		t.Errorf("SyncType: got %q want LINE_SYNCED", result.SyncType)
+	}
+	if len(result.Lines) != 3 {
+		t.Fatalf("lines: got %d want 3", len(result.Lines))
+	}
+	if result.Lines[0].StartTimeMs != "22290" || result.Lines[0].Words != "first line" {
+		t.Errorf("line0: got %+v", result.Lines[0])
+	}
+	// blank gap lines are preserved
+	if result.Lines[2].Words != "" || result.Lines[2].StartTimeMs != "33680" {
+		t.Errorf("line2 (blank gap): got %+v", result.Lines[2])
+	}
+}
+
+func TestParsePrimary_DefaultsEmptySyncTypeToUnsynced(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"lyrics": {"lines": [{"startTimeMs": "0", "words": "x"}]}}`)
+	result, err := parsePrimary(body)
+	if err != nil {
+		t.Fatalf("parsePrimary: %v", err)
+	}
+	if result.SyncType != "UNSYNCED" {
+		t.Errorf("SyncType: got %q want UNSYNCED", result.SyncType)
+	}
+}
+
+func TestParsePrimary_NoLinesIsError(t *testing.T) {
+	t.Parallel()
+
+	if _, err := parsePrimary([]byte(`{"lyrics": {"syncType": "LINE_SYNCED", "lines": []}}`)); err == nil {
+		t.Error("expected error for empty lines, got nil")
 	}
 }

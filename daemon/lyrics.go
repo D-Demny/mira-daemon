@@ -30,64 +30,45 @@ type LyricsResult struct {
 	Lines    []LyricsLine `json:"lines"`
 }
 
-// LyricsProvider fetches from a primary source then falls back to LRCLIB.
-type LyricsProvider struct {
-	log    librespot.Logger
-	client *http.Client
-	// separate client with cookie jar so session cookies persist across calls
-	lpClient *http.Client
+// 404 means a track w no lyrics
+var ErrNoLyrics = errors.New("no lyrics available")
 
-	// primary source config
-	lpTokenURL    string
-	lpSubtitleURL string
-	lpAppID       string
-	lpOrigin      string
-	lpReferer     string
-	lpSubtitleFmt string
-	lrclibURL     string
+// everything any source might need to look a track up
+type lyricsQuery struct {
+	trackId    string
+	trackName  string
+	artistName string
+	albumName  string
+	durationMs int
+}
+
+// lyricSource is one tier in the prefer-synced lookup chain.
+type lyricSource interface {
+	name() string
+	fetch(ctx context.Context, q lyricsQuery) (*LyricsResult, error)
+}
+
+type LyricsProvider struct {
+	log     librespot.Logger
+	sources []lyricSource
 
 	mu    sync.RWMutex
 	cache map[string]*LyricsResult // keyed by trackId
-
-	lpMu    sync.Mutex
-	lpToken string
-	lpExp   time.Time
-	// skip primary until this time if we get rate limited
-	lpCooldownUntil time.Time
 }
 
-// how long to skip the primary source after a rate-limit before retrying
-const primaryCooldown = 60 * time.Second
-
-func NewLyricsProvider(logger librespot.Logger) *LyricsProvider {
-	jar, jarErr := cookiejar.New(nil)
-	if jarErr != nil {
-		logger.Warnf("lyrics: cookie jar init failed (primary path may degrade): %v", jarErr)
-	}
+func NewLyricsProvider(logger librespot.Logger, getAccessToken func(ctx context.Context, force bool) (string, error)) *LyricsProvider {
 	return &LyricsProvider{
 		log: logger,
-		client: &http.Client{
-			Timeout: 10 * time.Second,
+		sources: []lyricSource{
+			newPrimaryLyricProvider(logger, getAccessToken),
+			newSecondaryLyricProvider(logger),
+			newTertiaryLyricProvider(logger),
 		},
-		lpClient: &http.Client{
-			Timeout: 10 * time.Second,
-			Jar:     jar,
-		},
-		lpTokenURL:    os.Getenv("THING_LP_TOKEN_URL"),
-		lpSubtitleURL: os.Getenv("THING_LP_SUBTITLE_URL"),
-		lpAppID:       os.Getenv("THING_LP_APP_ID"),
-		lpOrigin:      os.Getenv("THING_LP_ORIGIN"),
-		lpReferer:     os.Getenv("THING_LP_REFERER"),
-		lpSubtitleFmt: os.Getenv("THING_LP_SUBTITLE_FORMAT"),
-		lrclibURL:     lrclibURL,
-		cache:         make(map[string]*LyricsResult),
+		cache: make(map[string]*LyricsResult),
 	}
 }
 
-// ErrNoLyrics maps to 404 in the HTTP layer (normal for tracks w no lyrics)
-var ErrNoLyrics = errors.New("no lyrics available")
-
-// FetchLyrics tries primary then LRCLIB. trackId is the cache key.
+// first source to return synced lyrics wins
 func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, artistName, albumName string, durationMs int) (*LyricsResult, error) {
 	if trackName == "" {
 		return nil, fmt.Errorf("track name is required")
@@ -100,19 +81,36 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 	}
 	lp.mu.RUnlock()
 
-	result, err := lp.fetchPrimary(ctx, trackName, artistName, albumName, durationMs)
-	if err != nil {
-		lp.log.Debugf("lyrics: primary failed, trying lrclib: %v", err)
+	q := lyricsQuery{
+		trackId:    trackId,
+		trackName:  trackName,
+		artistName: artistName,
+		albumName:  albumName,
+		durationMs: durationMs,
 	}
 
-	if result == nil {
-		result, err = lp.fetchLRCLIB(ctx, trackName, artistName, durationMs)
+	var result, firstUnsynced *LyricsResult
+	for _, src := range lp.sources {
+		res, err := src.fetch(ctx, q)
 		if err != nil {
-			lp.log.Debugf("lyrics: lrclib also failed: %v", err)
-			return nil, ErrNoLyrics
+			lp.log.Debugf("lyrics: %s failed: %v", src.name(), err)
+			continue
+		}
+		if res == nil {
+			continue
+		}
+		if res.SyncType == "LINE_SYNCED" {
+			result = res
+			break
+		}
+		if firstUnsynced == nil {
+			firstUnsynced = res
 		}
 	}
 
+	if result == nil {
+		result = firstUnsynced
+	}
 	if result == nil {
 		return nil, ErrNoLyrics
 	}
@@ -146,42 +144,217 @@ func (lp *LyricsProvider) ClearCache() {
 	lp.cache = make(map[string]*LyricsResult)
 }
 
-// Primary lyrics source
+// primary source
 
-func (lp *LyricsProvider) addPrimaryHeaders(req *http.Request) {
-	// browser-mimicking headers, origin/referer from env so they don't leak in source
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	if lp.lpOrigin != "" {
-		req.Header.Set("Origin", lp.lpOrigin)
-	}
-	if lp.lpReferer != "" {
-		req.Header.Set("Referer", lp.lpReferer)
+// errPrimaryUnauthorized signals a 401/403 so we force a token refresh
+var errPrimaryUnauthorized = errors.New("primary unauthorized")
+
+type primaryLyricProvider struct {
+	log    librespot.Logger
+	client *http.Client
+	url      string
+	query    string
+	platform string
+	getAccessToken func(ctx context.Context, force bool) (string, error)
+}
+
+func newPrimaryLyricProvider(logger librespot.Logger, getAccessToken func(ctx context.Context, force bool) (string, error)) *primaryLyricProvider {
+	return &primaryLyricProvider{
+		log:            logger,
+		client:         &http.Client{Timeout: 10 * time.Second},
+		url:            os.Getenv("THING_LP_PRIMARY_URL"),
+		query:          os.Getenv("THING_LP_PRIMARY_QUERY"),
+		platform:       os.Getenv("THING_LP_PRIMARY_PLATFORM"),
+		getAccessToken: getAccessToken,
 	}
 }
 
-func (lp *LyricsProvider) getPrimaryToken(ctx context.Context) (string, error) {
-	lp.lpMu.Lock()
-	defer lp.lpMu.Unlock()
+func (p *primaryLyricProvider) name() string { return "primary" }
 
-	// tokens last ~10 min, refresh at 8
-	if lp.lpToken != "" && time.Now().Before(lp.lpExp) {
-		return lp.lpToken, nil
+func (p *primaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*LyricsResult, error) {
+	if p.url == "" {
+		return nil, errors.New("primary disabled (no env config)")
+	}
+	if p.getAccessToken == nil {
+		return nil, errors.New("primary: no access token source")
+	}
+
+	// trackId may arrive as a bare id or in a "<type>:<id>" form
+	id := q.trackId
+	if i := strings.LastIndex(id, ":"); i >= 0 {
+		id = id[i+1:]
+	}
+	if id == "" {
+		return nil, errors.New("primary: empty track id")
+	}
+
+	result, err := p.request(ctx, id, false)
+	if errors.Is(err, errPrimaryUnauthorized) {
+		p.log.Debugf("lyrics: primary 401/403, retrying with a fresh token")
+		result, err = p.request(ctx, id, true)
+	}
+	return result, err
+}
+
+func (p *primaryLyricProvider) request(ctx context.Context, trackId string, force bool) (*LyricsResult, error) {
+	token, err := p.getAccessToken(ctx, force)
+	if err != nil {
+		return nil, fmt.Errorf("primary access token: %w", err)
+	}
+
+	reqURL := p.url + trackId
+	if p.query != "" {
+		reqURL += "?" + p.query
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating primary request: %w", err)
+	}
+	// a browser-like User-Agent 
+	req.Header.Set("Authorization", "Bearer "+token)
+	if p.platform != "" {
+		req.Header.Set("App-Platform", p.platform)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("primary request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == 401 || resp.StatusCode == 403:
+		return nil, errPrimaryUnauthorized
+	case resp.StatusCode == 404:
+		// no lyrics for this track in the primary source
+		return nil, fmt.Errorf("primary: no lyrics for track")
+	case resp.StatusCode != 200:
+		return nil, fmt.Errorf("primary status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading primary response: %w", err)
+	}
+	return parsePrimary(body)
+}
+
+func parsePrimary(body []byte) (*LyricsResult, error) {
+	var resp struct {
+		Lyrics struct {
+			SyncType string `json:"syncType"`
+			Lines    []struct {
+				StartTimeMs string `json:"startTimeMs"`
+				Words       string `json:"words"`
+			} `json:"lines"`
+		} `json:"lyrics"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parsing primary response: %w", err)
+	}
+
+	if len(resp.Lyrics.Lines) == 0 {
+		return nil, fmt.Errorf("primary: no lines")
+	}
+
+	syncType := resp.Lyrics.SyncType
+	if syncType == "" {
+		syncType = "UNSYNCED"
+	}
+
+	// startTimeMs already arrives as a millisecond string
+	lines := make([]LyricsLine, 0, len(resp.Lyrics.Lines))
+	for _, l := range resp.Lyrics.Lines {
+		lines = append(lines, LyricsLine{
+			StartTimeMs: l.StartTimeMs,
+			Words:       l.Words,
+		})
+	}
+
+	return &LyricsResult{SyncType: syncType, Lines: lines}, nil
+}
+
+// secondary source
+
+// how long to skip the secondary source after a rate-limit
+const secondaryCooldown = 60 * time.Second
+
+type secondaryLyricProvider struct {
+	log librespot.Logger
+	client *http.Client
+
+	tokenURL    string
+	subtitleURL string
+	appID       string
+	origin      string
+	referer     string
+	subtitleFmt string
+
+	mu  sync.Mutex
+	tok string
+	exp time.Time
+	cooldownUntil time.Time
+}
+
+func newSecondaryLyricProvider(logger librespot.Logger) *secondaryLyricProvider {
+	jar, jarErr := cookiejar.New(nil)
+	if jarErr != nil {
+		logger.Warnf("lyrics: cookie jar init failed (secondary path may degrade): %v", jarErr)
+	}
+	return &secondaryLyricProvider{
+		log: logger,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			Jar:     jar,
+		},
+		tokenURL:    os.Getenv("THING_LP_TOKEN_URL"),
+		subtitleURL: os.Getenv("THING_LP_SUBTITLE_URL"),
+		appID:       os.Getenv("THING_LP_APP_ID"),
+		origin:      os.Getenv("THING_LP_ORIGIN"),
+		referer:     os.Getenv("THING_LP_REFERER"),
+		subtitleFmt: os.Getenv("THING_LP_SUBTITLE_FORMAT"),
+	}
+}
+
+func (s *secondaryLyricProvider) name() string { return "secondary" }
+
+func (s *secondaryLyricProvider) addHeaders(req *http.Request) {
+	// browser header
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	if s.origin != "" {
+		req.Header.Set("Origin", s.origin)
+	}
+	if s.referer != "" {
+		req.Header.Set("Referer", s.referer)
+	}
+}
+
+func (s *secondaryLyricProvider) getToken(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// tokens last about 10 min, refresh at 8
+	if s.tok != "" && time.Now().Before(s.exp) {
+		return s.tok, nil
 	}
 
 	params := url.Values{
-		"app_id": {lp.lpAppID},
+		"app_id": {s.appID},
 	}
-	reqURL := lp.lpTokenURL + "?" + params.Encode()
+	reqURL := s.tokenURL + "?" + params.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("creating token request: %w", err)
 	}
-	lp.addPrimaryHeaders(req)
+	s.addHeaders(req)
 
-	resp, err := lp.lpClient.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("token request failed: %w", err)
 	}
@@ -208,70 +381,69 @@ func (lp *LyricsProvider) getPrimaryToken(ctx context.Context) (string, error) {
 	}
 
 	if tokenResp.Message.Header.StatusCode != 200 || tokenResp.Message.Body.UserToken == "" {
-		return "", fmt.Errorf("primary returned status %d or empty token", tokenResp.Message.Header.StatusCode)
+		return "", fmt.Errorf("secondary returned status %d or empty token", tokenResp.Message.Header.StatusCode)
 	}
 
-	lp.lpToken = tokenResp.Message.Body.UserToken
-	lp.lpExp = time.Now().Add(8 * time.Minute)
+	s.tok = tokenResp.Message.Body.UserToken
+	s.exp = time.Now().Add(8 * time.Minute)
 
-	lp.log.Debugf("lyrics: acquired new primary token")
-	return lp.lpToken, nil
+	s.log.Debugf("lyrics: acquired new secondary token")
+	return s.tok, nil
 }
 
-func (lp *LyricsProvider) invalidatePrimaryToken() {
-	lp.lpMu.Lock()
-	defer lp.lpMu.Unlock()
-	lp.lpToken = ""
-	lp.lpExp = time.Time{}
-	// back off so we don't hammer Musixmatch / its token endpoint while rate-limited
-	lp.lpCooldownUntil = time.Now().Add(primaryCooldown)
+func (s *secondaryLyricProvider) invalidateToken() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tok = ""
+	s.exp = time.Time{}
+	// back off when we are rate limited
+	s.cooldownUntil = time.Now().Add(secondaryCooldown)
 }
 
-func (lp *LyricsProvider) fetchPrimary(ctx context.Context, trackName, artistName, albumName string, durationMs int) (*LyricsResult, error) {
-	if lp.lpTokenURL == "" || lp.lpSubtitleURL == "" {
-		return nil, errors.New("primary disabled (no env config)")
+func (s *secondaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*LyricsResult, error) {
+	if s.tokenURL == "" || s.subtitleURL == "" {
+		return nil, errors.New("secondary disabled (no env config)")
 	}
 
-	lp.lpMu.Lock()
-	cooling := time.Now().Before(lp.lpCooldownUntil)
-	lp.lpMu.Unlock()
+	s.mu.Lock()
+	cooling := time.Now().Before(s.cooldownUntil)
+	s.mu.Unlock()
 	if cooling {
-		return nil, errors.New("primary cooling down after auth/rate-limit error")
+		return nil, errors.New("secondary cooling down after auth/rate-limit error")
 	}
 
-	token, err := lp.getPrimaryToken(ctx)
+	token, err := s.getToken(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("getting primary token: %w", err)
+		return nil, fmt.Errorf("getting secondary token: %w", err)
 	}
 
 	params := url.Values{
 		"format":            {"json"},
 		"namespace":         {"lyrics_richsynched"},
-		"subtitle_format":   {lp.lpSubtitleFmt},
-		"app_id":            {lp.lpAppID},
+		"subtitle_format":   {s.subtitleFmt},
+		"app_id":            {s.appID},
 		"usertoken":         {token},
-		"q_track":           {trackName},
-		"q_artist":          {artistName},
-		"q_artists":         {artistName},
-		"track_spotify_id":  {""},
+		"q_track":           {q.trackName},
+		"q_artist":          {q.artistName},
+		"q_artists":         {q.artistName},
 		"f_subtitle_length": {""},
 	}
-	if albumName != "" {
-		params.Set("q_album", albumName)
+	if q.albumName != "" {
+		params.Set("q_album", q.albumName)
 	}
-	if durationMs > 0 {
-		params.Set("q_duration", strconv.Itoa(durationMs/1000))
+	if q.durationMs > 0 {
+		params.Set("q_duration", strconv.Itoa(q.durationMs/1000))
 	}
 
-	reqURL := lp.lpSubtitleURL + "?" + params.Encode()
+	reqURL := s.subtitleURL + "?" + params.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating subtitle request: %w", err)
 	}
-	lp.addPrimaryHeaders(req)
+	s.addHeaders(req)
 
-	resp, err := lp.lpClient.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("subtitle request failed: %w", err)
 	}
@@ -283,14 +455,14 @@ func (lp *LyricsProvider) fetchPrimary(ctx context.Context, trackName, artistNam
 	}
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		lp.invalidatePrimaryToken()
-		return nil, fmt.Errorf("primary auth error (status %d), token invalidated", resp.StatusCode)
+		s.invalidateToken()
+		return nil, fmt.Errorf("secondary auth error (status %d), token invalidated", resp.StatusCode)
 	}
 
-	return lp.parsePrimaryResponse(body)
+	return s.parseResponse(body)
 }
 
-func (lp *LyricsProvider) parsePrimaryResponse(body []byte) (*LyricsResult, error) {
+func (s *secondaryLyricProvider) parseResponse(body []byte) (*LyricsResult, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parsing response: %w", err)
@@ -314,35 +486,33 @@ func (lp *LyricsProvider) parsePrimaryResponse(body []byte) (*LyricsResult, erro
 	}
 
 	if msg.Header.StatusCode != 200 {
-		// Musixmatch signals a dead/rate-limited usertoken via the in-body
-		// status_code (HTTP stays 200), so the HTTP-level 401 check above never
-		// fires. Invalidate here too, or we reuse the dead token forever.
+		// provider signals a dead/rate-limited token via the in-body status_code
 		if msg.Header.StatusCode == 401 || msg.Header.StatusCode == 403 {
-			lp.invalidatePrimaryToken()
+			s.invalidateToken()
 		}
-		return nil, fmt.Errorf("primary status %d", msg.Header.StatusCode)
+		return nil, fmt.Errorf("secondary status %d", msg.Header.StatusCode)
 	}
 
 	// try synced first
 	if subtitlesRaw, ok := msg.Body.MacroCalls["track.subtitles.get"]; ok {
-		result, err := lp.parsePrimarySubtitles(subtitlesRaw)
+		result, err := s.parseSubtitles(subtitlesRaw)
 		if err == nil && result != nil {
 			return result, nil
 		}
-		lp.log.Debugf("lyrics: synced subtitles parse failed, trying plain lyrics: %v", err)
+		s.log.Debugf("lyrics: synced subtitles parse failed, trying plain lyrics: %v", err)
 	}
 
 	if lyricsRaw, ok := msg.Body.MacroCalls["track.lyrics.get"]; ok {
-		result, err := lp.parsePrimaryPlain(lyricsRaw)
+		result, err := s.parsePlain(lyricsRaw)
 		if err == nil && result != nil {
 			return result, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no lyrics data in primary response")
+	return nil, fmt.Errorf("no lyrics data in secondary response")
 }
 
-func (lp *LyricsProvider) parsePrimarySubtitles(raw json.RawMessage) (*LyricsResult, error) {
+func (s *secondaryLyricProvider) parseSubtitles(raw json.RawMessage) (*LyricsResult, error) {
 	// body comes as either an object or an empty array
 	var envelope struct {
 		Message struct {
@@ -363,7 +533,7 @@ func (lp *LyricsProvider) parsePrimarySubtitles(raw json.RawMessage) (*LyricsRes
 
 	body := bytes.TrimSpace(envelope.Message.Body)
 	if len(body) == 0 || body[0] != '{' {
-		// "no synced lyrics" sentinel, fall through to plain or LRCLIB
+		// "no synced lyrics" fall through to plain or LRCLIB
 		return nil, fmt.Errorf("no synced subtitles")
 	}
 
@@ -417,7 +587,7 @@ func (lp *LyricsProvider) parsePrimarySubtitles(raw json.RawMessage) (*LyricsRes
 	}, nil
 }
 
-func (lp *LyricsProvider) parsePrimaryPlain(raw json.RawMessage) (*LyricsResult, error) {
+func (s *secondaryLyricProvider) parsePlain(raw json.RawMessage) (*LyricsResult, error) {
 	var lyr struct {
 		Message struct {
 			Header struct {
@@ -442,20 +612,35 @@ func (lp *LyricsProvider) parsePrimaryPlain(raw json.RawMessage) (*LyricsResult,
 	return plainTextToResult(lyr.Message.Body.Lyrics.LyricsBody), nil
 }
 
-// LRCLIB
-
+// final source LRCLIB (public api w/no auth but not as much lyrics)
 const lrclibURL = "https://lrclib.net/api/get"
 
-func (lp *LyricsProvider) fetchLRCLIB(ctx context.Context, trackName, artistName string, durationMs int) (*LyricsResult, error) {
-	params := url.Values{
-		"track_name":  {trackName},
-		"artist_name": {artistName},
+type tertiaryLyricProvider struct {
+	log    librespot.Logger
+	client *http.Client
+	url    string
+}
+
+func newTertiaryLyricProvider(logger librespot.Logger) *tertiaryLyricProvider {
+	return &tertiaryLyricProvider{
+		log:    logger,
+		client: &http.Client{Timeout: 10 * time.Second},
+		url:    lrclibURL,
 	}
-	if durationMs > 0 {
-		params.Set("duration", strconv.Itoa(durationMs/1000))
+}
+
+func (t *tertiaryLyricProvider) name() string { return "lrclib" }
+
+func (t *tertiaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*LyricsResult, error) {
+	params := url.Values{
+		"track_name":  {q.trackName},
+		"artist_name": {q.artistName},
+	}
+	if q.durationMs > 0 {
+		params.Set("duration", strconv.Itoa(q.durationMs/1000))
 	}
 
-	reqURL := lp.lrclibURL + "?" + params.Encode()
+	reqURL := t.url + "?" + params.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
@@ -463,7 +648,7 @@ func (lp *LyricsProvider) fetchLRCLIB(ctx context.Context, trackName, artistName
 	}
 	req.Header.Set("User-Agent", "go-librespot-observer/1.0")
 
-	resp, err := lp.client.Do(req)
+	resp, err := t.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("lrclib request failed: %w", err)
 	}
@@ -502,7 +687,6 @@ func (lp *LyricsProvider) fetchLRCLIB(ctx context.Context, trackName, artistName
 	if lrcResp.SyncedLyrics != "" {
 		result, err := parseLRC(lrcResp.SyncedLyrics)
 		if err == nil && len(result.Lines) > 0 {
-
 			return result, nil
 		}
 	}
@@ -514,7 +698,7 @@ func (lp *LyricsProvider) fetchLRCLIB(ctx context.Context, trackName, artistName
 	return nil, fmt.Errorf("lrclib: empty lyrics")
 }
 
-// lyric parser
+// helpers
 
 // matches lines like [03:20.31] some text
 var lrcLineRegex = regexp.MustCompile(`^\[(\d{2}):(\d{2})\.(\d{2,3})\]\s?(.*)$`)
@@ -562,8 +746,6 @@ func parseLRC(lrc string) (*LyricsResult, error) {
 		Lines:    lines,
 	}, nil
 }
-
-// Helpers
 
 func plainTextToResult(text string) *LyricsResult {
 	rawLines := strings.Split(text, "\n")
