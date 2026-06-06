@@ -217,12 +217,12 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 		ShuffleContext:        ps.Options != nil && ps.Options.ShufflingContext,
 		RepeatContext:         ps.Options != nil && ps.Options.RepeatingContext,
 		RepeatTrack:           ps.Options != nil && ps.Options.RepeatingTrack,
-		DisallowSkipPrev: ps.Restrictions != nil && len(ps.Restrictions.DisallowSkippingPrevReasons) > 0,
-		DisallowSkipNext: ps.Restrictions != nil && len(ps.Restrictions.DisallowSkippingNextReasons) > 0,
-		DisallowSeek:     ps.Restrictions != nil && len(ps.Restrictions.DisallowSeekingReasons) > 0,
-		PrevTracks:       projectQueue(ps.PrevTracks, QueueLimit),
-		NextTracks:       projectQueue(ps.NextTracks, QueueLimit),
-		RawMetadata:      rawMeta,
+		DisallowSkipPrev:      ps.Restrictions != nil && len(ps.Restrictions.DisallowSkippingPrevReasons) > 0,
+		DisallowSkipNext:      ps.Restrictions != nil && len(ps.Restrictions.DisallowSkippingNextReasons) > 0,
+		DisallowSeek:          ps.Restrictions != nil && len(ps.Restrictions.DisallowSeekingReasons) > 0,
+		PrevTracks:            projectQueue(ps.PrevTracks, QueueLimit),
+		NextTracks:            projectQueue(ps.NextTracks, QueueLimit),
+		RawMetadata:           rawMeta,
 	}
 }
 
@@ -440,75 +440,37 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 
 		return map[string]any{
-			"active":         true,
-			"device_id":      rs.DeviceId,
-			"device_name":    rs.DeviceName,
-			"device_type":    rs.DeviceType,
-			"track_id":       trackId,
-			"track_uri":      rs.TrackUri,
-			"track_name":     rs.TrackName,
-			"track_artist":   rs.TrackArtist,
-			"track_album":    rs.TrackAlbum,
-			"track_image":    rs.TrackImageUrl,
-			"context_uri":    rs.ContextUri,
-			"context_name":   rs.ContextName,
-			"duration":       rs.Duration,
-			"position":       rs.RemotePosition(),
-			"is_playing":     rs.IsPlaying,
-			"is_paused":      rs.IsPaused,
+			"active":          true,
+			"device_id":       rs.DeviceId,
+			"device_name":     rs.DeviceName,
+			"device_type":     rs.DeviceType,
+			"track_id":        trackId,
+			"track_uri":       rs.TrackUri,
+			"track_name":      rs.TrackName,
+			"track_artist":    rs.TrackArtist,
+			"track_album":     rs.TrackAlbum,
+			"track_image":     rs.TrackImageUrl,
+			"context_uri":     rs.ContextUri,
+			"context_name":    rs.ContextName,
+			"duration":        rs.Duration,
+			"position":        rs.RemotePosition(),
+			"is_playing":      rs.IsPlaying,
+			"is_paused":       rs.IsPaused,
 			"volume":          rs.Volume,
 			"volume_max":      MaxStateVolume,
 			"volume_disabled": rs.VolumeDisabled,
 			"volume_steps":    rs.VolumeSteps,
-			"shuffle":        rs.ShuffleContext,
-			"repeat_context": rs.RepeatContext,
-			"repeat_track":   rs.RepeatTrack,
-			"disallow_prev":  rs.DisallowSkipPrev,
-			"disallow_next":  rs.DisallowSkipNext,
-			"disallow_seek":  rs.DisallowSeek,
-			"prev_tracks":    rs.PrevTracks,
-			"next_tracks":    rs.NextTracks,
-			"lyrics_url":     lyricsUrl,
-			"raw_metadata":   rs.RawMetadata,
+			"shuffle":         rs.ShuffleContext,
+			"repeat_context":  rs.RepeatContext,
+			"repeat_track":    rs.RepeatTrack,
+			"disallow_prev":   rs.DisallowSkipPrev,
+			"disallow_next":   rs.DisallowSkipNext,
+			"disallow_seek":   rs.DisallowSeek,
+			"prev_tracks":     rs.PrevTracks,
+			"next_tracks":     rs.NextTracks,
+			"lyrics_url":      lyricsUrl,
+			"raw_metadata":    rs.RawMetadata,
 		}, nil
-
-	case ApiRequestTypeLyrics:
-		data := req.Data.(ApiRequestDataLyrics)
-		trackName := data.TrackName
-		artistName := data.ArtistName
-		albumName := data.AlbumName
-		durationMs := data.DurationMs
-
-		if trackName == "" || artistName == "" {
-			rs := p.state.remoteState
-			if rs != nil {
-				if trackName == "" {
-					trackName = rs.TrackName
-				}
-				if artistName == "" {
-					artistName = rs.TrackArtist
-				}
-				if albumName == "" {
-					albumName = rs.TrackAlbum
-				}
-				if durationMs == 0 {
-					durationMs = int(rs.Duration)
-				}
-			}
-		}
-
-		if trackName == "" {
-			return nil, fmt.Errorf("track name required (provide ?track= param or wait for observer state)")
-		}
-
-		result, err := p.lyricsProvider.FetchLyrics(ctx, data.TrackId, trackName, artistName, albumName, durationMs)
-		if err != nil {
-			if errors.Is(err, ErrNoLyrics) {
-				return nil, ErrNotFound
-			}
-			return nil, fmt.Errorf("lyrics fetch failed: %w", err)
-		}
-		return result, nil
 
 	case ApiRequestTypeResume:
 		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "resume"})
@@ -734,6 +696,52 @@ func (p *AppPlayer) Close() {
 	p.sess.Close()
 }
 
+// handleLyricsAsync resolves the track metadata synchronously 
+// keeps slow lyrics HTTP off the player loop so it never stalls the dealer keepalive/messages
+func (p *AppPlayer) handleLyricsAsync(ctx context.Context, req ApiRequest) {
+	data := req.Data.(ApiRequestDataLyrics)
+	trackName := data.TrackName
+	artistName := data.ArtistName
+	albumName := data.AlbumName
+	durationMs := data.DurationMs
+
+	if trackName == "" || artistName == "" {
+		if rs := p.state.remoteState; rs != nil {
+			if trackName == "" {
+				trackName = rs.TrackName
+			}
+			if artistName == "" {
+				artistName = rs.TrackArtist
+			}
+			if albumName == "" {
+				albumName = rs.TrackAlbum
+			}
+			if durationMs == 0 {
+				durationMs = int(rs.Duration)
+			}
+		}
+	}
+
+	if trackName == "" {
+		req.Reply(nil, fmt.Errorf("track name required (provide ?track= param or wait for observer state)"))
+		return
+	}
+
+	lp := p.lyricsProvider
+	go func() {
+		result, err := lp.FetchLyrics(ctx, data.TrackId, trackName, artistName, albumName, durationMs)
+		if err != nil {
+			if errors.Is(err, ErrNoLyrics) {
+				req.Reply(nil, ErrNotFound)
+				return
+			}
+			req.Reply(nil, fmt.Errorf("lyrics fetch failed: %w", err))
+			return
+		}
+		req.Reply(result, nil)
+	}()
+}
+
 func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	err := p.sess.Dealer().Connect(ctx)
 	if err != nil {
@@ -787,6 +795,13 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			}
 		case req, ok := <-apiRecv:
 			if !ok {
+				continue
+			}
+			// fetching lyrics sometimes block the HTTP connection between the ui
+			// for seconds at a time in cases where fetching lyrics take too long (no lyrics for several songs in succession) 
+			// having it inlione stalls this loop that keeps the dealer keepalive/messages
+			if req.Type == ApiRequestTypeLyrics {
+				p.handleLyricsAsync(ctx, req)
 				continue
 			}
 			data, err := p.handleApiRequest(ctx, req)
