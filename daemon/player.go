@@ -746,7 +746,9 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	p.app.server.SetPlayerReady(true)
 	defer p.app.server.SetPlayerReady(false)
 
-	p.lyricsProvider = NewLyricsProvider(p.app.log)
+	p.lyricsProvider = NewLyricsProvider(p.app.log, func(ctx context.Context, force bool) (string, error) {
+		return p.sess.Spclient().GetAccessToken(ctx, force)
+	})
 	p.app.log.Infof("lyrics provider initialized")
 
 	p.queueResolver = newQueueResolver(p.app.log, p.sess.Spclient(), p.queueResolvedCh)

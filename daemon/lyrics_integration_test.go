@@ -14,19 +14,31 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 )
 
-// URL fields left empty, test must set them or it hits production
-func newTestLyricsProviderForHTTP() *LyricsProvider {
-	return &LyricsProvider{
-		log:       &librespot.NullLogger{},
-		client:    &http.Client{Timeout: 5 * time.Second},
-		lpClient: &http.Client{Timeout: 5 * time.Second},
-		cache:     make(map[string]*LyricsResult),
+// test helpers
+func newTestSecondaryProviderHTTP() *secondaryLyricProvider {
+	return &secondaryLyricProvider{
+		log:    &librespot.NullLogger{},
+		client: &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
-// getPrimaryToken - token acquisition + caching + invalidation
+func newTestTertiaryProviderHTTP() *tertiaryLyricProvider {
+	return &tertiaryLyricProvider{
+		log:    &librespot.NullLogger{},
+		client: &http.Client{Timeout: 5 * time.Second},
+	}
+}
 
-func TestGetPrimaryToken_FetchesParsesAndCachesNewToken(t *testing.T) {
+func newTestOrchestrator(sources ...lyricSource) *LyricsProvider {
+	return &LyricsProvider{
+		log:     &librespot.NullLogger{},
+		sources: sources,
+		cache:   make(map[string]*LyricsResult),
+	}
+}
+
+// token acquisition + caching + invalidation
+func TestSecondaryGetToken_FetchesParsesAndCachesNewToken(t *testing.T) {
 	t.Parallel()
 
 	var requests int32
@@ -36,12 +48,12 @@ func TestGetPrimaryToken_FetchesParsesAndCachesNewToken(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	lp := newTestLyricsProviderForHTTP()
-	lp.lpTokenURL = srv.URL
+	s := newTestSecondaryProviderHTTP()
+	s.tokenURL = srv.URL
 
-	got, err := lp.getPrimaryToken(context.Background())
+	got, err := s.getToken(context.Background())
 	if err != nil {
-		t.Fatalf("getPrimaryToken: %v", err)
+		t.Fatalf("getToken: %v", err)
 	}
 	if got != "the-token" {
 		t.Errorf("token: got %q want %q", got, "the-token")
@@ -49,19 +61,19 @@ func TestGetPrimaryToken_FetchesParsesAndCachesNewToken(t *testing.T) {
 	if atomic.LoadInt32(&requests) != 1 {
 		t.Errorf("expected exactly 1 token fetch, got %d", requests)
 	}
-	if lp.lpToken != "the-token" {
-		t.Errorf("token not cached on provider; got %q", lp.lpToken)
+	if s.tok != "the-token" {
+		t.Errorf("token not cached on provider; got %q", s.tok)
 	}
-	// lpExp must be in the future (8min window).
-	if lp.lpExp.IsZero() || time.Until(lp.lpExp) <= 0 {
-		t.Errorf("lpExp should be in the future, got %v (now=%v)", lp.lpExp, time.Now())
+	// exp must be in the future
+	if s.exp.IsZero() || time.Until(s.exp) <= 0 {
+		t.Errorf("exp should be in the future, got %v (now=%v)", s.exp, time.Now())
 	}
 }
 
-func TestGetPrimaryToken_ReusesCachedTokenWithinExpiry(t *testing.T) {
+func TestSecondaryGetToken_ReusesCachedTokenWithinExpiry(t *testing.T) {
 	t.Parallel()
 
-	// cache hit, second call within the 8-min window must not hit the network
+	// cache hit
 	var requests int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&requests, 1)
@@ -69,13 +81,13 @@ func TestGetPrimaryToken_ReusesCachedTokenWithinExpiry(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	lp := newTestLyricsProviderForHTTP()
-	lp.lpTokenURL = srv.URL
+	s := newTestSecondaryProviderHTTP()
+	s.tokenURL = srv.URL
 
-	if _, err := lp.getPrimaryToken(context.Background()); err != nil {
+	if _, err := s.getToken(context.Background()); err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	if _, err := lp.getPrimaryToken(context.Background()); err != nil {
+	if _, err := s.getToken(context.Background()); err != nil {
 		t.Fatalf("second call: %v", err)
 	}
 
@@ -84,7 +96,7 @@ func TestGetPrimaryToken_ReusesCachedTokenWithinExpiry(t *testing.T) {
 	}
 }
 
-func TestGetPrimaryToken_ExpiredTokenTriggersRefresh(t *testing.T) {
+func TestSecondaryGetToken_ExpiredTokenTriggersRefresh(t *testing.T) {
 	t.Parallel()
 
 	var requests int32
@@ -94,10 +106,10 @@ func TestGetPrimaryToken_ExpiredTokenTriggersRefresh(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	lp := newTestLyricsProviderForHTTP()
-	lp.lpTokenURL = srv.URL
+	s := newTestSecondaryProviderHTTP()
+	s.tokenURL = srv.URL
 
-	first, err := lp.getPrimaryToken(context.Background())
+	first, err := s.getToken(context.Background())
 	if err != nil {
 		t.Fatalf("first call: %v", err)
 	}
@@ -105,12 +117,12 @@ func TestGetPrimaryToken_ExpiredTokenTriggersRefresh(t *testing.T) {
 		t.Errorf("first token: got %q want %q", first, "token-1")
 	}
 
-	// force expiry by reaching past the deadline
-	lp.lpMu.Lock()
-	lp.lpExp = time.Now().Add(-time.Second)
-	lp.lpMu.Unlock()
+	// force expiry
+	s.mu.Lock()
+	s.exp = time.Now().Add(-time.Second)
+	s.mu.Unlock()
 
-	second, err := lp.getPrimaryToken(context.Background())
+	second, err := s.getToken(context.Background())
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
@@ -122,7 +134,7 @@ func TestGetPrimaryToken_ExpiredTokenTriggersRefresh(t *testing.T) {
 	}
 }
 
-func TestGetPrimaryToken_Non200StatusCodeReturnsError(t *testing.T) {
+func TestSecondaryGetToken_Non200StatusCodeReturnsError(t *testing.T) {
 	t.Parallel()
 
 	// body wraps a non-200 status code
@@ -131,15 +143,15 @@ func TestGetPrimaryToken_Non200StatusCodeReturnsError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	lp := newTestLyricsProviderForHTTP()
-	lp.lpTokenURL = srv.URL
+	s := newTestSecondaryProviderHTTP()
+	s.tokenURL = srv.URL
 
-	if _, err := lp.getPrimaryToken(context.Background()); err == nil {
+	if _, err := s.getToken(context.Background()); err == nil {
 		t.Error("status_code 401 should produce an error, got nil")
 	}
 }
 
-func TestGetPrimaryToken_InvalidateForcesRefetch(t *testing.T) {
+func TestSecondaryGetToken_InvalidateForcesRefetch(t *testing.T) {
 	t.Parallel()
 
 	var requests int32
@@ -149,14 +161,18 @@ func TestGetPrimaryToken_InvalidateForcesRefetch(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	lp := newTestLyricsProviderForHTTP()
-	lp.lpTokenURL = srv.URL
+	s := newTestSecondaryProviderHTTP()
+	s.tokenURL = srv.URL
 
-	if _, err := lp.getPrimaryToken(context.Background()); err != nil {
+	if _, err := s.getToken(context.Background()); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	lp.invalidatePrimaryToken()
-	if _, err := lp.getPrimaryToken(context.Background()); err != nil {
+	s.invalidateToken()
+	// invalidateToken sets a cooldown
+	s.mu.Lock()
+	s.cooldownUntil = time.Time{}
+	s.mu.Unlock()
+	if _, err := s.getToken(context.Background()); err != nil {
 		t.Fatalf("second: %v", err)
 	}
 
@@ -165,19 +181,19 @@ func TestGetPrimaryToken_InvalidateForcesRefetch(t *testing.T) {
 	}
 }
 
-// FetchLyrics, end-to-end with primary source + LRCLIB fallback
+// end-to-end 
 
-// happyPrimarySubtitleResponse returns the deeply-nested JSON primary source
-func happyPrimarySubtitleResponse() []byte {
+// returns the deeply-nested secondary JSON
+func happySecondarySubtitleResponse() []byte {
 	return []byte(`{"message":{"header":{"status_code":200},"body":{"macro_calls":{"track.subtitles.get":{"message":{"header":{"status_code":200},"body":{"subtitle_list":[{"subtitle":{"subtitle_body":"[{\"text\":\"Hello\",\"time\":{\"total\":0}},{\"text\":\"World\",\"time\":{\"total\":1.5}}]"}}]}}}}}}}`)
 }
 
-// noSyncedLyricsResponse returns the body=[] sentinel primary source ships
+// returns the body=[]
 func noSyncedLyricsResponse() []byte {
 	return []byte(`{"message":{"header":{"status_code":200},"body":{"macro_calls":{"track.subtitles.get":{"message":{"header":{"status_code":200},"body":[]}}}}}}`)
 }
 
-func TestFetchLyrics_PrimaryHappyPathReturnsSyncedLyrics(t *testing.T) {
+func TestFetchLyrics_SecondaryHappyPathReturnsSyncedLyrics(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -185,14 +201,16 @@ func TestFetchLyrics_PrimaryHappyPathReturnsSyncedLyrics(t *testing.T) {
 			_, _ = w.Write([]byte(`{"message":{"header":{"status_code":200},"body":{"user_token":"t"}}}`))
 			return
 		}
-		_, _ = w.Write(happyPrimarySubtitleResponse())
+		_, _ = w.Write(happySecondarySubtitleResponse())
 	}))
 	t.Cleanup(srv.Close)
 
-	lp := newTestLyricsProviderForHTTP()
-	lp.lpTokenURL = srv.URL + "/token.get"
-	lp.lpSubtitleURL = srv.URL + "/macro.subtitles.get"
-	lp.lrclibURL = "http://localhost:1/nope"
+	sec := newTestSecondaryProviderHTTP()
+	sec.tokenURL = srv.URL + "/token.get"
+	sec.subtitleURL = srv.URL + "/macro.subtitles.get"
+	ter := newTestTertiaryProviderHTTP()
+	ter.url = "http://localhost:1/nope"
+	lp := newTestOrchestrator(sec, ter)
 
 	result, err := lp.FetchLyrics(
 		context.Background(),
@@ -220,11 +238,10 @@ func TestFetchLyrics_PrimaryHappyPathReturnsSyncedLyrics(t *testing.T) {
 	}
 }
 
-func TestFetchLyrics_PrimaryFailsFallsBackToLRCLIB(t *testing.T) {
+func TestFetchLyrics_SecondaryFailsFallsBackToLRCLIB(t *testing.T) {
 	t.Parallel()
 
-	// primary source returns the "no synced subtitles" sentinel; LRCLIB ships real synced lyrics.
-	// End result is the LRCLIB-decoded LyricsResult
+	// secondary returns "no synced subtitles" our third source has synced lyrics, returns the 3rd source
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "token.get") {
 			_, _ = w.Write([]byte(`{"message":{"header":{"status_code":200},"body":{"user_token":"t"}}}`))
@@ -243,10 +260,12 @@ func TestFetchLyrics_PrimaryFailsFallsBackToLRCLIB(t *testing.T) {
 	}))
 	t.Cleanup(lrc.Close)
 
-	lp := newTestLyricsProviderForHTTP()
-	lp.lpTokenURL = srv.URL + "/token.get"
-	lp.lpSubtitleURL = srv.URL + "/macro.subtitles.get"
-	lp.lrclibURL = lrc.URL
+	sec := newTestSecondaryProviderHTTP()
+	sec.tokenURL = srv.URL + "/token.get"
+	sec.subtitleURL = srv.URL + "/macro.subtitles.get"
+	ter := newTestTertiaryProviderHTTP()
+	ter.url = lrc.URL
+	lp := newTestOrchestrator(sec, ter)
 
 	result, err := lp.FetchLyrics(
 		context.Background(),
@@ -270,11 +289,11 @@ func TestFetchLyrics_PrimaryFailsFallsBackToLRCLIB(t *testing.T) {
 	}
 }
 
-func TestFetchLyrics_BothFailReturnsErrNoLyrics(t *testing.T) {
+func TestFetchLyrics_AllSourcesFailReturnsErrNoLyrics(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Always return the no-lyrics sentinel
+		// always return the no-lyrics
 		if strings.Contains(r.URL.Path, "token.get") {
 			_, _ = w.Write([]byte(`{"message":{"header":{"status_code":200},"body":{"user_token":"t"}}}`))
 			return
@@ -288,10 +307,12 @@ func TestFetchLyrics_BothFailReturnsErrNoLyrics(t *testing.T) {
 	}))
 	t.Cleanup(lrc.Close)
 
-	lp := newTestLyricsProviderForHTTP()
-	lp.lpTokenURL = srv.URL + "/token.get"
-	lp.lpSubtitleURL = srv.URL + "/macro.subtitles.get"
-	lp.lrclibURL = lrc.URL
+	sec := newTestSecondaryProviderHTTP()
+	sec.tokenURL = srv.URL + "/token.get"
+	sec.subtitleURL = srv.URL + "/macro.subtitles.get"
+	ter := newTestTertiaryProviderHTTP()
+	ter.url = lrc.URL
+	lp := newTestOrchestrator(sec, ter)
 
 	_, err := lp.FetchLyrics(context.Background(), "track-nothing", "X", "Y", "", 60_000)
 	if err == nil {
@@ -305,8 +326,8 @@ func TestFetchLyrics_BothFailReturnsErrNoLyrics(t *testing.T) {
 func TestFetchLyrics_EmptyTrackNameReturnsErrorImmediately(t *testing.T) {
 	t.Parallel()
 
-	// LyricsProvider's own guard, no track name = no useful query
-	lp := newTestLyricsProviderForHTTP()
+	// no track name = no useful query
+	lp := newTestOrchestrator(newTestSecondaryProviderHTTP(), newTestTertiaryProviderHTTP())
 
 	_, err := lp.FetchLyrics(context.Background(), "track-x", "", "Artist", "", 60_000)
 	if err == nil {
@@ -324,14 +345,16 @@ func TestFetchLyrics_CacheHitSkipsUpstream(t *testing.T) {
 			_, _ = w.Write([]byte(`{"message":{"header":{"status_code":200},"body":{"user_token":"t"}}}`))
 			return
 		}
-		_, _ = w.Write(happyPrimarySubtitleResponse())
+		_, _ = w.Write(happySecondarySubtitleResponse())
 	}))
 	t.Cleanup(srv.Close)
 
-	lp := newTestLyricsProviderForHTTP()
-	lp.lpTokenURL = srv.URL + "/token.get"
-	lp.lpSubtitleURL = srv.URL + "/macro.subtitles.get"
-	lp.lrclibURL = "http://localhost:1/nope"
+	sec := newTestSecondaryProviderHTTP()
+	sec.tokenURL = srv.URL + "/token.get"
+	sec.subtitleURL = srv.URL + "/macro.subtitles.get"
+	ter := newTestTertiaryProviderHTTP()
+	ter.url = "http://localhost:1/nope"
+	lp := newTestOrchestrator(sec, ter)
 
 	if _, err := lp.FetchLyrics(context.Background(), "k", "Hi", "X", "", 60_000); err != nil {
 		t.Fatalf("first FetchLyrics: %v", err)
@@ -341,7 +364,7 @@ func TestFetchLyrics_CacheHitSkipsUpstream(t *testing.T) {
 		t.Fatal("first call should have hit the network")
 	}
 
-	// Second call same trackId, should be a pure cache hit.
+	// should be a cache hit
 	if _, err := lp.FetchLyrics(context.Background(), "k", "Hi", "X", "", 60_000); err != nil {
 		t.Fatalf("second FetchLyrics: %v", err)
 	}
@@ -355,24 +378,24 @@ func TestFetchLyrics_CacheHitSkipsUpstream(t *testing.T) {
 func TestEvictOldestLocked_BoundsCacheSize(t *testing.T) {
 	t.Parallel()
 
-	// eviction shrinks the cache enough to be bounded again
+	// eviction shrinks the cache enough
 	cases := []struct {
 		name           string
 		startSize      int
 		expectedRemain int
 	}{
-		// Traced: iter1 deletes (0 < 4/2=2). iter2 break (1 >= 3/2=1).
+		// Traced: iter1 deletes (0 < 4/2=2). iter2 break (1 >= 3/2=1)
 		// One deletion total 3 remain.
 		{"size_4_deletes_1", 4, 3},
-		// iter1 deletes (0 < 2). iter2 deletes (1 < 4/2=2). iter3 break (2 >= 3/2=1).
+		// iter1 deletes (0 < 2). iter2 deletes (1 < 4/2=2). iter3 break (2 >= 3/2=1)
 		{"size_5_deletes_2", 5, 3},
-		// iter1-3 delete. iter4 break (3 >= 7/2=3).
+		// iter1-3 delete. iter4 break (3 >= 7/2=3)
 		{"size_10_deletes_3", 10, 7},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			lp := newTestLyricsProviderForHTTP()
+			lp := newTestOrchestrator()
 			for i := 0; i < tc.startSize; i++ {
 				lp.cache[string(rune('a'+i))] = &LyricsResult{SyncType: "LINE_SYNCED"}
 			}
@@ -393,7 +416,7 @@ func TestEvictOldestLocked_EmptyCacheIsSafe(t *testing.T) {
 	t.Parallel()
 
 	// calling eviction on an empty cache must not panic
-	lp := newTestLyricsProviderForHTTP()
+	lp := newTestOrchestrator()
 
 	lp.mu.Lock()
 	lp.evictOldestLocked()
@@ -407,7 +430,7 @@ func TestEvictOldestLocked_EmptyCacheIsSafe(t *testing.T) {
 func TestClearCache_RemovesAllEntries(t *testing.T) {
 	t.Parallel()
 
-	lp := newTestLyricsProviderForHTTP()
+	lp := newTestOrchestrator()
 	for _, k := range []string{"a", "b", "c"} {
 		lp.cache[k] = &LyricsResult{SyncType: "UNSYNCED"}
 	}
@@ -428,14 +451,16 @@ func TestFetchLyrics_ConcurrentCallsForSameTrackDoNotDeadlock(t *testing.T) {
 			_, _ = w.Write([]byte(`{"message":{"header":{"status_code":200},"body":{"user_token":"t"}}}`))
 			return
 		}
-		_, _ = w.Write(happyPrimarySubtitleResponse())
+		_, _ = w.Write(happySecondarySubtitleResponse())
 	}))
 	t.Cleanup(srv.Close)
 
-	lp := newTestLyricsProviderForHTTP()
-	lp.lpTokenURL = srv.URL + "/token.get"
-	lp.lpSubtitleURL = srv.URL + "/macro.subtitles.get"
-	lp.lrclibURL = "http://localhost:1/nope"
+	sec := newTestSecondaryProviderHTTP()
+	sec.tokenURL = srv.URL + "/token.get"
+	sec.subtitleURL = srv.URL + "/macro.subtitles.get"
+	ter := newTestTertiaryProviderHTTP()
+	ter.url = "http://localhost:1/nope"
+	lp := newTestOrchestrator(sec, ter)
 
 	const N = 10
 	var wg sync.WaitGroup
