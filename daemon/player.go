@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -125,9 +126,18 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
 
 		cluster := clusterUpdate.Cluster
 		activeDeviceId := cluster.ActiveDeviceId
-		isUs := activeDeviceId == p.app.deviceId
 
-		if !isUs && cluster.PlayerState != nil {
+		// snapshot the selectable device list
+		p.updateConnectDevices(cluster)
+
+		// "is anything active" signal is ActiveDeviceId
+		switch {
+		case activeDeviceId == p.app.deviceId:
+			// ignore we cannot playback on the car thing
+		case activeDeviceId == "":
+			// nothing is active anywhere so we go idle.
+			p.clearActiveDevice()
+		case cluster.PlayerState != nil:
 			p.updateRemoteState(ctx, cluster)
 		}
 
@@ -283,6 +293,86 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 	}
 }
 
+// ConnectDevice is a selectable Spotify Connect device
+type ConnectDevice struct {
+	Id             string `json:"id"`
+	Name           string `json:"name"`
+	Type           string `json:"type"`
+	Volume         uint32 `json:"volume"`
+	VolumeSteps    int32  `json:"volume_steps"`
+	VolumeDisabled bool   `json:"volume_disabled"`
+	IsActive       bool   `json:"is_active"`
+	IsOffline      bool   `json:"is_offline"`
+	CanTransfer    bool   `json:"can_transfer"`
+}
+
+// snapshots the selectable connect devices from a cluster
+func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
+	activeDeviceId := cluster.ActiveDeviceId
+	devs := make([]ConnectDevice, 0, len(cluster.Device))
+	for id, d := range cluster.Device {
+		if id == p.app.deviceId {
+			continue
+		}
+		cd := ConnectDevice{
+			Id:          id,
+			Name:        d.Name,
+			Type:        d.DeviceType.String(),
+			Volume:      d.Volume,
+			IsActive:    id == activeDeviceId,
+			IsOffline:   d.IsOffline,
+			CanTransfer: len(d.DisallowTransferReasons) == 0,
+		}
+		if d.Capabilities != nil {
+			cd.VolumeSteps = d.Capabilities.VolumeSteps
+			cd.VolumeDisabled = d.Capabilities.DisableVolume
+		}
+		devs = append(devs, cd)
+	}
+	// active device first, then alphabetical
+	sort.Slice(devs, func(i, j int) bool {
+		if devs[i].IsActive != devs[j].IsActive {
+			return devs[i].IsActive
+		}
+		return devs[i].Name < devs[j].Name
+	})
+
+	p.state.connectDevices = devs
+
+	// only emit when the meaningful shape changes
+	sig := connectDevicesSignature(devs)
+	if sig == p.state.connectDevSig {
+		return
+	}
+	p.state.connectDevSig = sig
+	p.app.server.Emit(&ApiEvent{Type: ApiEventTypeConnectDevices, Data: devs})
+}
+
+func connectDevicesSignature(devs []ConnectDevice) string {
+	var sb strings.Builder
+	for _, d := range devs {
+		fmt.Fprintf(&sb, "%s:%t:%t;", d.Id, d.IsActive, d.IsOffline)
+	}
+	return sb.String()
+}
+
+// returns the device snapshot, never nil
+func (p *AppPlayer) connectDevicesOrEmpty() []ConnectDevice {
+	if p.state.connectDevices == nil {
+		return []ConnectDevice{}
+	}
+	return p.state.connectDevices
+}
+
+// drops the observed remote state when no device is active
+func (p *AppPlayer) clearActiveDevice() {
+	if p.state.remoteState == nil {
+		return
+	}
+	p.state.remoteState = nil
+	p.app.server.Emit(&ApiEvent{Type: ApiEventTypeObserverInactive})
+}
+
 // resolveTrackMetadata tries spclient first (fast), falls back to the web API
 // when spclient is unavailable
 func (p *AppPlayer) resolveTrackMetadata(ctx context.Context, spotId librespot.SpotifyId) (artist, album string) {
@@ -426,6 +516,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			return map[string]any{
 				"active":  false,
 				"message": "no remote device is currently playing",
+				"devices": p.connectDevicesOrEmpty(),
 			}, nil
 		}
 
@@ -470,7 +561,15 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			"next_tracks":     rs.NextTracks,
 			"lyrics_url":      lyricsUrl,
 			"raw_metadata":    rs.RawMetadata,
+			"devices":         p.connectDevicesOrEmpty(),
 		}, nil
+
+	case ApiRequestTypeConnectDevices:
+		return map[string]any{"devices": p.connectDevicesOrEmpty()}, nil
+
+	case ApiRequestTypeTransfer:
+		data, _ := req.Data.(ApiRequestDataTransfer)
+		return nil, p.sendTransfer(ctx, data.DeviceId)
 
 	case ApiRequestTypeResume:
 		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "resume"})
@@ -672,6 +771,44 @@ func (p *AppPlayer) sendActiveDeviceVolume(ctx context.Context, volume int64) er
 	return nil
 }
 
+type transferOptions struct {
+	RestorePaused string `json:"restore_paused"`
+}
+
+type transferBody struct {
+	TransferOptions transferOptions `json:"transfer_options"`
+	InteractionId   string          `json:"interaction_id"`
+	CommandId       string          `json:"command_id"`
+}
+
+// moves the current playback session to targetDeviceId
+func (p *AppPlayer) sendTransfer(ctx context.Context, targetDeviceId string) error {
+	if targetDeviceId == "" {
+		return fmt.Errorf("transfer requires a target device id")
+	}
+	if targetDeviceId == p.app.deviceId {
+		return fmt.Errorf("cannot transfer to ourselves (observer cannot play)")
+	}
+	if !p.hasSpotConnId {
+		return fmt.Errorf("dealer not connected (no spotify-connection-id)")
+	}
+
+	body, err := json.Marshal(transferBody{
+		TransferOptions: transferOptions{RestorePaused: "restore"},
+		InteractionId:   randomCommandId(),
+		CommandId:       randomCommandId(),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal transfer: %w", err)
+	}
+
+	if err := p.sess.Spclient().TransferConnect(ctx, p.app.deviceId, targetDeviceId, p.spotConnId, body); err != nil {
+		return fmt.Errorf("transfer to %s: %w", targetDeviceId, err)
+	}
+	p.app.log.Debugf("observer: transferred playback to %s", targetDeviceId)
+	return nil
+}
+
 func convertSpotifyImageUrl(s string) string {
 	if strings.HasPrefix(s, "spotify:image:") {
 		return "https://i.scdn.co/image/" + strings.TrimPrefix(s, "spotify:image:")
@@ -696,7 +833,7 @@ func (p *AppPlayer) Close() {
 	p.sess.Close()
 }
 
-// handleLyricsAsync resolves the track metadata synchronously 
+// handleLyricsAsync resolves the track metadata synchronously
 // keeps slow lyrics HTTP off the player loop so it never stalls the dealer keepalive/messages
 func (p *AppPlayer) handleLyricsAsync(ctx context.Context, req ApiRequest) {
 	data := req.Data.(ApiRequestDataLyrics)
@@ -798,7 +935,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 				continue
 			}
 			// fetching lyrics sometimes block the HTTP connection between the ui
-			// for seconds at a time in cases where fetching lyrics take too long (no lyrics for several songs in succession) 
+			// for seconds at a time in cases where fetching lyrics take too long (no lyrics for several songs in succession)
 			// having it inlione stalls this loop that keeps the dealer keepalive/messages
 			if req.Type == ApiRequestTypeLyrics {
 				p.handleLyricsAsync(ctx, req)

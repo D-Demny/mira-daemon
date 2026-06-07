@@ -24,9 +24,14 @@ type State struct {
 
 	// remoteState tracks what is playing on another device when in observer mode.
 	remoteState *RemoteState
+
+	// connectDevices is the latest snapshot of selectable Connect devices
+	connectDevices []ConnectDevice
+	// connectDevSig identical per-second clusters dont re-emit events
+	connectDevSig string
 }
 
-// RemoteState holds information about the playback state of the currently active remote device. 
+// RemoteState holds information about the playback state of the currently active remote device.
 // This is populated from ClusterUpdate messages
 type RemoteState struct {
 	// DeviceId of the active device.

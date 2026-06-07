@@ -229,6 +229,37 @@ func (c *Spclient) SendPlayerCommand(ctx context.Context, fromDeviceId, toDevice
 	return nil
 }
 
+// transfers the clusters current playback session to another device
+func (c *Spclient) TransferConnect(ctx context.Context, fromDeviceId, toDeviceId, spotConnId string, body []byte) error {
+	if fromDeviceId == "" || toDeviceId == "" {
+		return fmt.Errorf("transfer connect: missing device id (from=%q to=%q)", fromDeviceId, toDeviceId)
+	}
+	if spotConnId == "" {
+		return fmt.Errorf("transfer connect: missing spotify-connection-id")
+	}
+	resp, err := c.Request(
+		ctx,
+		"POST",
+		fmt.Sprintf("/connect-state/v1/connect/transfer/from/%s/to/%s", fromDeviceId, toDeviceId),
+		nil,
+		http.Header{
+			"X-Spotify-Connection-Id": []string{spotConnId},
+			"Content-Type":            []string{"application/json"},
+		},
+		body,
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode/100 != 2 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("transfer connect: status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // sets the volume of a remote device
 func (c *Spclient) SetConnectVolume(ctx context.Context, fromDeviceId, toDeviceId, spotConnId string, body []byte) error {
 	if fromDeviceId == "" || toDeviceId == "" {

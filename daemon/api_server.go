@@ -110,6 +110,8 @@ const (
 	ApiRequestTypeAddToQueue          ApiRequestType = "add_to_queue"
 	ApiRequestTypeToken               ApiRequestType = "token"
 	ApiRequestTypeObserverStatus      ApiRequestType = "observer_status"
+	ApiRequestTypeConnectDevices      ApiRequestType = "connect_devices"
+	ApiRequestTypeTransfer            ApiRequestType = "transfer"
 	ApiRequestTypeLyrics              ApiRequestType = "lyrics"
 )
 
@@ -132,6 +134,8 @@ const (
 	ApiEventTypePlaybackReady        ApiEventType = "playback_ready"
 	ApiEventTypeObserverTrackChanged ApiEventType = "observer_track_changed"
 	ApiEventTypeObserverStateChanged ApiEventType = "observer_state_changed"
+	ApiEventTypeObserverInactive     ApiEventType = "observer_inactive"
+	ApiEventTypeConnectDevices       ApiEventType = "connect_devices"
 
 	ApiEventTypeBluetoothPairing           ApiEventType = "bluetooth/pairing"
 	ApiEventTypeBluetoothPairingCancelled  ApiEventType = "bluetooth/pairing/cancelled"
@@ -198,6 +202,10 @@ type ApiRequestDataPlay struct {
 	Uri       string `json:"uri"`
 	SkipToUri string `json:"skip_to_uri"`
 	Paused    bool   `json:"paused"`
+}
+
+type ApiRequestDataTransfer struct {
+	DeviceId string `json:"device_id"`
 }
 
 type ApiRequestDataNext struct {
@@ -589,6 +597,36 @@ func (s *ConcreteApiServer) serve() {
 		}
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeObserverStatus}, w)
+	})
+	m.HandleFunc("/connect/devices", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// no cluster yet so no devices
+		if !s.playerReady.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []any{}})
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeConnectDevices}, w)
+	})
+	m.HandleFunc("/connect/transfer", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var data ApiRequestDataTransfer
+		if err := jsonDecode(r, &data); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if data.DeviceId == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeTransfer, Data: data}, w)
 	})
 	// /auth/status must answer before any AppPlayer exists
 	m.HandleFunc("/auth/status", func(w http.ResponseWriter, r *http.Request) {
