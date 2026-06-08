@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/introspect"
@@ -16,7 +17,45 @@ type agent struct {
 	conn    *dbus.Conn
 	manager *Manager
 	path    dbus.ObjectPath
+
+	// mu guards current
+	mu      sync.Mutex
 	current *PairingRequest
+}
+
+func (a *agent) setCurrent(pr *PairingRequest) {
+	a.mu.Lock()
+	a.current = pr
+	a.mu.Unlock()
+}
+
+// getCurrent returns a copy of the in-flight request (or nil) so callers never read a struct another goroutine may be mutating
+func (a *agent) getCurrent() *PairingRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.current == nil {
+		return nil
+	}
+	cp := *a.current
+	return &cp
+}
+
+// clearCurrent drops the in-flight request unconditionally
+func (a *agent) clearCurrent() {
+	a.mu.Lock()
+	a.current = nil
+	a.mu.Unlock()
+}
+
+// clearCurrentIfDevice drops the in-flight request only when it belongs to devicePath
+func (a *agent) clearCurrentIfDevice(devicePath string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.current != nil && a.current.Device == devicePath {
+		a.current = nil
+		return true
+	}
+	return false
 }
 
 func newAgent(log librespot.Logger, conn *dbus.Conn, manager *Manager) (*agent, error) {
@@ -86,11 +125,11 @@ func (a *agent) RequestConfirmation(device dbus.ObjectPath, passkey uint32) *dbu
 
 	address := a.addressFromPath(string(device))
 	passkeyStr := fmt.Sprintf("%06d", passkey)
-	a.current = &PairingRequest{
+	a.setCurrent(&PairingRequest{
 		Device:      string(device),
 		Passkey:     passkeyStr,
 		RequestType: "confirmation",
-	}
+	})
 
 	if a.manager.emit != nil {
 		a.manager.emit(EventPairing, PairingStartedPayload{
@@ -125,24 +164,26 @@ func (a *agent) AuthorizeService(device dbus.ObjectPath, uuid string) *dbus.Erro
 func (a *agent) Cancel() *dbus.Error {
 	a.log.Info("bluetooth: pairing cancelled by remote")
 
-	if a.current != nil && a.manager.emit != nil {
+	if pr := a.getCurrent(); pr != nil && a.manager.emit != nil {
 		a.manager.emit(EventPairingCancelled, DeviceDisconnectedPayload{
-			Address: a.addressFromPath(a.current.Device),
+			Address: a.addressFromPath(pr.Device),
 		})
 	}
 
-	a.current = nil
+	a.clearCurrent()
 	return nil
 }
 
 // internal methods called via manager.go (not exported on D-Bus)
 func (a *agent) acceptPairing() error {
-	if a.current == nil {
+	pr := a.getCurrent()
+	if pr == nil {
 		return fmt.Errorf("no pairing request in progress")
 	}
 
-	address := a.addressFromPath(a.current.Device)
+	address := a.addressFromPath(pr.Device)
 
+	// GetDeviceInfo takes Manager.mu
 	deviceInfo, err := a.manager.GetDeviceInfo(address)
 	if err != nil {
 		a.log.WithError(err).Warn("bluetooth: failed to fetch device info after pairing")
@@ -156,14 +197,14 @@ func (a *agent) acceptPairing() error {
 		a.manager.emit(EventPaired, DevicePairedPayload{Device: deviceInfo})
 	}
 
-	a.current = nil
+	a.clearCurrent()
 	return nil
 }
 
 func (a *agent) rejectPairing() error {
-	if a.current == nil {
+	if a.getCurrent() == nil {
 		return fmt.Errorf("no pairing request in progress")
 	}
-	a.current = nil
+	a.clearCurrent()
 	return nil
 }
