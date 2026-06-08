@@ -66,17 +66,37 @@ func (s *FileStateStore) Save(state *librespot.AppState) error {
 	state.Lock()
 	defer state.Unlock()
 
-	tmpFile, err := os.CreateTemp(filepath.Dir(s.statePath), filepath.Base(s.statePath)+".*.tmp")
+	dir := filepath.Dir(s.statePath)
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(s.statePath)+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("failed creating temporary file for app state: %w", err)
 	}
+	tmpName := tmpFile.Name()
+	// no-op after a successful rename, removes the temp file
+	defer func() { _ = os.Remove(tmpName) }()
 
 	if err := json.NewEncoder(tmpFile).Encode(state); err != nil {
+		_ = tmpFile.Close()
 		return fmt.Errorf("failed writing marshalled app state: %w", err)
 	}
 
-	if err := os.Rename(tmpFile.Name(), s.statePath); err != nil {
+	// Flush the filess data to stable storage before the rename
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed syncing app state file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed closing app state file: %w", err)
+	}
+
+	if err := os.Rename(tmpName, s.statePath); err != nil {
 		return fmt.Errorf("failed replacing app state file: %w", err)
+	}
+
+	// fsync the parent directory so the new directory entry is durable
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
 	}
 
 	return nil

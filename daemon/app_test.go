@@ -23,6 +23,8 @@ func TestSessionRetryBackoff(t *testing.T) {
 		{5, 30 * time.Second}, // 32s, cap kicks in
 		{10, 30 * time.Second},
 		{30, 30 * time.Second}, // far past the cap, no overflow
+		{31, 30 * time.Second}, // 1<<31 overflows a 32-bit int
+		{63, 30 * time.Second},
 	}
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("attempt_%d", tt.attempt), func(t *testing.T) {
@@ -31,6 +33,17 @@ func TestSessionRetryBackoff(t *testing.T) {
 				t.Errorf("sessionRetryBackoff(%d) = %v, want %v", tt.attempt, got, tt.want)
 			}
 		})
+	}
+}
+
+// the backoff is always a usable positive delay no greater than the cap
+func TestSessionRetryBackoffAlwaysPositiveAndCapped(t *testing.T) {
+	t.Parallel()
+	const cap = 30 * time.Second
+	for attempt := 0; attempt <= 70; attempt++ {
+		if got := sessionRetryBackoff(attempt); got <= 0 || got > cap {
+			t.Fatalf("sessionRetryBackoff(%d) = %v, want in (0, %v]", attempt, got, cap)
+		}
 	}
 }
 
@@ -165,7 +178,7 @@ func TestSetOnlineState_NoOpWhenAlreadyOnline(t *testing.T) {
 	if app.onlineCh != chAfterFirst {
 		t.Error("setOnlineState(true) when online should not replace onlineCh")
 	}
-	// Verify the channel is NOT closed 
+	// Verify the channel is NOT closed
 	select {
 	case <-app.onlineCh:
 		t.Error("onlineCh was closed by no-op setOnlineState(true); double-close protection failed")

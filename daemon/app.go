@@ -129,7 +129,9 @@ func New(opts *Options) (*App, error) {
 		app.deviceId = hex.EncodeToString(deviceIdBytes)
 		app.log.Infof("generated new device id: %s", app.deviceId)
 
+		app.state.Lock()
 		app.state.DeviceId = app.deviceId
+		app.state.Unlock()
 		if err := app.persistState(); err != nil {
 			return nil, err
 		}
@@ -171,7 +173,11 @@ func New(opts *Options) (*App, error) {
 
 		// persist on change so next reboot has the address
 		bm.SetLastPanAddressChangedHandler(func(addr string) {
+			// Fires from Bluetooth manager goroutines; hold the state lock that
+			// Save() relies on. Release it before persistState (Save re-locks).
+			app.state.Lock()
 			app.state.LastBluetoothPanAddress = addr
+			app.state.Unlock()
 			if err := app.persistState(); err != nil {
 				app.log.WithError(err).Warn("failed to persist last PAN address")
 			}
@@ -634,12 +640,15 @@ func (app *App) waitOnline(ctx context.Context, timeout time.Duration) error {
 
 // sessionRetryBackoff: 2s, 4s, 8s, 16s, 30s, 30s, ... capped at 30s
 func sessionRetryBackoff(attempt int) time.Duration {
-	d := time.Duration(1<<attempt) * time.Second
 	const cap = 30 * time.Second
-	if d > cap {
+	// int is 32-bit on the armv6 build target, so 1<<31 overflows to a negative
+	if attempt >= 5 {
 		return cap
 	}
-	return d
+	if d := time.Duration(1<<attempt) * time.Second; d < cap {
+		return d
+	}
+	return cap
 }
 
 // newAppPlayerWithRetry retries session creation with exponential backoff
@@ -654,6 +663,14 @@ func (app *App) newAppPlayerWithRetry(ctx context.Context, creds any) (*AppPlaye
 		}
 
 		appPlayer, err := app.newAppPlayer(ctx, creds)
+		if err == nil {
+			if err = appPlayer.sess.Dealer().Connect(ctx); err != nil {
+				appPlayer.Close()
+				err = fmt.Errorf("failed connecting to dealer: %w", err)
+			} else {
+				app.log.Debugf("connected to dealer")
+			}
+		}
 		if err == nil {
 			return appPlayer, nil
 		}
@@ -698,8 +715,10 @@ func (app *App) withCredentials(ctx context.Context, creds any) (err error) {
 		return err
 	}
 
+	app.state.Lock()
 	app.state.Credentials.Username = appPlayer.sess.Username()
 	app.state.Credentials.Data = appPlayer.sess.StoredCredentials()
+	app.state.Unlock()
 
 	if err = app.persistState(); err != nil {
 		return err
