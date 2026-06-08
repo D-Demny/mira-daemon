@@ -2,10 +2,10 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 
 	librespot "github.com/devgianlu/go-librespot"
 	pbdata "github.com/devgianlu/go-librespot/proto/spotify/clienttoken/data/v0"
@@ -13,7 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func retrieveClientToken(c *http.Client, deviceId string) (string, error) {
+func retrieveClientToken(ctx context.Context, c *http.Client, deviceId string) (string, error) {
 	body, err := proto.Marshal(&pbhttp.ClientTokenRequest{
 		RequestType: pbhttp.ClientTokenRequestType_REQUEST_CLIENT_DATA_REQUEST,
 		Request: &pbhttp.ClientTokenRequest_ClientData{
@@ -33,20 +33,16 @@ func retrieveClientToken(c *http.Client, deviceId string) (string, error) {
 		return "", fmt.Errorf("failed marshalling ClientTokenRequest: %w", err)
 	}
 
-	reqUrl, err := url.Parse("https://clienttoken.spotify.com/v1/clienttoken")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://clienttoken.spotify.com/v1/clienttoken", bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("invalid clienttoken url: %w", err)
+		return "", fmt.Errorf("failed building clienttoken request: %w", err)
 	}
+	req.Header.Set("Accept", "application/x-protobuf")
+	req.Header.Set("User-Agent", librespot.UserAgent())
 
-	resp, err := c.Do(&http.Request{
-		Method: "POST",
-		URL:    reqUrl,
-		Header: http.Header{
-			"Accept":     []string{"application/x-protobuf"},
-			"User-Agent": []string{librespot.UserAgent()},
-		},
-		Body: io.NopCloser(bytes.NewReader(body)),
-	})
+	// ctx-bound so a stalled pre-network connect is cancellable
+	resp, err := c.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed requesting clienttoken: %w", err)
 	}

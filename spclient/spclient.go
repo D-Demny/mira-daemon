@@ -79,6 +79,11 @@ func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.
 
 	var forceNewToken bool
 	resp, err := backoff.RetryWithData(func() (*http.Response, error) {
+		// restore the request body on every attempt
+		if req.GetBody != nil {
+			req.Body, _ = req.GetBody()
+		}
+
 		accessToken, err := c.accessToken(ctx, forceNewToken)
 		if err != nil {
 			// Fail with a permanent error if we can't get a new token. The caller should have already retried, there's
