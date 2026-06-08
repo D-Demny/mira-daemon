@@ -47,3 +47,34 @@ func TestWriteConnRejectsClosedDealer(t *testing.T) {
 		t.Fatalf("expected ErrDealerClosed, got %v", err)
 	}
 }
+
+func TestDeliverMessageDoesNotBlockOnFullReceiver(t *testing.T) {
+	d := &Dealer{}
+	recv := messageReceiver{c: make(chan Message, 1)}
+	recv.c <- Message{Uri: "hm://connect-state/v1/old"}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.deliverMessage(&librespot.NullLogger{}, recv, Message{Uri: "hm://connect-state/v1/new"})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deliverMessage blocked on a full receiver")
+	}
+}
+
+func TestDeliverMessageMakesRoomForConnectionID(t *testing.T) {
+	d := &Dealer{}
+	recv := messageReceiver{c: make(chan Message, 1)}
+	recv.c <- Message{Uri: "hm://connect-state/v1/old"}
+
+	d.deliverMessage(&librespot.NullLogger{}, recv, Message{Uri: "hm://pusher/v1/connections/abc"})
+
+	got := <-recv.c
+	if got.Uri != "hm://pusher/v1/connections/abc" {
+		t.Fatalf("buffered message = %q, want connection-id message", got.Uri)
+	}
+}
