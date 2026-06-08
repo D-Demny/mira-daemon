@@ -129,7 +129,11 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
 	if strings.HasPrefix(msg.Uri, "hm://pusher/v1/connections/") {
 		p.spotConnId = msg.Headers["Spotify-Connection-Id"]
 		p.hasSpotConnId = p.spotConnId != ""
-		p.app.log.Debugf("received connection id: %s...%s", p.spotConnId[:16], p.spotConnId[len(p.spotConnId)-16:])
+		if len(p.spotConnId) >= 32 {
+			p.app.log.Debugf("received connection id: %s...%s", p.spotConnId[:16], p.spotConnId[len(p.spotConnId)-16:])
+		} else {
+			p.app.log.Debugf("received connection id (%d bytes)", len(p.spotConnId))
+		}
 
 		go p.registerAsync(p.spotConnId)
 
@@ -847,7 +851,10 @@ func firstNonEmpty(vals ...string) string {
 }
 
 func (p *AppPlayer) Close() {
-	p.stop <- struct{}{}
+	select {
+	case p.stop <- struct{}{}:
+	default:
+	}
 	p.sess.Close()
 }
 
@@ -898,13 +905,6 @@ func (p *AppPlayer) handleLyricsAsync(ctx context.Context, req ApiRequest) {
 }
 
 func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
-	err := p.sess.Dealer().Connect(ctx)
-	if err != nil {
-		p.app.log.Errorf("failed connecting to dealer: %v", err)
-		p.Close()
-		return
-	}
-
 	// Signal the API server that we are now consuming the request channel
 	p.app.server.SetPlayerReady(true)
 	defer p.app.server.SetPlayerReady(false)
