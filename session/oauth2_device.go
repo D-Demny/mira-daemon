@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -41,6 +42,8 @@ type deviceTokenResponse struct {
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
 }
+
+var errDeviceTokenPollTransient = errors.New("transient device token poll failure")
 
 // runDeviceAuthFlow blocks until user authorizes / code expires / ctx cancel.
 // urlCallback fires once with the verification URI so the caller can render
@@ -85,6 +88,10 @@ func runDeviceAuthFlow(
 
 		tok, err := pollDeviceToken(ctx, client, auth.DeviceCode)
 		if err != nil {
+			if errors.Is(err, errDeviceTokenPollTransient) {
+				log.WithError(err).Warn("device auth token poll failed transiently; keeping current QR code")
+				continue
+			}
 			return "", err
 		}
 		if tok == nil {
@@ -151,9 +158,16 @@ func pollDeviceToken(ctx context.Context, client *http.Client, deviceCode string
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("%w: token request failed: %v", errDeviceTokenPollTransient, err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		return nil, fmt.Errorf("%w: token endpoint returned %s", errDeviceTokenPollTransient, resp.Status)
+	}
 
 	var out deviceTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
