@@ -32,6 +32,9 @@ type Manager struct {
 	panMu          sync.Mutex
 	lastPanAddress string
 
+	// serialize PAN connect/reconnect attempts without blocking
+	networkMu sync.Mutex
+
 	// when non-nil, signals an active background loop retrying PAN while offline
 	offlineRetryMu   sync.Mutex
 	offlineRetryStop chan struct{}
@@ -187,10 +190,8 @@ func (m *Manager) handleDevicePaired(devicePath, address string) {
 	m.log.Infof("bluetooth: device paired: %s", devicePath)
 
 	// clear pending pair so a stale Cancel() doesn't fire later
-	if m.agent != nil && m.agent.current != nil && m.agent.current.Device == devicePath {
-		m.mu.Lock()
-		m.agent.current = nil
-		m.mu.Unlock()
+	if m.agent != nil {
+		m.agent.clearCurrentIfDevice(devicePath)
 	}
 
 	info, err := m.GetDeviceInfo(address)
@@ -319,10 +320,8 @@ func (m *Manager) handleDeviceDisconnected(devicePath, address string) {
 
 	m.log.Infof("bluetooth: device disconnected: %s", devicePath)
 
-	if m.agent != nil && m.agent.current != nil && m.agent.current.Device == devicePath {
-		m.mu.Lock()
-		m.agent.current = nil
-		m.mu.Unlock()
+	if m.agent != nil {
+		m.agent.clearCurrentIfDevice(devicePath)
 	}
 }
 
@@ -405,7 +404,7 @@ func (m *Manager) shouldRetryPan(now time.Time) (allowed bool, recentDrops int) 
 
 const (
 	offlineRetryInterval    = 15 * time.Second
-	offlineRetryMaxAttempts = 20 
+	offlineRetryMaxAttempts = 20
 )
 
 func (m *Manager) SetOfflineRetry(active bool) {
@@ -615,8 +614,6 @@ func fillDeviceInfo(info *DeviceInfo, props map[string]dbus.Variant) {
 
 func (m *Manager) GetDeviceInfo(address string) (*DeviceInfo, error) {
 	m.log.Debugf("bluetooth: GetDeviceInfo(%s) entry", address)
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	devicePath := formatDevicePath(m.adapter, address)
 	obj := m.conn.Object(bluezBusName, devicePath)
@@ -698,13 +695,10 @@ func (m *Manager) GetCurrentPairingRequest() *PairingRequest {
 	if m.agent == nil {
 		return nil
 	}
-	return m.agent.current
+	return m.agent.getCurrent()
 }
 
 func (m *Manager) ConnectDevice(address string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	cmd := exec.Command("nmcli", "device", "connect", address)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nmcli connect: %w (output: %s)", err, strings.TrimSpace(string(out)))
@@ -762,8 +756,8 @@ func (m *Manager) ConnectNetworkForced(address string) error {
 
 func (m *Manager) connectNetworkInternal(address string, force bool) error {
 	m.log.Debugf("bluetooth: ConnectNetwork(%s, force=%v) entry", address, force)
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.networkMu.Lock()
+	defer m.networkMu.Unlock()
 
 	devicePath := formatDevicePath(m.adapter, address)
 	obj := m.conn.Object(bluezBusName, devicePath)
