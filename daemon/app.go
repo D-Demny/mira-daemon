@@ -2,14 +2,18 @@ package daemon
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -38,12 +42,21 @@ type App struct {
 	server   ApiServer
 	logoutCh chan *AppPlayer
 
+	// currentPlayer points at the running AppPlayer (nil between sessions), so
+	// App-level actions like resume-from-suspend can reach its dealer.
+	currentPlayer atomic.Pointer[AppPlayer]
+
+	// virtualTouch is a lazily-created uinput touchscreen used to inject a tap
+	// on resume (re-engages Chromium's keyboard seat). nil until first created.
+	virtualTouchMu sync.Mutex
+	virtualTouch   *os.File
+
 	// auth state for /auth/status
 	authMu       sync.RWMutex
 	authRequired bool
 	authURL      string
 	// authKnown distinguishes the state so the frontend can branch correctly
-	authKnown    bool
+	authKnown bool
 
 	bt *bluetooth.Manager
 
@@ -343,7 +356,7 @@ func (app *App) PerformRestart() {
 	app.reboot()
 }
 
-// backlight is off for an extra second so a visual glitch doesnt show 
+// backlight is off for an extra second so a visual glitch doesnt show
 func (app *App) PerformSuspend() {
 	app.log.Info("system: suspending")
 	script := `for bl in /sys/class/backlight/*/bl_power; do echo 4 > "$bl" 2>/dev/null; done
@@ -354,6 +367,186 @@ for bl in /sys/class/backlight/*/bl_power; do echo 0 > "$bl" 2>/dev/null; done`
 		app.log.WithError(err).Warn("system: suspend script failed")
 	}
 	app.log.Info("system: resumed from suspend")
+	app.onResume()
+}
+
+// onResume recovers state that suspend-to-RAM breaks
+func (app *App) onResume() {
+	p := app.currentPlayer.Load()
+	app.log.Infof("system: resume recovery (player active: %t)", p != nil)
+
+	// Force the dealer to reconnect
+	if p != nil && p.sess != nil {
+		p.sess.Dealer().ForceReconnect()
+	}
+
+	// restore button input
+	go func() {
+		if err := app.ensureVirtualTouch(); err != nil {
+			app.log.WithError(err).Warn("system: virtual touch unavailable (buttons may need a manual screen tap)")
+			return
+		}
+		// delay so chromium + virtual device are ready
+		time.Sleep(2500 * time.Millisecond)
+		if err := app.emitVirtualTap(); err != nil {
+			app.log.WithError(err).Warn("system: input recovery tap failed")
+		}
+	}()
+}
+
+// uinput ioctls
+const (
+	uiSetEvbit   = 0x40045564
+	uiSetKeybit  = 0x40045565
+	uiSetAbsbit  = 0x40045567
+	uiSetPropbit = 0x4004556e
+	uiDevCreate  = 0x5501
+)
+
+const (
+	evSyn           = 0x00
+	evKey           = 0x01
+	evAbs           = 0x03
+	synReport       = 0x00
+	btnTouch        = 0x14a
+	absMtSlot       = 0x2f
+	absMtTouchMajor = 0x30
+	absMtPositionX  = 0x35
+	absMtPositionY  = 0x36
+	absMtTrackingID = 0x39
+	absMtPressure   = 0x3a
+	inputPropDirect = 0x01
+	absCnt          = 64
+)
+
+// ensureVirtualTouch lazily creates a uinput virtual touchscreen
+func (app *App) ensureVirtualTouch() error {
+	app.virtualTouchMu.Lock()
+	defer app.virtualTouchMu.Unlock()
+	if app.virtualTouch != nil {
+		return nil
+	}
+	f, err := createVirtualTouchscreen()
+	if err != nil {
+		return err
+	}
+	app.virtualTouch = f
+	app.log.Info("system: created uinput virtual touchscreen for resume input recovery")
+	return nil
+}
+
+// emitVirtualTap sends one down+up tap through the virtual touchscreen
+func (app *App) emitVirtualTap() error {
+	app.virtualTouchMu.Lock()
+	f := app.virtualTouch
+	app.virtualTouchMu.Unlock()
+	if f == nil {
+		return fmt.Errorf("virtual touch not initialized")
+	}
+
+	ev := func(typ, code uint16, val int32) []byte {
+		b := make([]byte, 16)
+		binary.LittleEndian.PutUint16(b[8:], typ)
+		binary.LittleEndian.PutUint16(b[10:], code)
+		binary.LittleEndian.PutUint32(b[12:], uint32(val))
+		return b
+	}
+	write := func(events ...[]byte) error {
+		var buf []byte
+		for _, e := range events {
+			buf = append(buf, e...)
+		}
+		_, err := f.Write(buf)
+		return err
+	}
+
+	// down near a corner
+	if err := write(
+		ev(evAbs, absMtTrackingID, 1),
+		ev(evAbs, absMtPositionX, 20),
+		ev(evAbs, absMtPositionY, 20),
+		ev(evAbs, absMtPressure, 13),
+		ev(evKey, btnTouch, 1),
+		ev(evSyn, synReport, 0),
+	); err != nil {
+		return err
+	}
+	time.Sleep(40 * time.Millisecond)
+	return write(
+		ev(evAbs, absMtTrackingID, -1),
+		ev(evAbs, absMtPressure, 0),
+		ev(evKey, btnTouch, 0),
+		ev(evSyn, synReport, 0),
+	)
+}
+
+func createVirtualTouchscreen() (*os.File, error) {
+	f, err := os.OpenFile("/dev/uinput", os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open uinput: %w", err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = f.Close()
+		}
+	}()
+
+	ioctl := func(req, arg uintptr) error {
+		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), req, arg); errno != 0 {
+			return errno
+		}
+		return nil
+	}
+
+	for _, ev := range []uintptr{evSyn, evKey, evAbs} {
+		if err := ioctl(uiSetEvbit, ev); err != nil {
+			return nil, fmt.Errorf("set evbit %d: %w", ev, err)
+		}
+	}
+	if err := ioctl(uiSetKeybit, btnTouch); err != nil {
+		return nil, fmt.Errorf("set keybit: %w", err)
+	}
+	if err := ioctl(uiSetPropbit, inputPropDirect); err != nil {
+		return nil, fmt.Errorf("set propbit: %w", err)
+	}
+	for _, ax := range []uintptr{absMtSlot, absMtTouchMajor, absMtPositionX, absMtPositionY, absMtTrackingID, absMtPressure} {
+		if err := ioctl(uiSetAbsbit, ax); err != nil {
+			return nil, fmt.Errorf("set absbit %d: %w", ax, err)
+		}
+	}
+
+	// struct uinput_user_dev
+	const (
+		nameLen   = 80
+		idOff     = nameLen
+		absmaxOff = nameLen + 8 + 4
+	)
+	dev := make([]byte, absmaxOff+4*absCnt*4)
+	copy(dev[0:nameLen], "thing-virtual-touch")
+	binary.LittleEndian.PutUint16(dev[idOff:], 0x06)
+	binary.LittleEndian.PutUint16(dev[idOff+2:], 0x16c0)
+	binary.LittleEndian.PutUint16(dev[idOff+4:], 0x05df)
+	binary.LittleEndian.PutUint16(dev[idOff+6:], 1)
+	setAbsMax := func(code, val int) {
+		binary.LittleEndian.PutUint32(dev[absmaxOff+code*4:], uint32(val))
+	}
+	setAbsMax(absMtPositionX, 4095)
+	setAbsMax(absMtPositionY, 4095)
+	setAbsMax(absMtSlot, 9)
+	setAbsMax(absMtTrackingID, 65535)
+	setAbsMax(absMtPressure, 255)
+	setAbsMax(absMtTouchMajor, 255)
+
+	if _, err := f.Write(dev); err != nil {
+		return nil, fmt.Errorf("write uinput_user_dev: %w", err)
+	}
+	if err := ioctl(uiDevCreate, 0); err != nil {
+		return nil, fmt.Errorf("UI_DEV_CREATE: %w", err)
+	}
+
+	ok = true
+	return f, nil
 }
 
 func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err error) {

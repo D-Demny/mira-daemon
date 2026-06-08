@@ -119,6 +119,23 @@ func (d *Dealer) Close() {
 	})
 }
 
+// ForceReconnect closes the current connection
+func (d *Dealer) ForceReconnect() {
+	select {
+	case <-d.done:
+		return
+	default:
+	}
+	d.log.Debugf("forcing dealer reconnect")
+	d.connMu.RLock()
+	conn := d.conn
+	d.connMu.RUnlock()
+	if conn != nil {
+		// CloseNow tears down the underlying TCP immediately
+		_ = conn.CloseNow()
+	}
+}
+
 func (d *Dealer) startReceiving() {
 	d.recvLoopOnce.Do(func() {
 		d.log.Tracef("starting dealer recv loop")
@@ -236,7 +253,10 @@ loop:
 	case <-d.done:
 	default:
 		d.connMu.Lock()
-		if err := backoff.Retry(d.reconnect, backoff.NewExponentialBackOff()); err != nil {
+		// must keep retrying across long network outages
+		bo := backoff.NewExponentialBackOff()
+		bo.MaxElapsedTime = 0
+		if err := backoff.Retry(d.reconnect, bo); err != nil {
 			d.log.WithError(err).Errorf("failed reconnecting dealer")
 			d.connMu.Unlock()
 
@@ -285,6 +305,12 @@ func (d *Dealer) sendReply(key string, success bool) error {
 }
 
 func (d *Dealer) reconnect() error {
+	// stop the (now infinite) retry loop if we're shutting down
+	select {
+	case <-d.done:
+		return backoff.Permanent(ErrDealerClosed)
+	default:
+	}
 	if err := d.connect(context.TODO()); err != nil {
 		return err
 	}

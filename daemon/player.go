@@ -102,6 +102,26 @@ func (p *AppPlayer) handleAccesspointPacket(pktType ap.PacketType, payload []byt
 	}
 }
 
+func (p *AppPlayer) registerAsync(connId string) {
+	waits := []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second}
+	for i, wait := range waits {
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := p.putConnectState(ctx, connId, connectpb.PutStateReason_NEW_DEVICE)
+		cancel()
+		if err == nil {
+			if i > 0 {
+				p.app.log.Debugf("connect state put landed on attempt %d", i+1)
+			}
+			return
+		}
+		p.app.log.WithError(err).Warnf("connect state put failed (attempt %d), retrying", i+1)
+	}
+	p.app.log.Warn("connect state put gave up; will re-register on next dealer reconnect")
+}
+
 func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -111,9 +131,7 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
 		p.hasSpotConnId = p.spotConnId != ""
 		p.app.log.Debugf("received connection id: %s...%s", p.spotConnId[:16], p.spotConnId[len(p.spotConnId)-16:])
 
-		if err := p.putConnectState(ctx, connectpb.PutStateReason_NEW_DEVICE); err != nil {
-			return fmt.Errorf("failed initial state put: %w", err)
-		}
+		go p.registerAsync(p.spotConnId)
 
 		p.hasInitialConnectState = true
 		p.notifyPlaybackReadyIfNeeded()
@@ -890,6 +908,10 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	// Signal the API server that we are now consuming the request channel
 	p.app.server.SetPlayerReady(true)
 	defer p.app.server.SetPlayerReady(false)
+
+	// expose ourselves to app level actions
+	p.app.currentPlayer.Store(p)
+	defer p.app.currentPlayer.CompareAndSwap(p, nil)
 
 	p.lyricsProvider = NewLyricsProvider(p.app.log, func(ctx context.Context, force bool) (string, error) {
 		return p.sess.Spclient().GetAccessToken(ctx, force)
