@@ -75,11 +75,15 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 	}
 
 	lp.mu.RLock()
-	if cached, ok := lp.cache[trackId]; ok {
-		lp.mu.RUnlock()
+	cached, ok := lp.cache[trackId]
+	lp.mu.RUnlock()
+	if ok {
+		// a nil entry is a negative cache
+		if cached == nil {
+			return nil, ErrNoLyrics
+		}
 		return cached, nil
 	}
-	lp.mu.RUnlock()
 
 	q := lyricsQuery{
 		trackId:    trackId,
@@ -90,9 +94,14 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 	}
 
 	var result, firstUnsynced *LyricsResult
+	var sawTransientError bool
 	for _, src := range lp.sources {
 		res, err := src.fetch(ctx, q)
 		if err != nil {
+			// ErrNoLyrics means the source has nothing for this track
+			if !errors.Is(err, ErrNoLyrics) {
+				sawTransientError = true
+			}
 			lp.log.Debugf("lyrics: %s failed: %v", src.name(), err)
 			continue
 		}
@@ -112,18 +121,30 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 		result = firstUnsynced
 	}
 	if result == nil {
+		// cache the negative only when every source returns no lyrics
+		if !sawTransientError {
+			lp.mu.Lock()
+			lp.storeLocked(trackId, nil)
+			lp.mu.Unlock()
+			lp.log.Debugf("lyrics: confirmed none for %q by %q, caching negative", trackName, artistName)
+		}
 		return nil, ErrNoLyrics
 	}
 
 	lp.mu.Lock()
-	lp.cache[trackId] = result
-	if len(lp.cache) > 200 {
-		lp.evictOldestLocked()
-	}
+	lp.storeLocked(trackId, result)
 	lp.mu.Unlock()
 
 	lp.log.Debugf("lyrics found for %q by %q (%s, %d lines)", trackName, artistName, result.SyncType, len(result.Lines))
 	return result, nil
+}
+
+// storeLocked records a cache entry
+func (lp *LyricsProvider) storeLocked(trackId string, result *LyricsResult) {
+	lp.cache[trackId] = result
+	if len(lp.cache) > 200 {
+		lp.evictOldestLocked()
+	}
 }
 
 func (lp *LyricsProvider) evictOldestLocked() {
@@ -150,11 +171,11 @@ func (lp *LyricsProvider) ClearCache() {
 var errPrimaryUnauthorized = errors.New("primary unauthorized")
 
 type primaryLyricProvider struct {
-	log    librespot.Logger
-	client *http.Client
-	url      string
-	query    string
-	platform string
+	log            librespot.Logger
+	client         *http.Client
+	url            string
+	query          string
+	platform       string
 	getAccessToken func(ctx context.Context, force bool) (string, error)
 }
 
@@ -173,10 +194,10 @@ func (p *primaryLyricProvider) name() string { return "primary" }
 
 func (p *primaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*LyricsResult, error) {
 	if p.url == "" {
-		return nil, errors.New("primary disabled (no env config)")
+		return nil, fmt.Errorf("primary disabled (no env config): %w", ErrNoLyrics)
 	}
 	if p.getAccessToken == nil {
-		return nil, errors.New("primary: no access token source")
+		return nil, fmt.Errorf("primary: no access token source: %w", ErrNoLyrics)
 	}
 
 	// trackId may arrive as a bare id or in a "<type>:<id>" form
@@ -185,7 +206,7 @@ func (p *primaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*Lyric
 		id = id[i+1:]
 	}
 	if id == "" {
-		return nil, errors.New("primary: empty track id")
+		return nil, fmt.Errorf("primary: empty track id: %w", ErrNoLyrics)
 	}
 
 	result, err := p.request(ctx, id, false)
@@ -211,7 +232,7 @@ func (p *primaryLyricProvider) request(ctx context.Context, trackId string, forc
 	if err != nil {
 		return nil, fmt.Errorf("creating primary request: %w", err)
 	}
-	// a browser-like User-Agent 
+	// a browser-like User-Agent
 	req.Header.Set("Authorization", "Bearer "+token)
 	if p.platform != "" {
 		req.Header.Set("App-Platform", p.platform)
@@ -230,7 +251,7 @@ func (p *primaryLyricProvider) request(ctx context.Context, trackId string, forc
 		return nil, errPrimaryUnauthorized
 	case resp.StatusCode == 404:
 		// no lyrics for this track in the primary source
-		return nil, fmt.Errorf("primary: no lyrics for track")
+		return nil, fmt.Errorf("primary: no lyrics for track: %w", ErrNoLyrics)
 	case resp.StatusCode != 200:
 		return nil, fmt.Errorf("primary status %d", resp.StatusCode)
 	}
@@ -257,7 +278,7 @@ func parsePrimary(body []byte) (*LyricsResult, error) {
 	}
 
 	if len(resp.Lyrics.Lines) == 0 {
-		return nil, fmt.Errorf("primary: no lines")
+		return nil, fmt.Errorf("primary: no lines: %w", ErrNoLyrics)
 	}
 
 	syncType := resp.Lyrics.SyncType
@@ -283,7 +304,7 @@ func parsePrimary(body []byte) (*LyricsResult, error) {
 const secondaryCooldown = 60 * time.Second
 
 type secondaryLyricProvider struct {
-	log librespot.Logger
+	log    librespot.Logger
 	client *http.Client
 
 	tokenURL    string
@@ -293,9 +314,9 @@ type secondaryLyricProvider struct {
 	referer     string
 	subtitleFmt string
 
-	mu  sync.Mutex
-	tok string
-	exp time.Time
+	mu            sync.Mutex
+	tok           string
+	exp           time.Time
 	cooldownUntil time.Time
 }
 
@@ -402,7 +423,7 @@ func (s *secondaryLyricProvider) invalidateToken() {
 
 func (s *secondaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*LyricsResult, error) {
 	if s.tokenURL == "" || s.subtitleURL == "" {
-		return nil, errors.New("secondary disabled (no env config)")
+		return nil, fmt.Errorf("secondary disabled (no env config): %w", ErrNoLyrics)
 	}
 
 	s.mu.Lock()
@@ -509,7 +530,7 @@ func (s *secondaryLyricProvider) parseResponse(body []byte) (*LyricsResult, erro
 		}
 	}
 
-	return nil, fmt.Errorf("no lyrics data in secondary response")
+	return nil, fmt.Errorf("no lyrics data in secondary response: %w", ErrNoLyrics)
 }
 
 func (s *secondaryLyricProvider) parseSubtitles(raw json.RawMessage) (*LyricsResult, error) {
@@ -655,7 +676,7 @@ func (t *tertiaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*Lyri
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 404 {
-		return nil, fmt.Errorf("lrclib: no lyrics found")
+		return nil, fmt.Errorf("lrclib: no lyrics found: %w", ErrNoLyrics)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -695,7 +716,7 @@ func (t *tertiaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*Lyri
 		return plainTextToResult(lrcResp.PlainLyrics), nil
 	}
 
-	return nil, fmt.Errorf("lrclib: empty lyrics")
+	return nil, fmt.Errorf("lrclib: empty lyrics: %w", ErrNoLyrics)
 }
 
 // helpers
