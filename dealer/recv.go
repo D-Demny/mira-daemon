@@ -9,8 +9,15 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"time"
 
+	librespot "github.com/devgianlu/go-librespot"
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+)
+
+const (
+	messageReceiverBuffer = 32
+	requestReceiverBuffer = 8
 )
 
 type messageReceiver struct {
@@ -124,8 +131,9 @@ func (d *Dealer) handleMessage(rawMsg *RawMessage) {
 	//goland:noinspection GoImportUsedAsName
 	log := d.log.WithField("uri", rawMsg.Uri)
 
+	// payload count is controlled by the remote Spotify dealer
 	if len(rawMsg.Payloads) > 1 {
-		panic("unsupported number of payloads")
+		log.Warnf("dealer message has %d payloads, only the first will be processed", len(rawMsg.Payloads))
 	}
 
 	var matchedReceivers []messageReceiver
@@ -178,8 +186,32 @@ func (d *Dealer) handleMessage(rawMsg *RawMessage) {
 	}
 
 	for _, recv := range matchedReceivers {
-		recv.c <- msg
+		d.deliverMessage(log, recv, msg)
 	}
+}
+
+func (d *Dealer) deliverMessage(log librespot.Logger, recv messageReceiver, msg Message) {
+	select {
+	case recv.c <- msg:
+		return
+	default:
+	}
+
+	// Connection-id messages are not as safely replaced as cluster snapshots
+	if strings.HasPrefix(msg.Uri, "hm://pusher/v1/connections/") {
+		select {
+		case <-recv.c:
+		default:
+		}
+		select {
+		case recv.c <- msg:
+		default:
+			log.Warn("dealer message receiver full; dropped connection-id message")
+		}
+		return
+	}
+
+	log.Debug("dealer message receiver full; dropped message")
 }
 
 func (d *Dealer) ReceiveMessage(uriPrefixes ...string) <-chan Message {
@@ -198,7 +230,7 @@ func (d *Dealer) ReceiveMessage(uriPrefixes ...string) <-chan Message {
 	}
 
 	d.messageReceiversLock.Lock()
-	c := make(chan Message)
+	c := make(chan Message, messageReceiverBuffer)
 	d.messageReceivers = append(d.messageReceivers, messageReceiver{uriPrefixes, c})
 	d.startReceiving()
 	d.messageReceiversLock.Unlock()
@@ -232,27 +264,45 @@ func (d *Dealer) handleRequest(rawMsg *RawMessage) {
 		return
 	}
 
-	// dispatch request
 	resp := make(chan bool, 1)
-	select {
-	case recv.c <- Request{
+	req := Request{
 		resp:         resp,
 		MessageIdent: rawMsg.MessageIdent,
 		Payload:      payload,
-	}:
+	}
+
+	// dispatch without letting a stuck player command starve the dealer read loop
+	select {
+	case recv.c <- req:
 	case <-d.done:
+		return
+	default:
+		log.Warn("dealer request receiver full; replying failure")
+		go d.sendRequestReply(log, rawMsg.Key, false)
 		return
 	}
 
-	// wait for response and send it
+	go d.waitAndSendRequestReply(log, rawMsg.Key, resp)
+}
+
+func (d *Dealer) waitAndSendRequestReply(log librespot.Logger, key string, resp <-chan bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
 	case success := <-resp:
-		if err := d.sendReply(rawMsg.Key, success); err != nil {
-			log.WithError(err).Error("failed sending dealer reply")
-			return
-		}
+		d.sendRequestReply(log, key, success)
+	case <-timer.C:
+		log.Warn("dealer request handler timed out; replying failure")
+		d.sendRequestReply(log, key, false)
 	case <-d.done:
 		return
+	}
+}
+
+func (d *Dealer) sendRequestReply(log librespot.Logger, key string, success bool) {
+	if err := d.sendReply(key, success); err != nil {
+		log.WithError(err).Error("failed sending dealer reply")
 	}
 }
 
@@ -275,7 +325,7 @@ func (d *Dealer) ReceiveRequest(uri string) <-chan Request {
 		panic(fmt.Sprintf("cannot have more request receivers for %s", uri))
 	}
 
-	c := make(chan Request)
+	c := make(chan Request, requestReceiverBuffer)
 	d.requestReceivers[uri] = requestReceiver{c}
 	d.startReceiving()
 

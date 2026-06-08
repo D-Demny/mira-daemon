@@ -22,7 +22,14 @@ import (
 	"github.com/rs/cors"
 )
 
-const timeout = 10 * time.Second
+const (
+	// per-client websocket write deadline; a write that can't finish in this
+	// window means the client is wedged and gets dropped
+	wsWriteTimeout = 2 * time.Second
+	// buffered events per client before Emit starts dropping. Every event we emit
+	// is a full-state snapshot, so a dropped one is superseded by the next.
+	wsClientBuffer = 64
+)
 
 // returns (required, url, known). known=false while we haven't yet determined auth state
 type AuthStatusFunc func() (required bool, url string, known bool)
@@ -59,12 +66,12 @@ type ConcreteApiServer struct {
 	certFile    string
 	keyFile     string
 
-	close    bool
+	close    atomic.Bool
 	listener net.Listener
 
 	requests chan ApiRequest
 
-	clients     []*websocket.Conn
+	clients     []*wsClient
 	clientsLock sync.RWMutex
 
 	authMu sync.RWMutex
@@ -920,36 +927,44 @@ func (s *ConcreteApiServer) serve() {
 			opts.OriginPatterns = []string{allow}
 		}
 
-		c, err := websocket.Accept(w, r, opts)
+		conn, err := websocket.Accept(w, r, opts)
 		if err != nil {
 			s.log.WithError(err).Error("failed accepting websocket connection")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
-		// add the client to the list
+		client := &wsClient{conn: conn, send: make(chan *ApiEvent, wsClientBuffer)}
+
 		s.clientsLock.Lock()
-		s.clients = append(s.clients, c)
+		s.clients = append(s.clients, client)
 		s.clientsLock.Unlock()
 
 		s.log.Debugf("new websocket client")
 
-		for {
-			_, _, err := c.Read(context.Background())
-			if s.close {
-				return
-			} else if err != nil {
-				s.log.WithError(err).Error("websocket connection errored")
-
-				// remove the client from the list
-				s.clientsLock.Lock()
-				for i, cc := range s.clients {
-					if cc == c {
-						s.clients = append(s.clients[:i], s.clients[i+1:]...)
-						break
-					}
+		// dedicated writer
+		// the ONLY place we write to this socket
+		go func() {
+			for ev := range client.send {
+				ctx, cancel := context.WithTimeout(context.Background(), wsWriteTimeout)
+				err := wsjson.Write(ctx, client.conn, ev)
+				cancel()
+				if err != nil {
+					s.log.WithError(err).Debug("websocket write failed; dropping client")
+					s.removeClient(client)
+					return
 				}
-				s.clientsLock.Unlock()
+			}
+		}()
+
+		// read loop
+		for {
+			_, _, err := client.conn.Read(context.Background())
+			if s.close.Load() {
+				return
+			}
+			if err != nil {
+				s.removeClient(client)
 				return
 			}
 		}
@@ -968,12 +983,37 @@ func (s *ConcreteApiServer) serve() {
 		err = http.Serve(s.listener, c.Handler(m))
 	}
 
-	if s.close {
+	if s.close.Load() {
 		return
 	} else if err != nil {
 		s.log.WithError(err).Error("failed serving api")
 		_ = s.Close()
 	}
+}
+
+// wsClient is one connected /events subscriber
+type wsClient struct {
+	conn      *websocket.Conn
+	send      chan *ApiEvent
+	closeOnce sync.Once
+}
+
+// removeClient tears a client down exactly once
+func (s *ConcreteApiServer) removeClient(c *wsClient) {
+	c.closeOnce.Do(func() {
+		s.clientsLock.Lock()
+		for i, cc := range s.clients {
+			if cc == c {
+				s.clients = append(s.clients[:i], s.clients[i+1:]...)
+				break
+			}
+		}
+		s.clientsLock.Unlock()
+
+		// close AFTER unlinking
+		close(c.send)
+		_ = c.conn.Close(websocket.StatusNormalClosure, "")
+	})
 }
 
 func (s *ConcreteApiServer) Emit(ev *ApiEvent) {
@@ -983,12 +1023,11 @@ func (s *ConcreteApiServer) Emit(ev *ApiEvent) {
 	s.log.Tracef("emitting websocket event: %s", ev.Type)
 
 	for _, client := range s.clients {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		err := wsjson.Write(ctx, client, ev)
-		cancel()
-		if err != nil {
-			// purposely do not propagate this to the caller
-			s.log.WithError(err).Error("failed communicating with websocket client")
+		select {
+		case client.send <- ev:
+		default:
+			// buffer full, the client is wedged
+			s.log.Tracef("websocket send buffer full, dropping %s for a slow client", ev.Type)
 		}
 	}
 }
@@ -998,14 +1037,20 @@ func (s *ConcreteApiServer) Receive() <-chan ApiRequest {
 }
 
 func (s *ConcreteApiServer) Close() error {
-	s.close = true
+	s.close.Store(true)
 
-	// close all websocket clients
-	s.clientsLock.RLock()
-	for _, client := range s.clients {
-		_ = client.Close(websocket.StatusGoingAway, "")
+	// detach all clients under the lock,
+	s.clientsLock.Lock()
+	clients := s.clients
+	s.clients = nil
+	s.clientsLock.Unlock()
+
+	for _, client := range clients {
+		client.closeOnce.Do(func() {
+			close(client.send)
+			_ = client.conn.Close(websocket.StatusGoingAway, "")
+		})
 	}
-	s.clientsLock.RUnlock()
 
 	// close the listener
 	_ = s.listener.Close()
