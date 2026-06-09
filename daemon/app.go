@@ -381,23 +381,31 @@ func (app *App) onResume() {
 	p := app.currentPlayer.Load()
 	app.log.Infof("system: resume recovery (player active: %t)", p != nil)
 
-	// Force the dealer to reconnect
+	// drop the half-open dealer socket so the recv loop reconnects
 	if p != nil && p.sess != nil {
 		p.sess.Dealer().ForceReconnect()
 	}
 
+	// suspend tears down bt so on wake the PAN link is down
+	if app.bt != nil {
+		go app.bt.RecoverNetworkAfterResume("")
+	}
+
 	// restore button input
-	go func() {
-		if err := app.ensureVirtualTouch(); err != nil {
-			app.log.WithError(err).Warn("system: virtual touch unavailable (buttons may need a manual screen tap)")
-			return
-		}
-		// delay so chromium + virtual device are ready
-		time.Sleep(2500 * time.Millisecond)
-		if err := app.emitVirtualTap(); err != nil {
-			app.log.WithError(err).Warn("system: input recovery tap failed")
-		}
-	}()
+	go app.restoreInputAfterResume()
+}
+
+// restoreInputAfterResume re-engages Chromiums input 
+func (app *App) restoreInputAfterResume() {
+	if err := app.ensureVirtualTouch(); err != nil {
+		app.log.WithError(err).Warn("system: virtual touch unavailable (buttons may need a manual screen tap)")
+		return
+	}
+	// delay so chromium + virtual device are ready
+	time.Sleep(2500 * time.Millisecond)
+	if err := app.emitVirtualTap(); err != nil {
+		app.log.WithError(err).Warn("system: input recovery tap failed")
+	}
 }
 
 // uinput ioctls
