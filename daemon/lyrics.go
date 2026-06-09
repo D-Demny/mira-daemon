@@ -51,9 +51,10 @@ type lyricSource interface {
 type LyricsProvider struct {
 	log     librespot.Logger
 	sources []lyricSource
+	episode *episodeTextProvider
 
 	mu    sync.RWMutex
-	cache map[string]*LyricsResult // keyed by trackId
+	cache map[string]*LyricsResult // keyed by trackId/episode id
 }
 
 func NewLyricsProvider(logger librespot.Logger, getAccessToken func(ctx context.Context, force bool) (string, error)) *LyricsProvider {
@@ -64,7 +65,8 @@ func NewLyricsProvider(logger librespot.Logger, getAccessToken func(ctx context.
 			newSecondaryLyricProvider(logger),
 			newTertiaryLyricProvider(logger),
 		},
-		cache: make(map[string]*LyricsResult),
+		episode: newEpisodeTextProvider(logger, getAccessToken),
+		cache:   make(map[string]*LyricsResult),
 	}
 }
 
@@ -136,6 +138,27 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 	lp.mu.Unlock()
 
 	lp.log.Debugf("lyrics found for %q by %q (%s, %d lines)", trackName, artistName, result.SyncType, len(result.Lines))
+	return result, nil
+}
+
+// returns the synced text track for podcasts, these are not cached
+func (lp *LyricsProvider) FetchEpisodeText(ctx context.Context, episodeId string) (*LyricsResult, error) {
+	if i := strings.LastIndex(episodeId, ":"); i >= 0 {
+		episodeId = episodeId[i+1:]
+	}
+	if episodeId == "" {
+		return nil, fmt.Errorf("episode id is required")
+	}
+
+	if lp.episode == nil {
+		return nil, ErrNoLyrics
+	}
+
+	result, err := lp.episode.fetch(ctx, episodeId)
+	if err != nil {
+		return nil, err
+	}
+	lp.log.Debugf("episode text found for %s (%d lines)", episodeId, len(result.Lines))
 	return result, nil
 }
 
@@ -296,6 +319,156 @@ func parsePrimary(body []byte) (*LyricsResult, error) {
 	}
 
 	return &LyricsResult{SyncType: syncType, Lines: lines}, nil
+}
+
+// episode text source
+
+type episodeTextProvider struct {
+	log            librespot.Logger
+	client         *http.Client
+	url            string
+	query          string
+	platform       string
+	getAccessToken func(ctx context.Context, force bool) (string, error)
+}
+
+func newEpisodeTextProvider(logger librespot.Logger, getAccessToken func(ctx context.Context, force bool) (string, error)) *episodeTextProvider {
+	return &episodeTextProvider{
+		log:            logger,
+		client:         &http.Client{Timeout: 15 * time.Second},
+		url:            os.Getenv("THING_LP_EPISODE_URL"),
+		query:          os.Getenv("THING_LP_EPISODE_QUERY"),
+		platform:       os.Getenv("THING_LP_EPISODE_PLATFORM"),
+		getAccessToken: getAccessToken,
+	}
+}
+
+func (p *episodeTextProvider) fetch(ctx context.Context, episodeId string) (*LyricsResult, error) {
+	if p.url == "" {
+		return nil, fmt.Errorf("episode text disabled (no env config): %w", ErrNoLyrics)
+	}
+	if p.getAccessToken == nil {
+		return nil, fmt.Errorf("episode text: no access token source: %w", ErrNoLyrics)
+	}
+
+	result, err := p.request(ctx, episodeId, false)
+	if errors.Is(err, errPrimaryUnauthorized) {
+		p.log.Debugf("episode text: 401/403, retrying with a fresh token")
+		result, err = p.request(ctx, episodeId, true)
+	}
+	return result, err
+}
+
+func (p *episodeTextProvider) request(ctx context.Context, episodeId string, force bool) (*LyricsResult, error) {
+	token, err := p.getAccessToken(ctx, force)
+	if err != nil {
+		return nil, fmt.Errorf("episode text access token: %w", err)
+	}
+
+	reqURL := p.url + episodeId
+	if p.query != "" {
+		reqURL += "?" + p.query
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating episode text request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if p.platform != "" {
+		req.Header.Set("App-Platform", p.platform)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("episode text request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == 401 || resp.StatusCode == 403:
+		return nil, errPrimaryUnauthorized
+	case resp.StatusCode == 404:
+		return nil, fmt.Errorf("episode text: none for episode: %w", ErrNoLyrics)
+	case resp.StatusCode != 200:
+		return nil, fmt.Errorf("episode text status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading episode text response: %w", err)
+	}
+	return parseEpisodeText(body)
+}
+
+func parseEpisodeText(body []byte) (*LyricsResult, error) {
+	var resp struct {
+		Section []struct {
+			StartMs int64 `json:"startMs"`
+			Title   *struct {
+				Title string `json:"title"`
+			} `json:"title"`
+			Text *struct {
+				Sentence struct {
+					StartMs int64  `json:"startMs"`
+					Text    string `json:"text"`
+				} `json:"sentence"`
+			} `json:"text"`
+			Fallback *struct {
+				Sentence struct {
+					StartMs int64  `json:"startMs"`
+					Text    string `json:"text"`
+				} `json:"sentence"`
+			} `json:"fallback"`
+		} `json:"section"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parsing episode text response: %w", err)
+	}
+
+	lines := make([]LyricsLine, 0, len(resp.Section))
+	var pendingSpeaker string
+	for _, s := range resp.Section {
+		if s.Title != nil && strings.TrimSpace(s.Title.Title) != "" {
+			pendingSpeaker = strings.TrimSpace(s.Title.Title)
+			continue
+		}
+
+		var sentence string
+		var startMs int64
+		spoken := false
+		switch {
+		case s.Text != nil && strings.TrimSpace(s.Text.Sentence.Text) != "":
+			sentence = s.Text.Sentence.Text
+			startMs = s.Text.Sentence.StartMs
+			spoken = true
+		case s.Fallback != nil && strings.TrimSpace(s.Fallback.Sentence.Text) != "":
+			// music/intro caption
+			sentence = s.Fallback.Sentence.Text
+			startMs = s.Fallback.Sentence.StartMs
+		default:
+			continue
+		}
+		if startMs == 0 {
+			startMs = s.StartMs
+		}
+		if spoken && pendingSpeaker != "" {
+			sentence = pendingSpeaker + ": " + sentence
+			pendingSpeaker = ""
+		}
+		lines = append(lines, LyricsLine{
+			StartTimeMs: strconv.FormatInt(startMs, 10),
+			Words:       sentence,
+		})
+	}
+
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("episode text: no lines: %w", ErrNoLyrics)
+	}
+
+	return &LyricsResult{SyncType: "LINE_SYNCED", Lines: lines}, nil
 }
 
 // secondary source
