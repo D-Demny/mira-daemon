@@ -203,6 +203,7 @@ type ApiRequestDataLyrics struct {
 	ArtistName string
 	AlbumName  string
 	DurationMs int
+	Episode bool
 }
 
 type ApiRequestDataPlay struct {
@@ -688,6 +689,7 @@ func (s *ConcreteApiServer) serve() {
 			ArtistName: artistName,
 			AlbumName:  albumName,
 			DurationMs: durationMs,
+			Episode:    r.URL.Query().Get("episode") == "1",
 		}}, w)
 	})
 	m.HandleFunc("/player/play", func(w http.ResponseWriter, r *http.Request) {

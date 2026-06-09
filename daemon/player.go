@@ -287,6 +287,9 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 			if prevState != nil && prevState.TrackUri == rs.TrackUri && prevState.TrackArtist != "" {
 				artistName = prevState.TrackArtist
 				albumName = prevState.TrackAlbum
+			} else if strings.HasPrefix(rs.TrackUri, "spotify:episode:") {
+				// Podcasts carry no artist_name
+				artistName, albumName = p.resolveEpisodeMetadata(ctx, *spotId)
 			} else {
 				artistName, albumName = p.resolveTrackMetadata(ctx, *spotId)
 			}
@@ -408,6 +411,25 @@ func (p *AppPlayer) resolveTrackMetadata(ctx context.Context, spotId librespot.S
 		return wbArtist, wbAlbum
 	}
 	return artist, album
+}
+
+// resolveEpisodeMetadata resolves a podcast episode's show name
+func (p *AppPlayer) resolveEpisodeMetadata(ctx context.Context, spotId librespot.SpotifyId) (show, album string) {
+	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	var ep metadatapb.Episode
+	if err := p.sess.Spclient().ExtendedMetadataSimple(reqCtx, spotId,
+		extmetadatapb.ExtensionKind_EPISODE_V4, &ep); err != nil {
+		p.app.log.Debugf("observer: spclient episode metadata for %s failed: %v", spotId.Uri(), err)
+		return "", ""
+	}
+
+	if ep.Show != nil && ep.Show.Name != nil {
+		show = *ep.Show.Name
+	}
+	p.app.log.Debugf("observer: spclient episode metadata for %s: show=%q", spotId.Uri(), show)
+	return show, show
 }
 
 func (p *AppPlayer) resolveViaSpclient(ctx context.Context, spotId librespot.SpotifyId) (artist, album string) {
@@ -862,6 +884,25 @@ func (p *AppPlayer) Close() {
 // keeps slow lyrics HTTP off the player loop so it never stalls the dealer keepalive/messages
 func (p *AppPlayer) handleLyricsAsync(ctx context.Context, req ApiRequest) {
 	data := req.Data.(ApiRequestDataLyrics)
+
+	// fetch the synced transcript by episode id
+	if data.Episode {
+		lp := p.lyricsProvider
+		go func() {
+			result, err := lp.FetchEpisodeText(ctx, data.TrackId)
+			if err != nil {
+				if errors.Is(err, ErrNoLyrics) {
+					req.Reply(nil, ErrNotFound)
+					return
+				}
+				req.Reply(nil, fmt.Errorf("episode text fetch failed: %w", err))
+				return
+			}
+			req.Reply(result, nil)
+		}()
+		return
+	}
+
 	trackName := data.TrackName
 	artistName := data.ArtistName
 	albumName := data.AlbumName
