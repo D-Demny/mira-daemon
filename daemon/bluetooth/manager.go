@@ -514,6 +514,41 @@ func (m *Manager) tryActiveReconnect(addr string) {
 	}()
 }
 
+// RecoverNetworkAfterResume does a safe PAN recovery after the device wakes from sleep 
+func (m *Manager) RecoverNetworkAfterResume(addr string) {
+	if addr == "" {
+		m.panMu.Lock()
+		addr = m.lastPanAddress
+		m.panMu.Unlock()
+	}
+	if addr == "" {
+		m.log.Debug("bluetooth: resume recovery skipped, no prior PAN address")
+		return
+	}
+
+	info, err := m.GetDeviceInfo(addr)
+	if err != nil {
+		m.log.WithError(err).Debugf("bluetooth: resume recovery skipped for %s (no device info)", addr)
+		return
+	}
+
+	if !info.Connected {
+		m.log.Infof("bluetooth: resume recovery, %s not BT-connected, paging", addr)
+		m.tryActiveReconnect(addr)
+		return
+	}
+
+	if !m.NetworkUp() {
+		m.log.Infof("bluetooth: resume recovery, ACL up but PAN down, reconnecting PAN to %s", addr)
+		if err := m.ConnectNetworkForced(addr); err != nil {
+			m.log.WithError(err).Debugf("bluetooth: resume PAN reconnect failed")
+		}
+		return
+	}
+
+	m.log.Debugf("bluetooth: resume recovery, %s already connected with PAN up", addr)
+}
+
 // invokes a D-Bus method with dbusCallTimeout
 func (m *Manager) dbusCall(obj dbus.BusObject, method string, args ...any) *dbus.Call {
 	ctx, cancel := context.WithTimeout(context.Background(), dbusCallTimeout)
