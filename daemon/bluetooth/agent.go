@@ -197,7 +197,8 @@ func (a *agent) acceptPairing() error {
 		a.manager.emit(EventPaired, DevicePairedPayload{Device: deviceInfo})
 	}
 
-	a.clearCurrent()
+	// only clear our own request
+	a.clearCurrentIfDevice(pr.Device)
 	return nil
 }
 

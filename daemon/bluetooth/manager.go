@@ -43,8 +43,23 @@ type Manager struct {
 	panRetryMu      sync.Mutex
 	panRetryHistory []time.Time
 
-	// daemon can persist it across reboots
-	onLastPanAddressChanged func(addr string)
+	// prioritized reconnect list
+	knownMu               sync.Mutex
+	knownDevices          []librespot.BluetoothKnownDevice
+	onKnownDevicesChanged func(devs []librespot.BluetoothKnownDevice)
+
+	// manual-disconnect marks + per-device connect timestamps 
+	manualMu          sync.Mutex
+	manualDisconnects map[string]time.Time
+	connectedSince    map[string]time.Time
+
+	// most recent bnep0 (PAN) drop
+	networkDropMu     sync.Mutex
+	lastNetworkDropAt time.Time
+
+	// gates auto-PAN so a newly connected device cant take over a working connection
+	onlineMu sync.Mutex
+	online   bool
 
 	// prevents overlapping Device1.Connect calls
 	activeReconnectMu       sync.Mutex
@@ -54,6 +69,10 @@ type Manager struct {
 const (
 	panRetryThreshold = 3
 	panRetryWindow    = 30 * time.Second
+
+	// a connection older than this is "stable"
+	panStableAfter        = 60 * time.Second
+	panStableRetryAllowed = 1
 )
 
 func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
@@ -79,10 +98,12 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 	log.Infof("bluetooth: using adapter %s", adapter)
 
 	m := &Manager{
-		log:     log,
-		conn:    conn,
-		adapter: adapter,
-		emit:    emit,
+		log:               log,
+		conn:              conn,
+		adapter:           adapter,
+		emit:              emit,
+		manualDisconnects: make(map[string]time.Time),
+		connectedSince:    make(map[string]time.Time),
 	}
 
 	a, err := newAgent(log, conn, m)
@@ -98,13 +119,10 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 	m.monitorDisconnects()
 	m.monitorNetworkInterfaces()
 
-	// open for pairing on boot, network monitor takes over after
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		if err := m.SetDiscoverable(true); err != nil {
-			m.log.WithError(err).Warn("bluetooth: failed to enable initial discoverable")
-		}
-	}()
+	// disconnect reasons let us tell a deliberate phone-side disconnect from a dropout
+	if err := m.watchMgmtDisconnects(); err != nil {
+		m.log.WithError(err).Warn("bluetooth: mgmt watcher unavailable, deliberate disconnects will look like dropouts")
+	}
 
 	return m, nil
 }
@@ -200,6 +218,13 @@ func (m *Manager) handleDevicePaired(devicePath, address string) {
 		info = &DeviceInfo{Address: address, Paired: true}
 	}
 
+	// list the device immediately
+	name := info.Alias
+	if name == "" {
+		name = info.Name
+	}
+	m.recordPairedDevice(address, name)
+
 	if m.emit != nil {
 		m.emit(EventPaired, DevicePairedPayload{Device: info})
 	}
@@ -208,6 +233,12 @@ func (m *Manager) handleDevicePaired(devicePath, address string) {
 // fires on Connected:true
 func (m *Manager) handleDeviceConnected(devicePath, address string) {
 	m.log.Infof("bluetooth: device connected: %s", devicePath)
+
+	// the device coming back always re-arms auto-reconnect
+	m.manualMu.Lock()
+	delete(m.manualDisconnects, address)
+	m.connectedSince[address] = time.Now()
+	m.manualMu.Unlock()
 
 	info, err := m.GetDeviceInfo(address)
 	if err != nil {
@@ -222,6 +253,21 @@ func (m *Manager) handleDeviceConnected(devicePath, address string) {
 	// only chase PAN for paired devices, random discovering peripherals shouldn't trigger Connect
 	if info == nil || !info.Paired {
 		return
+	}
+
+	// if we're already online, a newly connected device must not take over 
+	m.panMu.Lock()
+	activePan := m.lastPanAddress
+	m.panMu.Unlock()
+	if activePan != address {
+		if m.IsOnline() {
+			m.log.Infof("bluetooth: %s connected while already online, leaving the network untouched", address)
+			return
+		}
+		if activePan != "" && m.NetworkUp() {
+			m.log.Infof("bluetooth: %s connected but PAN already active via %s, skipping auto-PAN", address, activePan)
+			return
+		}
 	}
 
 	// gate auto-PAN on the peer actually advertising NAP
@@ -338,6 +384,7 @@ func (m *Manager) monitorNetworkInterfaces() {
 		for update := range linkUpdates {
 			if update.Header.Type == syscall.RTM_DELLINK && update.Link.Attrs().Name == panInterface {
 				m.log.Info("bluetooth: bnep0 interface removed")
+				m.markNetworkDrop()
 				if m.emit != nil {
 					m.emit(EventNetworkDisconnect, nil)
 				}
@@ -356,15 +403,13 @@ func (m *Manager) tryRecoverPan() {
 		return
 	}
 
-	allowed, recentDrops := m.shouldRetryPan(time.Now())
-	if !allowed {
-		m.log.Warnf("bluetooth: PAN dropped %d times in %s, backing off auto-recover (assuming intentional disconnect)",
-			recentDrops+1, panRetryWindow)
-		return
-	}
-
 	go func() {
-		time.Sleep(1 * time.Second)
+		// phones tear BNEP down first and drop the ACL a beat later
+		time.Sleep(3 * time.Second)
+		if m.isManualDisconnect(addr) {
+			m.log.Debugf("bluetooth: PAN auto-recover skipped for %s (manual disconnect)", addr)
+			return
+		}
 		info, err := m.GetDeviceInfo(addr)
 		if err != nil {
 			m.log.WithError(err).Debugf("bluetooth: PAN auto-recover skipped for %s (no device info)", addr)
@@ -372,6 +417,25 @@ func (m *Manager) tryRecoverPan() {
 		}
 		if !info.Connected {
 			m.log.Debugf("bluetooth: PAN auto-recover skipped for %s (BT link is down too)", addr)
+			return
+		}
+
+		// on a stable session only one recovery per window
+		threshold := panRetryThreshold
+		if uptime, ok := m.connectionUptime(addr); ok && uptime > panStableAfter {
+			threshold = panStableRetryAllowed
+		}
+		// breaker ticks only for drops we actually try to recover
+		allowed, recentDrops := m.shouldRetryPanThreshold(time.Now(), threshold)
+		if !allowed {
+			if threshold == panStableRetryAllowed {
+				m.markManualDisconnect(addr)
+				m.log.Warnf("bluetooth: PAN to %s dropped again within %s of recovering — treating as a deliberate disconnect, pausing auto-reconnect (reconnect from the phone or the Bluetooth menu)",
+					addr, panRetryWindow)
+			} else {
+				m.log.Warnf("bluetooth: PAN dropped %d times in %s, backing off auto-recover (assuming intentional disconnect)",
+					recentDrops+1, panRetryWindow)
+			}
 			return
 		}
 		m.log.Infof("bluetooth: bnep0 dropped while %s still BT-connected, retrying PAN", addr)
@@ -382,6 +446,10 @@ func (m *Manager) tryRecoverPan() {
 }
 
 func (m *Manager) shouldRetryPan(now time.Time) (allowed bool, recentDrops int) {
+	return m.shouldRetryPanThreshold(now, panRetryThreshold)
+}
+
+func (m *Manager) shouldRetryPanThreshold(now time.Time, threshold int) (allowed bool, recentDrops int) {
 	m.panRetryMu.Lock()
 	defer m.panRetryMu.Unlock()
 
@@ -395,7 +463,7 @@ func (m *Manager) shouldRetryPan(now time.Time) (allowed bool, recentDrops int) 
 	}
 	m.panRetryHistory = fresh
 
-	if len(m.panRetryHistory) >= panRetryThreshold {
+	if len(m.panRetryHistory) >= threshold {
 		return false, len(m.panRetryHistory)
 	}
 	m.panRetryHistory = append(m.panRetryHistory, now)
@@ -403,8 +471,9 @@ func (m *Manager) shouldRetryPan(now time.Time) (allowed bool, recentDrops int) 
 }
 
 const (
-	offlineRetryInterval    = 15 * time.Second
-	offlineRetryMaxAttempts = 20
+	offlineRetryInterval     = 15 * time.Second
+	offlineRetryFastAttempts = 20
+	offlineRetrySlowInterval = 1 * time.Minute
 )
 
 func (m *Manager) SetOfflineRetry(active bool) {
@@ -430,6 +499,14 @@ func (m *Manager) SetOfflineRetry(active bool) {
 }
 
 func (m *Manager) offlineRetryLoop(stop <-chan struct{}) {
+	defer func() {
+		m.offlineRetryMu.Lock()
+		if m.offlineRetryStop != nil && (<-chan struct{})(m.offlineRetryStop) == stop {
+			m.offlineRetryStop = nil
+		}
+		m.offlineRetryMu.Unlock()
+	}()
+
 	// first attempt immediately, don't wait a full 15s on cold boot
 	m.runOfflineRetryAttempt(1)
 
@@ -443,9 +520,10 @@ func (m *Manager) offlineRetryLoop(stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 			attempts++
-			if attempts > offlineRetryMaxAttempts {
-				m.log.Infof("bluetooth: offline retry gave up after %d attempts", offlineRetryMaxAttempts)
-				return
+			// after the fast window assume the peer is genuinely away and slow down
+			if attempts == offlineRetryFastAttempts {
+				m.log.Infof("bluetooth: offline retry slowing to every %s after %d attempts", offlineRetrySlowInterval, attempts)
+				ticker.Reset(offlineRetrySlowInterval)
 			}
 			m.runOfflineRetryAttempt(attempts)
 		}
@@ -453,39 +531,55 @@ func (m *Manager) offlineRetryLoop(stop <-chan struct{}) {
 }
 
 func (m *Manager) runOfflineRetryAttempt(attempt int) {
-	m.panMu.Lock()
-	addr := m.lastPanAddress
-	m.panMu.Unlock()
-	if addr == "" {
-		m.log.Tracef("bluetooth: offline retry skipped, no prior PAN address")
+	candidates := m.reconnectCandidates()
+	if len(candidates) == 0 {
+		m.log.Tracef("bluetooth: offline retry skipped, no reconnect candidates")
 		return
 	}
 
-	info, err := m.GetDeviceInfo(addr)
-	if err != nil {
-		m.log.WithError(err).Tracef("bluetooth: offline retry skipped for %s (no device info)", addr)
-		return
-	}
-	if !info.Connected {
-		m.log.Debugf("bluetooth: offline retry attempt %d, %s not BT-connected, actively reconnecting", attempt, addr)
-		m.tryActiveReconnect(addr)
-		return
+	// any candidate already ACL-connected wins
+	var disconnected []string
+	for _, addr := range candidates {
+		info, err := m.GetDeviceInfo(addr)
+		if err != nil {
+			m.log.WithError(err).Tracef("bluetooth: offline retry skipped %s (no device info)", addr)
+			continue
+		}
+		if info.Connected {
+			if m.NetworkUp() {
+				// bnep0 up but offline = zombie PAN
+				m.log.Infof("bluetooth: offline retry %d, %s bnep0 up but offline (zombie), forcing PAN reconnect", attempt, addr)
+				if err := m.ConnectNetworkForced(addr); err != nil {
+					m.log.WithError(err).Debugf("bluetooth: offline retry %d forced reconnect failed", attempt)
+				}
+			} else {
+				// bnep0 down = tethering off, or a clean PAN drop
+				m.log.Infof("bluetooth: offline retry %d, %s ACL up + bnep0 down, attempting PAN connect", attempt, addr)
+				if err := m.ConnectNetwork(addr); err != nil {
+					m.log.Debugf("bluetooth: offline retry %d, PAN not available for %s yet (tethering off?): %v", attempt, addr, err)
+				}
+			}
+			return
+		}
+		disconnected = append(disconnected, addr)
 	}
 
-	// ACL up but offline = BNEP zombie state
-	m.log.Infof("bluetooth: offline retry attempt %d, force-reconnecting PAN to %s", attempt, addr)
-	if err := m.ConnectNetworkForced(addr); err != nil {
-		m.log.WithError(err).Debugf("bluetooth: offline retry %d failed", attempt)
+	if len(disconnected) == 0 {
+		return
 	}
+	m.log.Debugf("bluetooth: offline retry attempt %d, no candidate BT-connected, actively paging %d device(s)", attempt, len(disconnected))
+	m.tryActiveReconnect(disconnected)
 }
 
-// pages a bonded-but-disconnected peer via Device1.Connect. async because
-// bluez scans can block 20-30s
-func (m *Manager) tryActiveReconnect(addr string) {
+func (m *Manager) tryActiveReconnect(addrs []string) {
+	if len(addrs) == 0 {
+		return
+	}
+
 	m.activeReconnectMu.Lock()
 	if m.activeReconnectInFlight {
 		m.activeReconnectMu.Unlock()
-		m.log.Tracef("bluetooth: active reconnect to %s skipped, previous attempt still in flight", addr)
+		m.log.Tracef("bluetooth: active reconnect skipped, previous attempt still in flight")
 		return
 	}
 	m.activeReconnectInFlight = true
@@ -498,28 +592,43 @@ func (m *Manager) tryActiveReconnect(addr string) {
 			m.activeReconnectMu.Unlock()
 		}()
 
-		// 30s for bluez to finish page scan
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+		for _, addr := range addrs {
+			// marks can land while we paging a higher priority device
+			if m.isManualDisconnect(addr) {
+				continue
+			}
 
-		devicePath := formatDevicePath(m.adapter, addr)
-		obj := m.conn.Object(bluezBusName, devicePath)
+			// bounded so one absent device cant eat the whole attempt
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 
-		m.log.Infof("bluetooth: actively paging %s for reconnect", addr)
-		if err := obj.CallWithContext(ctx, bluezDeviceInterface+".Connect", 0).Err; err != nil {
-			m.log.WithError(err).Debugf("bluetooth: active reconnect to %s failed (peer likely out of range or BT off)", addr)
+			devicePath := formatDevicePath(m.adapter, addr)
+			obj := m.conn.Object(bluezBusName, devicePath)
+
+			m.log.Infof("bluetooth: actively paging %s for reconnect", addr)
+			err := obj.CallWithContext(ctx, bluezDeviceInterface+".Connect", 0).Err
+			cancel()
+			if err != nil {
+				m.log.WithError(err).Debugf("bluetooth: active reconnect to %s failed (peer likely out of range or BT off)", addr)
+				continue
+			}
+			m.log.Infof("bluetooth: active reconnect to %s succeeded, PAN follows via signal handler", addr)
 			return
 		}
-		m.log.Infof("bluetooth: active reconnect to %s succeeded, PAN follows via signal handler", addr)
 	}()
 }
 
-// RecoverNetworkAfterResume does a safe PAN recovery after the device wakes from sleep 
+// RecoverNetworkAfterResume does a safe PAN recovery after the device wakes from sleep
 func (m *Manager) RecoverNetworkAfterResume(addr string) {
+	// waking up = the user is back
+	m.ClearManualDisconnects()
+
 	if addr == "" {
 		m.panMu.Lock()
 		addr = m.lastPanAddress
 		m.panMu.Unlock()
+	}
+	if addr == "" {
+		addr = m.topReconnectCandidate()
 	}
 	if addr == "" {
 		m.log.Debug("bluetooth: resume recovery skipped, no prior PAN address")
@@ -534,7 +643,7 @@ func (m *Manager) RecoverNetworkAfterResume(addr string) {
 
 	if !info.Connected {
 		m.log.Infof("bluetooth: resume recovery, %s not BT-connected, paging", addr)
-		m.tryActiveReconnect(addr)
+		m.tryActiveReconnect(m.reconnectCandidates())
 		return
 	}
 
@@ -757,6 +866,28 @@ func (m *Manager) ConnectDevice(address string) error {
 	return nil
 }
 
+// PageDevice is the explicit "connect to this phone" action from the UI
+func (m *Manager) PageDevice(address string) error {
+	if !m.isKnownDevice(address) {
+		return fmt.Errorf("unknown device %s", address)
+	}
+	m.clearManualDisconnect(address)
+
+	info, err := m.GetDeviceInfo(address)
+	if err == nil && info.Connected {
+		// ACL already up, just (re-)establish PAN
+		go func() {
+			if err := m.ConnectNetworkForced(address); err != nil {
+				m.log.WithError(err).Warnf("bluetooth: explicit PAN connect to %s failed", address)
+			}
+		}()
+		return nil
+	}
+
+	m.tryActiveReconnect([]string{address})
+	return nil
+}
+
 func (m *Manager) DisconnectDevice(address string) error {
 	m.log.Debugf("bluetooth: DisconnectDevice(%s) entry", address)
 	m.mu.Lock()
@@ -766,9 +897,12 @@ func (m *Manager) DisconnectDevice(address string) error {
 	obj := m.conn.Object(bluezBusName, devicePath)
 
 	m.pendingDisconnects.Store(address, true)
+	// asked for disconnect
+	m.markManualDisconnect(address)
 
 	if err := m.dbusCall(obj, "org.bluez.Device1.Disconnect").Err; err != nil {
 		m.pendingDisconnects.Delete(address)
+		m.clearManualDisconnect(address)
 		return fmt.Errorf("disconnect device: %w", err)
 	}
 
@@ -829,15 +963,23 @@ func (m *Manager) connectNetworkInternal(address string, force bool) error {
 	m.requestDHCP()
 
 	m.panMu.Lock()
-	changed := m.lastPanAddress != address
 	m.lastPanAddress = address
-	cb := m.onLastPanAddressChanged
 	m.panMu.Unlock()
 
-	// persist only on actual change
-	if changed && cb != nil {
-		cb(address)
-	}
+	// PAN coming up is proof the user wants this device connected
+	m.clearManualDisconnect(address)
+
+	go func() {
+		var name string
+		if info, err := m.GetDeviceInfo(address); err == nil {
+			if info.Alias != "" {
+				name = info.Alias
+			} else {
+				name = info.Name
+			}
+		}
+		m.recordPanConnected(address, name)
+	}()
 
 	if m.emit != nil {
 		m.emit(EventNetworkConnect, NetworkConnectedPayload{Address: address})
@@ -855,13 +997,6 @@ func (m *Manager) SeedLastPanAddress(addr string) {
 	m.lastPanAddress = addr
 	m.panMu.Unlock()
 	m.log.Debugf("bluetooth: seeded lastPanAddress=%s from persisted state", addr)
-}
-
-// SetLastPanAddressChangedHandler registers a persistence callback, nil to clear
-func (m *Manager) SetLastPanAddressChangedHandler(fn func(addr string)) {
-	m.panMu.Lock()
-	m.onLastPanAddressChanged = fn
-	m.panMu.Unlock()
 }
 
 // requestDHCP runs dhclient in the background for an IPv4 lease on bnep0
@@ -893,4 +1028,16 @@ func (m *Manager) NetworkUp() bool {
 		return false
 	}
 	return link.Attrs().Flags&net.FlagUp != 0
+}
+
+func (m *Manager) SetOnline(online bool) {
+	m.onlineMu.Lock()
+	m.online = online
+	m.onlineMu.Unlock()
+}
+
+func (m *Manager) IsOnline() bool {
+	m.onlineMu.Lock()
+	defer m.onlineMu.Unlock()
+	return m.online
 }

@@ -21,6 +21,12 @@ type BluetoothHandler interface {
 	AcceptPairing() error
 	DenyPairing() error
 	GetCurrentPairingRequest() *bluetooth.PairingRequest
+
+	// prioritized reconnect list
+	KnownDevices() []bluetooth.KnownDevice
+	StarDevice(address string, starred bool) error
+	ForgetDevice(address string) error
+	PageDevice(address string) error
 }
 
 func writeBluetoothJSON(w http.ResponseWriter, v any) {
@@ -164,6 +170,72 @@ func registerBluetoothRoutes(log librespot.Logger, m *http.ServeMux, get func() 
 			return
 		}
 		writeBluetoothJSON(w, map[string]bool{"up": bm.NetworkUp()})
+	}))
+
+	// known-devices list for the Bluetooth pairing menu
+	m.HandleFunc("GET /bluetooth/known", trace(func(w http.ResponseWriter, r *http.Request) {
+		bm := get()
+		if bm == nil {
+			bluetoothUnavailable(w)
+			return
+		}
+		devices := bm.KnownDevices()
+		if devices == nil {
+			devices = []bluetooth.KnownDevice{}
+		}
+		writeBluetoothJSON(w, devices)
+	}))
+
+	m.HandleFunc("POST /bluetooth/known/{addr}/star", trace(func(w http.ResponseWriter, r *http.Request) {
+		bm := get()
+		if bm == nil {
+			bluetoothUnavailable(w)
+			return
+		}
+		if err := bm.StarDevice(r.PathValue("addr"), true); err != nil {
+			writeBluetoothError(w, http.StatusNotFound, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	m.HandleFunc("POST /bluetooth/known/{addr}/unstar", trace(func(w http.ResponseWriter, r *http.Request) {
+		bm := get()
+		if bm == nil {
+			bluetoothUnavailable(w)
+			return
+		}
+		if err := bm.StarDevice(r.PathValue("addr"), false); err != nil {
+			writeBluetoothError(w, http.StatusNotFound, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	m.HandleFunc("POST /bluetooth/known/{addr}/forget", trace(func(w http.ResponseWriter, r *http.Request) {
+		bm := get()
+		if bm == nil {
+			bluetoothUnavailable(w)
+			return
+		}
+		if err := bm.ForgetDevice(r.PathValue("addr")); err != nil {
+			writeBluetoothError(w, http.StatusInternalServerError, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	m.HandleFunc("POST /bluetooth/known/{addr}/connect", trace(func(w http.ResponseWriter, r *http.Request) {
+		bm := get()
+		if bm == nil {
+			bluetoothUnavailable(w)
+			return
+		}
+		if err := bm.PageDevice(r.PathValue("addr")); err != nil {
+			writeBluetoothError(w, http.StatusNotFound, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	}))
 
 	m.HandleFunc("GET /bluetooth/pairing", trace(func(w http.ResponseWriter, r *http.Request) {

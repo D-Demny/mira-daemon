@@ -10,7 +10,9 @@ import (
 // minimal Manager for flow-control tests, no D-Bus wired up
 func newTestManager() *Manager {
 	return &Manager{
-		log: &librespot.NullLogger{},
+		log:               &librespot.NullLogger{},
+		manualDisconnects: make(map[string]time.Time),
+		connectedSince:    make(map[string]time.Time),
 	}
 }
 
