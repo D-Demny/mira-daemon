@@ -19,6 +19,7 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/apresolve"
 	"github.com/devgianlu/go-librespot/daemon/bluetooth"
+	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 	devicespb "github.com/devgianlu/go-librespot/proto/spotify/connectstate/devices"
 	"github.com/devgianlu/go-librespot/session"
 	"golang.org/x/exp/rand"
@@ -152,6 +153,12 @@ func New(opts *Options) (*App, error) {
 
 	// app owns reset because it touches BT manager + state store
 	app.server.SetSystemHandler(app)
+	app.server.SetSettingsHandler(app)
+
+	// mirror persisted settings into the firmware brightness conf
+	if len(app.state.Settings) > 0 {
+		app.mirrorBacklightConf(app.state.Settings)
+	}
 
 	// BT manager init, non-fatal on dev/test systems without BlueZ
 	emit := func(eventType string, payload any) {
@@ -166,20 +173,30 @@ func New(opts *Options) (*App, error) {
 		app.bt = bm
 		app.server.SetBluetoothHandler(bm)
 
-		// seed lastPanAddress from persisted state so the offline-retry loop can try the known device asap
-		if app.state.LastBluetoothPanAddress != "" {
-			bm.SeedLastPanAddress(app.state.LastBluetoothPanAddress)
+		// seed the prioritized reconnect list from persisted state
+		known := app.state.KnownBluetoothDevices
+		if len(known) == 0 && app.state.LastBluetoothPanAddress != "" {
+			// migrated single device inherits default priority
+			known = []librespot.BluetoothKnownDevice{{Address: app.state.LastBluetoothPanAddress, Starred: true}}
+		}
+		if len(known) > 0 {
+			bm.SeedKnownDevices(known)
+			bm.SeedLastPanAddress(known[0].Address)
 		}
 
-		// persist on change so next reboot has the address
-		bm.SetLastPanAddressChangedHandler(func(addr string) {
-			// Fires from Bluetooth manager goroutines; hold the state lock that
-			// Save() relies on. Release it before persistState (Save re-locks).
+		// persist on change so next reboot has the list
+		bm.SetKnownDevicesChangedHandler(func(devs []librespot.BluetoothKnownDevice) {
+			// Fires from Bluetooth manager goroutines
 			app.state.Lock()
-			app.state.LastBluetoothPanAddress = addr
+			app.state.KnownBluetoothDevices = devs
+			if len(devs) > 0 {
+				app.state.LastBluetoothPanAddress = devs[0].Address
+			} else {
+				app.state.LastBluetoothPanAddress = ""
+			}
 			app.state.Unlock()
 			if err := app.persistState(); err != nil {
-				app.log.WithError(err).Warn("failed to persist last PAN address")
+				app.log.WithError(err).Warn("failed to persist known bluetooth devices")
 			}
 		})
 	}
@@ -193,15 +210,19 @@ func New(opts *Options) (*App, error) {
 			case app.retryNowCh <- struct{}{}:
 			default:
 			}
+			// the network just came back everything that was talking to Spotify is now half-open
+			app.client.CloseIdleConnections()
+			if p := app.currentPlayer.Load(); p != nil && p.sess != nil {
+				app.log.Info("network: back online, forcing dealer reconnect + flushing stale connections")
+				p.sess.Dealer().ForceReconnect()
+			}
 		}
 
 		if app.bt == nil {
 			return
 		}
-		if err := app.bt.SetDiscoverable(!online); err != nil {
-			app.log.WithError(err).Debugf("bluetooth: failed to set discoverable=%v on network transition", !online)
-		}
-		// offline PAN retry loop runs if we're offline
+		// gate for auto-PAN
+		app.bt.SetOnline(online)
 		app.bt.SetOfflineRetry(!online)
 	}
 	startNetworkMonitor(app.log, app.server, onNetTransition)
@@ -296,6 +317,30 @@ func (app *App) persistState() error {
 	return nil
 }
 
+// GetSettings returns a copy of the persisted frontend settings or nil
+func (app *App) GetSettings() []byte {
+	app.state.Lock()
+	defer app.state.Unlock()
+	if len(app.state.Settings) == 0 {
+		return nil
+	}
+	out := make([]byte, len(app.state.Settings))
+	copy(out, app.state.Settings)
+	return out
+}
+
+// PutSettings replaces the stored settings blob and persists it
+func (app *App) PutSettings(body []byte) error {
+	buf := make([]byte, len(body))
+	copy(buf, body)
+	app.state.Lock()
+	app.state.Settings = buf
+	app.state.Unlock()
+	// keep the firmware auto_brightness service in sync
+	app.mirrorBacklightConf(body)
+	return app.persistState()
+}
+
 // PerformReset wipes the device to a full factory state and reboots
 func (app *App) PerformReset() {
 	app.log.Warn("system: performing factory reset")
@@ -381,11 +426,6 @@ func (app *App) onResume() {
 	p := app.currentPlayer.Load()
 	app.log.Infof("system: resume recovery (player active: %t)", p != nil)
 
-	// drop the half-open dealer socket so the recv loop reconnects
-	if p != nil && p.sess != nil {
-		p.sess.Dealer().ForceReconnect()
-	}
-
 	// suspend tears down bt so on wake the PAN link is down
 	if app.bt != nil {
 		go app.bt.RecoverNetworkAfterResume("")
@@ -393,9 +433,14 @@ func (app *App) onResume() {
 
 	// restore button input
 	go app.restoreInputAfterResume()
+
+	// drop the half-open dealer socket so the recv loop reconnects
+	if p != nil && p.sess != nil {
+		p.sess.Dealer().ForceReconnect()
+	}
 }
 
-// restoreInputAfterResume re-engages Chromiums input 
+// restoreInputAfterResume re-engages chromiums input
 func (app *App) restoreInputAfterResume() {
 	if err := app.ensureVirtualTouch(); err != nil {
 		app.log.WithError(err).Warn("system: virtual touch unavailable (buttons may need a manual screen tap)")
@@ -571,6 +616,7 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 		countryCode:     new(string),
 		playbackReadyCh: make(chan struct{}),
 		queueResolvedCh: make(chan struct{}, 1),
+		clusterCh:       make(chan *connectpb.Cluster, 1),
 	}
 
 	appPlayer.prefetchTimer = time.NewTimer(math.MaxInt64)
@@ -706,6 +752,8 @@ func (app *App) newAppPlayerWithRetry(ctx context.Context, creds any) (*AppPlaye
 
 func (app *App) withCredentials(ctx context.Context, creds any) (err error) {
 	if len(app.state.Credentials.Data) > 0 {
+		// stored creds
+		app.SetAuthState(false, "")
 		appPlayer, err := app.newAppPlayerWithRetry(ctx, session.StoredCredentials{
 			Username: app.state.Credentials.Username,
 			Data:     app.state.Credentials.Data,
