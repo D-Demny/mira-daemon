@@ -161,12 +161,13 @@ func (c *Spclient) PutConnectStateInactive(ctx context.Context, spotConnId strin
 	}
 }
 
-func (c *Spclient) PutConnectState(ctx context.Context, spotConnId string, reqProto *connectpb.PutStateRequest) error {
+// PutConnectState registers/updates our connect-state
+func (c *Spclient) PutConnectState(ctx context.Context, spotConnId string, reqProto *connectpb.PutStateRequest) (*connectpb.Cluster, error) {
 	reqBody, err := proto.Marshal(reqProto)
 	if err != nil {
-		return fmt.Errorf("failed marshalling PutStateRequest: %w", err)
+		return nil, fmt.Errorf("failed marshalling PutStateRequest: %w", err)
 	}
-	_, err = backoff.RetryWithData(func() (*http.Response, error) {
+	cluster, err := backoff.RetryWithData(func() (*connectpb.Cluster, error) {
 		resp, err := c.Request(
 			ctx,
 			"PUT",
@@ -191,15 +192,26 @@ func (c *Spclient) PutConnectState(ctx context.Context, spotConnId string, reqPr
 			}
 			c.log.Debugf("put state request failed with status %d: %s", resp.StatusCode, putError.Message)
 			return nil, fmt.Errorf("put state request failed with status %d: %s", resp.StatusCode, putError.Message)
-		} else {
-			c.log.Debugf("put connect state because %s", reqProto.PutStateReason)
-			return resp, nil
 		}
+
+		c.log.Debugf("put connect state because %s", reqProto.PutStateReason)
+		// the 200 body is the current Cluster
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			c.log.Debugf("put connect state: failed reading cluster response: %v", err)
+			return nil, nil
+		}
+		var cluster connectpb.Cluster
+		if err := proto.Unmarshal(body, &cluster); err != nil {
+			c.log.Debugf("put connect state: response was not a cluster (%d bytes): %v", len(body), err)
+			return nil, nil
+		}
+		return &cluster, nil
 	}, backoff.WithContext(backoff.WithMaxRetries(backoff.NewConstantBackOff(1*time.Second), 2), ctx))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return cluster, nil
 }
 
 // SendPlayerCommand sends a Spotify Connect remote-control command,

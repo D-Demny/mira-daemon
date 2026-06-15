@@ -82,9 +82,9 @@ func TestProjectQueue_ExtractsTrackIdFromThreePartSpotifyUri(t *testing.T) {
 	// 3-part Spotify URI, trackId is the third part. non-3-part leaves it empty
 	tracks := []*connectpb.ProvidedTrack{
 		{Uri: "spotify:track:abc123"},
-		{Uri: "spotify:local:something"},  // 3-part but not "track" - still extracts "something"
+		{Uri: "spotify:local:something"}, // 3-part but not "track" - still extracts "something"
 		{Uri: "spotify:track:abc:extra"}, // 4-part - strings.SplitN(",",3) returns 3 parts where the third has ":extra"
-		{Uri: "local-file"},               // 1-part - no trackId
+		{Uri: "local-file"},              // 1-part - no trackId
 	}
 
 	got := projectQueue(tracks, 10)
@@ -146,8 +146,8 @@ func TestProjectQueue_NilMetadataAndEmptyImageUrlAreSafe(t *testing.T) {
 
 	// nil/empty Metadata or empty image_url -> ImageUrl stays empty (not "https://")
 	tracks := []*connectpb.ProvidedTrack{
-		{Uri: "spotify:track:a"},                                   // Metadata is nil
-		{Uri: "spotify:track:b", Metadata: map[string]string{}},    // empty map
+		{Uri: "spotify:track:a"},                                               // Metadata is nil
+		{Uri: "spotify:track:b", Metadata: map[string]string{}},                // empty map
 		{Uri: "spotify:track:c", Metadata: map[string]string{"image_url": ""}}, // empty image_url
 	}
 

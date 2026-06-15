@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -36,6 +37,11 @@ type AppPlayer struct {
 	logout chan *AppPlayer
 
 	spotConnId string
+
+	registerGen atomic.Uint64
+	registered atomic.Bool
+	heartbeatInFlight atomic.Bool
+	clusterCh chan *connectpb.Cluster
 
 	prodInfo    *ProductInfo
 	countryCode *string
@@ -102,24 +108,93 @@ func (p *AppPlayer) handleAccesspointPacket(pktType ap.PacketType, payload []byt
 	}
 }
 
-func (p *AppPlayer) registerAsync(connId string) {
+// registerAsync registers this device with the connect cluster
+func (p *AppPlayer) registerAsync(connId string, gen uint64) {
 	waits := []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second}
-	for i, wait := range waits {
+	const slowRetry = 30 * time.Second
+
+	for attempt := 0; ; attempt++ {
+		wait := slowRetry
+		if attempt < len(waits) {
+			wait = waits[attempt]
+		}
 		if wait > 0 {
 			time.Sleep(wait)
 		}
+
+		// superseded by a newer connection-id
+		if p.registerGen.Load() != gen || p.app.currentPlayer.Load() != p {
+			return
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		err := p.putConnectState(ctx, connId, connectpb.PutStateReason_NEW_DEVICE)
+		cluster, err := p.putConnectState(ctx, connId, connectpb.PutStateReason_NEW_DEVICE)
 		cancel()
 		if err == nil {
-			if i > 0 {
-				p.app.log.Debugf("connect state put landed on attempt %d", i+1)
+			if p.registerGen.Load() == gen {
+				p.registered.Store(true)
+				// the registration response carries the current cluster
+				p.injectCluster(cluster)
+			}
+			if attempt > 0 {
+				p.app.log.Debugf("connect state put landed on attempt %d", attempt+1)
 			}
 			return
 		}
-		p.app.log.WithError(err).Warnf("connect state put failed (attempt %d), retrying", i+1)
+
+		// warn through the fast ladder
+		if attempt < len(waits) {
+			p.app.log.WithError(err).Warnf("connect state put failed (attempt %d), retrying", attempt+1)
+		} else {
+			p.app.log.WithError(err).Debugf("connect state put failed (attempt %d), retrying in %s", attempt+1, slowRetry)
+		}
 	}
-	p.app.log.Warn("connect state put gave up; will re-register on next dealer reconnect")
+}
+
+// connectStateHeartbeatInterval keeps our cluster registration alive
+const connectStateHeartbeatInterval = 4 * time.Minute
+
+// heartbeatConnectState re-puts our connect state periodically
+func (p *AppPlayer) heartbeatConnectState() {
+	if !p.hasSpotConnId || !p.registered.Load() {
+		// registerAsync is still retrying, don't pile on
+		return
+	}
+	if !p.heartbeatInFlight.CompareAndSwap(false, true) {
+		return
+	}
+
+	connId, gen := p.spotConnId, p.registerGen.Load()
+	go func() {
+		defer p.heartbeatInFlight.Store(false)
+
+		for attempt := 1; attempt <= 2; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			cluster, err := p.putConnectState(ctx, connId, connectpb.PutStateReason_NEW_DEVICE)
+			cancel()
+			if err == nil {
+				p.app.log.Tracef("connect state heartbeat ok")
+				// keep the device list fresh even if no dealer push arrived
+				if p.registerGen.Load() == gen {
+					p.injectCluster(cluster)
+				}
+				return
+			}
+
+			// a newer connection-id took over, its registerAsync owns recovery now
+			if p.registerGen.Load() != gen || p.app.currentPlayer.Load() != p {
+				return
+			}
+
+			p.app.log.WithError(err).Warnf("connect state heartbeat failed (attempt %d)", attempt)
+			if attempt == 1 {
+				time.Sleep(5 * time.Second)
+			}
+		}
+
+		p.registered.Store(false)
+		p.sess.Dealer().ForceReconnect()
+	}()
 }
 
 func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message) error {
@@ -135,7 +210,10 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
 			p.app.log.Debugf("received connection id (%d bytes)", len(p.spotConnId))
 		}
 
-		go p.registerAsync(p.spotConnId)
+		// a fresh connection-id voids any previous registration
+		p.app.log.Infof("dealer connection-id received (%d bytes), re-registering with connect cluster", len(p.spotConnId))
+		p.registered.Store(false)
+		go p.registerAsync(p.spotConnId, p.registerGen.Add(1))
 
 		p.hasInitialConnectState = true
 		p.notifyPlaybackReadyIfNeeded()
@@ -146,28 +224,55 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
 			return fmt.Errorf("failed unmarshalling ClusterUpdate: %w", err)
 		}
 
-		cluster := clusterUpdate.Cluster
-		activeDeviceId := cluster.ActiveDeviceId
-
-		// snapshot the selectable device list
-		p.updateConnectDevices(cluster)
-
-		// "is anything active" signal is ActiveDeviceId
-		switch {
-		case activeDeviceId == p.app.deviceId:
-			// ignore we cannot playback on the car thing
-		case activeDeviceId == "":
-			// nothing is active anywhere so we go idle.
-			p.clearActiveDevice()
-		case cluster.PlayerState != nil:
-			p.updateRemoteState(ctx, cluster)
-		}
-
+		p.handleCluster(ctx, clusterUpdate.Cluster)
 		return nil
 	}
 
 	p.app.log.Debugf("skipping dealer message, uri: %s", msg.Uri)
 	return nil
+}
+
+// handleCluster applies a Cluster snapshot
+func (p *AppPlayer) handleCluster(ctx context.Context, cluster *connectpb.Cluster) {
+	if cluster == nil {
+		return
+	}
+
+	activeDeviceId := cluster.ActiveDeviceId
+
+	// snapshot the selectable device list
+	p.updateConnectDevices(cluster)
+
+	// "is anything active" signal is ActiveDeviceId
+	switch {
+	case activeDeviceId == p.app.deviceId:
+		// ignore we cannot playback on the car thing
+	case activeDeviceId == "":
+		// nothing is active anywhere so we go idle.
+		p.clearActiveDevice()
+	case cluster.PlayerState != nil:
+		p.updateRemoteState(ctx, cluster)
+	}
+}
+
+// injectCluster hands a Cluster from a put_state response
+func (p *AppPlayer) injectCluster(cluster *connectpb.Cluster) {
+	if cluster == nil {
+		return
+	}
+	select {
+	case p.clusterCh <- cluster:
+	default:
+		// drop the previous queued snapshot in favour of this newer one
+		select {
+		case <-p.clusterCh:
+		default:
+		}
+		select {
+		case p.clusterCh <- cluster:
+		default:
+		}
+	}
 }
 
 func (p *AppPlayer) handleDealerRequest(ctx context.Context, req dealer.Request) error {
@@ -965,10 +1070,15 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	msgRecv := p.sess.Dealer().ReceiveMessage("hm://pusher/v1/connections/", "hm://connect-state/v1/")
 	reqRecv := p.sess.Dealer().ReceiveRequest("hm://connect-state/v1/player/command")
 
+	heartbeat := time.NewTicker(connectStateHeartbeatInterval)
+	defer heartbeat.Stop()
+
 	for {
 		select {
 		case <-p.stop:
 			return
+		case <-heartbeat.C:
+			p.heartbeatConnectState()
 		case pkt, ok := <-apRecv:
 			if !ok {
 				continue
@@ -983,6 +1093,11 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			if err := p.handleDealerMessage(ctx, msg); err != nil {
 				p.app.log.Warnf("failed handling dealer message: %v", err)
 			}
+		case cluster := <-p.clusterCh:
+			// cluster snapshot from a put_state response
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			p.handleCluster(cctx, cluster)
+			cancel()
 		case req, ok := <-reqRecv:
 			if !ok {
 				continue

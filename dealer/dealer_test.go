@@ -78,3 +78,52 @@ func TestDeliverMessageMakesRoomForConnectionID(t *testing.T) {
 		t.Fatalf("buffered message = %q, want connection-id message", got.Uri)
 	}
 }
+
+func TestForceReconnectDoesNotBlockOnHeldConnLock(t *testing.T) {
+	d := &Dealer{
+		log:          &librespot.NullLogger{},
+		done:         make(chan struct{}),
+		reconnectNow: make(chan struct{}, 1),
+	}
+
+	d.connMu.Lock()
+	defer d.connMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.ForceReconnect()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ForceReconnect blocked behind a held conn lock")
+	}
+
+	// it must still have signalled the reconnect loop to retry immediately
+	select {
+	case <-d.reconnectNow:
+	default:
+		t.Fatal("ForceReconnect did not signal reconnectNow")
+	}
+}
+
+func TestForceReconnectSafeOnZeroValueChannels(t *testing.T) {
+	d := &Dealer{
+		log:  &librespot.NullLogger{},
+		done: make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.ForceReconnect()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ForceReconnect blocked with nil reconnectNow channel")
+	}
+}

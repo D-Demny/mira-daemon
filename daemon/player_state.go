@@ -292,15 +292,15 @@ func (rs *RemoteState) RemotePosition() int64 {
 }
 
 func (p *AppPlayer) updateState(ctx context.Context) {
-	if err := p.putConnectState(ctx, p.spotConnId, connectpb.PutStateReason_PLAYER_STATE_CHANGED); err != nil {
+	if _, err := p.putConnectState(ctx, p.spotConnId, connectpb.PutStateReason_PLAYER_STATE_CHANGED); err != nil {
 		p.app.log.Errorf("failed put state after update: %v", err)
 	}
 }
 
 // putConnectState takes connId so it can be called safely from a goroutine
-func (p *AppPlayer) putConnectState(ctx context.Context, connId string, reason connectpb.PutStateReason) error {
+func (p *AppPlayer) putConnectState(ctx context.Context, connId string, reason connectpb.PutStateReason) (*connectpb.Cluster, error) {
 	if reason == connectpb.PutStateReason_BECAME_INACTIVE {
-		return p.sess.Spclient().PutConnectStateInactive(ctx, connId, false)
+		return nil, p.sess.Spclient().PutConnectStateInactive(ctx, connId, false)
 	}
 
 	putStateReq := &connectpb.PutStateRequest{
