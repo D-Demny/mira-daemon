@@ -38,6 +38,9 @@ type Dealer struct {
 	lastPong     time.Time
 	lastPongLock sync.Mutex
 
+	// reconnectNow wakes the reconnect loop out of a backoff sleep
+	reconnectNow chan struct{}
+
 	// connMu protects conn pointer state.
 	connMu sync.RWMutex
 
@@ -60,6 +63,7 @@ func NewDealer(log librespot.Logger, client *http.Client, dealerAddr librespot.G
 		addr:             dealerAddr,
 		accessToken:      accessToken,
 		done:             make(chan struct{}),
+		reconnectNow:     make(chan struct{}, 1),
 		requestReceivers: map[string]requestReceiver{},
 	}
 }
@@ -98,7 +102,8 @@ func (d *Dealer) connect(ctx context.Context) error {
 		return err
 	} else {
 		if d.conn != nil {
-			_ = d.conn.Close(websocket.StatusServiceRestart, "")
+			// CloseNow, not graceful Close
+			_ = d.conn.CloseNow()
 		}
 
 		// we assign to d.conn after because if Dial fails we'll have a nil d.conn which we don't want
@@ -119,7 +124,7 @@ func (d *Dealer) Close() {
 	})
 }
 
-// ForceReconnect closes the current connection
+// ForceReconnect closes the current connection and kicks the reconnect loop
 func (d *Dealer) ForceReconnect() {
 	select {
 	case <-d.done:
@@ -127,12 +132,21 @@ func (d *Dealer) ForceReconnect() {
 	default:
 	}
 	d.log.Debugf("forcing dealer reconnect")
-	d.connMu.RLock()
-	conn := d.conn
-	d.connMu.RUnlock()
-	if conn != nil {
-		// CloseNow tears down the underlying TCP immediately
-		_ = conn.CloseNow()
+
+	// wake the reconnect loop out of its backoff sleep 
+	select {
+	case d.reconnectNow <- struct{}{}:
+	default:
+	}
+
+
+	if d.connMu.TryRLock() {
+		conn := d.conn
+		d.connMu.RUnlock()
+		if conn != nil {
+			// CloseNow tears down the underlying TCP immediately
+			_ = conn.CloseNow()
+		}
 	}
 }
 
@@ -252,21 +266,29 @@ loop:
 	select {
 	case <-d.done:
 	default:
-		d.connMu.Lock()
 		// must keep retrying across long network outages
 		bo := backoff.NewExponentialBackOff()
 		bo.MaxElapsedTime = 0
-		if err := backoff.Retry(d.reconnect, bo); err != nil {
-			d.log.WithError(err).Errorf("failed reconnecting dealer")
+	retryLoop:
+		for {
+			d.connMu.Lock()
+			err := d.reconnect()
 			d.connMu.Unlock()
+			if err == nil {
+				// reconnection was successful, do not close receivers
+				return
+			} else if errors.Is(err, ErrDealerClosed) {
+				break
+			}
 
-			// something went very wrong, give up
-			d.Close()
-		} else {
-			d.connMu.Unlock()
-
-			// reconnection was successful, do not close receivers
-			return
+			select {
+			case <-d.done:
+				break retryLoop
+			case <-d.reconnectNow:
+				// resume recovery says the network just came back, retry immediately
+				bo.Reset()
+			case <-time.After(bo.NextBackOff()):
+			}
 		}
 	}
 
@@ -319,7 +341,7 @@ func (d *Dealer) reconnect() error {
 	// restart the recv loop
 	go d.recvLoop()
 
-	d.log.Debugf("re-established dealer connection")
+	d.log.Info("re-established dealer connection")
 	return nil
 }
 
@@ -344,8 +366,9 @@ func (d *Dealer) closeConn(status websocket.StatusCode) {
 }
 
 func (d *Dealer) closeConnRef(conn *websocket.Conn, status websocket.StatusCode) {
+	// CloseNow (forceful TCP teardown)
 	if conn != nil {
-		_ = conn.Close(status, "")
+		_ = conn.CloseNow()
 	}
 }
 

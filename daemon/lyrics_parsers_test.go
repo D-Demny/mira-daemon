@@ -117,7 +117,7 @@ func TestParseLRC_PreservesUnicodeAndSpecialChars(t *testing.T) {
 func TestPlainTextToResult_MultilineYieldsUnsyncedWithAllNonEmptyLines(t *testing.T) {
 	t.Parallel()
 
-	// Every output line carries StartTimeMs="0" 
+	// Every output line carries StartTimeMs="0"
 	input := "First line\nSecond line\nThird line"
 	result := plainTextToResult(input)
 
@@ -171,7 +171,7 @@ func secondaryEnvelope(statusCode int, macroCalls map[string]any) []byte {
 	return body
 }
 
-// secondarySubtitleCall builds a successful track.subtitles.get 
+// secondarySubtitleCall builds a successful track.subtitles.get
 func secondarySubtitleCall(subtitleBody string) map[string]any {
 	return map[string]any{
 		"message": map[string]any{
@@ -265,7 +265,7 @@ func TestParseSecondaryResponse_TopLevelNon200StatusReturnsError(t *testing.T) {
 func TestParseSecondaryResponse_MissingMessageFieldReturnsError(t *testing.T) {
 	t.Parallel()
 
-	// Some primary source error pages return JSON like `{"error":"..."}` 
+	// Some primary source error pages return JSON like `{"error":"..."}`
 	if _, err := newTestSecondaryProvider().parseResponse([]byte(`{"error":"bad"}`)); err == nil {
 		t.Error("parseResponse without message field should error, got nil")
 	}
@@ -305,7 +305,7 @@ func TestParseSecondarySubtitles_HappyPathDecodesSubtitleArray(t *testing.T) {
 	if len(result.Lines) != 2 {
 		t.Fatalf("expected 2 lines, got %d", len(result.Lines))
 	}
-	// 17.33s × 1000 = 17330ms. int cast 
+	// 17.33s × 1000 = 17330ms. int cast
 	if got, want := result.Lines[1].StartTimeMs, "17330"; got != want {
 		t.Errorf("Lines[1].StartTimeMs: got %q want %q (time.total × 1000)", got, want)
 	}
@@ -346,7 +346,7 @@ func TestParseSecondarySubtitles_EmptySubtitleList(t *testing.T) {
 func TestParseSecondarySubtitles_EmptySubtitleBody(t *testing.T) {
 	t.Parallel()
 
-	// subtitle_body is a string field, if it's empty, there's nothing so should error 
+	// subtitle_body is a string field, if it's empty, there's nothing so should error
 	raw, _ := json.Marshal(secondarySubtitleCall(""))
 
 	if _, err := newTestSecondaryProvider().parseSubtitles(raw); err == nil {
@@ -464,7 +464,7 @@ func TestParseSecondaryPlain_MalformedJSONReturnsError(t *testing.T) {
 	}
 }
 
-// the primary source 
+// the primary source
 func TestParsePrimary_MapsSyncedLinesAndKeepsMsStrings(t *testing.T) {
 	t.Parallel()
 

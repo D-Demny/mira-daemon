@@ -181,7 +181,7 @@ func TestSecondaryGetToken_InvalidateForcesRefetch(t *testing.T) {
 	}
 }
 
-// end-to-end 
+// end-to-end
 
 // returns the deeply-nested secondary JSON
 func happySecondarySubtitleResponse() []byte {
