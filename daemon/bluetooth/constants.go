@@ -17,14 +17,12 @@ const (
 	// must be advertised by the phone for tethering to work
 	panNAPUUID = "00001116-0000-1000-8000-00805f9b34fb"
 
-	EventPairing            = "bluetooth/pairing"
-	EventPairingCancelled   = "bluetooth/pairing/cancelled"
-	EventPaired             = "bluetooth/paired"
-	EventConnect            = "bluetooth/connect"
-	EventDisconnect         = "bluetooth/disconnect"
-	EventNetworkConnect     = "bluetooth/network/connect"
-	EventNetworkDisconnect  = "bluetooth/network/disconnect"
-	// EventNAPUnavailable fires when a paired device finishes service
-	// discovery but never advertises the PAN-NAP UUID 
-	EventNAPUnavailable     = "bluetooth/network/unavailable"
+	EventPairing           = "bluetooth/pairing"
+	EventPairingCancelled  = "bluetooth/pairing/cancelled"
+	EventPaired            = "bluetooth/paired"
+	EventConnect           = "bluetooth/connect"
+	EventDisconnect        = "bluetooth/disconnect"
+	EventNetworkConnect    = "bluetooth/network/connect"
+	EventNetworkDisconnect = "bluetooth/network/disconnect"
+	EventNAPUnavailable = "bluetooth/network/unavailable"
 )

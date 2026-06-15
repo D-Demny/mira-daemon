@@ -2,14 +2,23 @@ package daemon
 
 import (
 	"context"
+	"net"
 	"os/exec"
 	"time"
+
+	"github.com/vishvananda/netlink"
 
 	librespot "github.com/devgianlu/go-librespot"
 )
 
 // pinged once a second to test internet reachability
 const networkMonitorTarget = "1.1.1.1"
+
+// linkUp reports whether a network interface exists and is up
+func linkUp(name string) bool {
+	link, err := netlink.LinkByName(name)
+	return err == nil && link.Attrs().Flags&net.FlagUp != 0
+}
 
 // startNetworkMonitor pings + emits network_status on transition
 func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition func(online bool)) {
@@ -37,7 +46,11 @@ func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition fu
 		emit := func(status string) {
 			server.Emit(&ApiEvent{
 				Type: ApiEventTypeNetworkStatus,
-				Data: map[string]string{"status": status},
+				Data: map[string]any{
+					"status": status,
+					"usb":    linkUp("usb0"),
+					"bt":     linkUp("bnep0"),
+				},
 			})
 			tickSinceEmit = 0
 		}

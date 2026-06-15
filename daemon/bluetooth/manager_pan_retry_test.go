@@ -157,3 +157,27 @@ func TestShouldRetryPan_ConcurrentCallersSerializeAtThreshold(t *testing.T) {
 		t.Errorf("final history len: got %d want %d (only allowed callers append)", got, want)
 	}
 }
+
+// stable session threshold
+func TestShouldRetryPanThreshold_StableSessionSingleRetry(t *testing.T) {
+	t.Parallel()
+
+	m := newTestManager()
+	now := time.Now()
+
+	allowed, drops := m.shouldRetryPanThreshold(now, panStableRetryAllowed)
+	if !allowed || drops != 0 {
+		t.Fatalf("first drop should be allowed with 0 prior drops, got allowed=%v drops=%d", allowed, drops)
+	}
+
+	allowed, _ = m.shouldRetryPanThreshold(now.Add(5*time.Second), panStableRetryAllowed)
+	if allowed {
+		t.Fatalf("second drop within the window must be rejected at the stable threshold")
+	}
+
+	// after the window prunes, a fresh dropout recovers again
+	allowed, _ = m.shouldRetryPanThreshold(now.Add(panRetryWindow+time.Second), panStableRetryAllowed)
+	if !allowed {
+		t.Fatalf("a drop after the window should be allowed again")
+	}
+}
