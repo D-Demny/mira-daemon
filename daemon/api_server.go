@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +51,9 @@ type ApiServer interface {
 
 	// /system/* uses this, nil = 503
 	SetSystemHandler(h SystemHandler)
+
+	// /settings uses this, nil = 503
+	SetSettingsHandler(h SettingsHandler)
 }
 
 // destructive whole-device actions
@@ -57,6 +61,12 @@ type SystemHandler interface {
 	PerformReset()
 	PerformRestart()
 	PerformSuspend()
+}
+
+// durable store for the frontends settings
+type SettingsHandler interface {
+	GetSettings() []byte
+	PutSettings(body []byte) error
 }
 
 type ConcreteApiServer struct {
@@ -85,6 +95,9 @@ type ConcreteApiServer struct {
 
 	sysMu sync.RWMutex
 	sysFn SystemHandler
+
+	setMu sync.RWMutex
+	setFn SettingsHandler
 }
 
 var (
@@ -203,7 +216,7 @@ type ApiRequestDataLyrics struct {
 	ArtistName string
 	AlbumName  string
 	DurationMs int
-	Episode bool
+	Episode    bool
 }
 
 type ApiRequestDataPlay struct {
@@ -453,7 +466,8 @@ func (s *StubApiServer) SetAuthHandler(_ AuthStatusFunc) {}
 
 func (s *StubApiServer) SetPlayerReady(_ bool) {}
 
-func (s *StubApiServer) SetSystemHandler(_ SystemHandler) {}
+func (s *StubApiServer) SetSystemHandler(_ SystemHandler)     {}
+func (s *StubApiServer) SetSettingsHandler(_ SettingsHandler) {}
 
 func (s *StubApiServer) SetBluetoothHandler(_ BluetoothHandler) {}
 
@@ -496,6 +510,34 @@ func (s *ConcreteApiServer) getSystemHandler() SystemHandler {
 	s.sysMu.RLock()
 	defer s.sysMu.RUnlock()
 	return s.sysFn
+}
+
+func (s *ConcreteApiServer) SetSettingsHandler(h SettingsHandler) {
+	s.setMu.Lock()
+	s.setFn = h
+	s.setMu.Unlock()
+}
+
+func (s *ConcreteApiServer) getSettingsHandler() SettingsHandler {
+	s.setMu.RLock()
+	defer s.setMu.RUnlock()
+	return s.setFn
+}
+
+// ambientLuxPath is the tmd2772 ambient-light reading (lux) exposed by the
+// kernels iio subsystem
+const ambientLuxPath = "/sys/bus/iio/devices/iio:device0/in_illuminance0_input"
+
+func readAmbientLux() (int, bool) {
+	b, err := os.ReadFile(ambientLuxPath)
+	if err != nil {
+		return 0, false
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter) {
@@ -919,6 +961,55 @@ func (s *ConcreteApiServer) serve() {
 		go h.PerformSuspend()
 	})
 
+	// ambient light 
+	m.HandleFunc("GET /system/ambient", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if lux, ok := readAmbientLux(); ok {
+			fmt.Fprintf(w, `{"lux":%d}`, lux)
+		} else {
+			_, _ = w.Write([]byte(`{"lux":null}`))
+		}
+	})
+
+	// settings
+	m.HandleFunc("GET /settings", func(w http.ResponseWriter, r *http.Request) {
+		h := s.getSettingsHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		b := h.GetSettings()
+		if len(b) == 0 {
+			b = []byte("{}")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(b)
+	})
+
+	m.HandleFunc("PUT /settings", func(w http.ResponseWriter, r *http.Request) {
+		h := s.getSettingsHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if !json.Valid(body) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if err := h.PutSettings(body); err != nil {
+			s.log.WithError(err).Warn("failed to persist settings")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+
 	m.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		opts := &websocket.AcceptOptions{}
 		if len(s.allowOrigin) > 0 {
@@ -973,7 +1064,9 @@ func (s *ConcreteApiServer) serve() {
 	})
 
 	c := cors.New(cors.Options{
-		AllowedOrigins:      []string{s.allowOrigin},
+		AllowedOrigins: []string{s.allowOrigin},
+		// rs/cors defaults to GET/POST/HEAD only
+		AllowedMethods:      []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodHead},
 		AllowPrivateNetwork: true,
 		AllowCredentials:    true,
 	})
