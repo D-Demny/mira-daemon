@@ -3,12 +3,15 @@ package spclient
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -28,6 +31,12 @@ type Spclient struct {
 	deviceId    string
 
 	accessToken librespot.GetLogin5TokenFunc
+
+	// WebPlayer client-token for the Pathfinder gateway, minted + cached
+	// separately from the native client-token above.
+	webClientToken    string
+	webClientTokenExp time.Time
+	webClientTokenMu  sync.Mutex
 }
 
 func NewSpclient(ctx context.Context, log librespot.Logger, client *http.Client, addr librespot.GetAddressFunc, accessToken librespot.GetLogin5TokenFunc, deviceId, clientToken string) (*Spclient, error) {
@@ -129,6 +138,104 @@ func (c *Spclient) WebApiRequest(ctx context.Context, method string, path string
 func (c *Spclient) Request(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
 	reqUrl := c.baseUrl.JoinPath(path)
 	return c.innerRequest(ctx, method, reqUrl, query, header, body)
+}
+
+const (
+	webPlayerClientId    = "d8a5ed958d274c2e8ee717e6a4b0971d"
+	spotifyWebAppVersion = "1.2.80.313.gd1726b65"
+	spotifyWebUserAgent  = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+)
+
+func (c *Spclient) PartnerApiRequest(ctx context.Context, body []byte) (*http.Response, error) {
+	accessToken, err := c.accessToken(ctx, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed obtaining access token: %w", err)
+	}
+	clientToken, err := c.webPlayerClientToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed obtaining web client token: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://api-partner.spotify.com/pathfinder/v2/query", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed building pathfinder request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("App-Platform", "WebPlayer")
+	req.Header.Set("Spotify-App-Version", spotifyWebAppVersion)
+	req.Header.Set("User-Agent", spotifyWebUserAgent)
+	req.Header.Set("Origin", "https://open.spotify.com")
+	req.Header.Set("Client-Token", clientToken)
+	return c.client.Do(req)
+}
+
+func (c *Spclient) webPlayerClientToken(ctx context.Context) (string, error) {
+	c.webClientTokenMu.Lock()
+	defer c.webClientTokenMu.Unlock()
+
+	if c.webClientToken != "" && time.Now().Before(c.webClientTokenExp) {
+		return c.webClientToken, nil
+	}
+
+	idBytes := make([]byte, 16)
+	if _, err := rand.Read(idBytes); err != nil {
+		return "", fmt.Errorf("failed generating device id: %w", err)
+	}
+	reqBody, _ := json.Marshal(map[string]any{
+		"client_data": map[string]any{
+			"client_version": spotifyWebAppVersion,
+			"client_id":      webPlayerClientId,
+			"js_sdk_data": map[string]any{
+				"device_brand": "Apple",
+				"device_model": "unknown",
+				"os":           "macos",
+				"os_version":   "10.15.7",
+				"device_id":    hex.EncodeToString(idBytes),
+				"device_type":  "computer",
+			},
+		},
+	})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://clienttoken.spotify.com/v1/clienttoken", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("failed building clienttoken request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed requesting web client token: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("web clienttoken returned status %d", resp.StatusCode)
+	}
+
+	var data struct {
+		GrantedToken struct {
+			Token               string `json:"token"`
+			ExpiresAfterSeconds int    `json:"expires_after_seconds"`
+		} `json:"granted_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", fmt.Errorf("failed decoding web clienttoken: %w", err)
+	}
+	if data.GrantedToken.Token == "" {
+		return "", fmt.Errorf("web clienttoken response had no token")
+	}
+
+	ttl := data.GrantedToken.ExpiresAfterSeconds
+	if ttl <= 0 {
+		ttl = 3600
+	}
+	c.webClientToken = data.GrantedToken.Token
+	c.webClientTokenExp = time.Now().Add(time.Duration(ttl-60) * time.Second)
+	return c.webClientToken, nil
 }
 
 type putStateError struct {

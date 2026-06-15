@@ -33,3 +33,7 @@ func (s *Session) Accesspoint() *ap.Accesspoint {
 func (s *Session) WebApi(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
 	return s.sp.WebApiRequest(ctx, method, path, query, header, body)
 }
+
+func (s *Session) PartnerApi(ctx context.Context, body []byte) (*http.Response, error) {
+	return s.sp.PartnerApiRequest(ctx, body)
+}

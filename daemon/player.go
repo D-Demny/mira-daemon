@@ -599,6 +599,146 @@ func (p *AppPlayer) resolveViaWebApi(ctx context.Context, spotId librespot.Spoti
 	return
 }
 
+const (
+	pfAddToLibraryHash         = "7c5a69420e2bfae3da5cc4e14cbc8bb3f6090f80afc00ffc179177f19be3f33d"
+	pfApplyCurationsHash       = "05b739a3a73091c213385233b9d3ed8a857c2ca29d2eebadb3d04ed12e288697"
+	pfAreEntitiesInLibraryHash = "134337999233cc6fdd6b1e6dbf94841409f04a946c5c7b744b09ba0dfe5a85ed"
+)
+
+func pathfinderGraphQLError(body []byte) error {
+	var r struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal(body, &r) == nil && len(r.Errors) > 0 {
+		return fmt.Errorf("pathfinder: %s", r.Errors[0].Message)
+	}
+	return nil
+}
+
+func (p *AppPlayer) pathfinderQuery(ctx context.Context, body []byte) ([]byte, error) {
+	resp, err := p.sess.PartnerApi(ctx, body)
+	if err != nil {
+		return nil, fmt.Errorf("pathfinder request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	data, _ := io.ReadAll(resp.Body)
+
+	// Log the failure body
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet := string(data)
+		if len(snippet) > 500 {
+			snippet = snippet[:500]
+		}
+		p.app.log.Warnf("pathfinder: status=%d ct=%q body=%q", resp.StatusCode, resp.Header.Get("Content-Type"), snippet)
+	}
+
+	switch resp.StatusCode {
+	case 401, 403:
+		return nil, ErrForbidden
+	case 429:
+		return nil, ErrTooManyRequests
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("pathfinder returned status %d", resp.StatusCode)
+	}
+
+	if e := pathfinderGraphQLError(data); e != nil {
+		return nil, e
+	}
+	return data, nil
+}
+
+// report whether the URI is in liked songs
+func (p *AppPlayer) checkTrackSaved(ctx context.Context, uri string) (bool, error) {
+	if !strings.HasPrefix(uri, "spotify:") {
+		return false, ErrBadRequest
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"operationName": "areEntitiesInLibrary",
+		"variables":     map[string]any{"uris": []string{uri}},
+		"extensions": map[string]any{
+			"persistedQuery": map[string]any{"version": 1, "sha256Hash": pfAreEntitiesInLibraryHash},
+		},
+	})
+
+	data, err := p.pathfinderQuery(ctx, body)
+	if err != nil {
+		return false, err
+	}
+
+	var r struct {
+		Data struct {
+			Lookup []struct {
+				Saved *bool `json:"saved"`
+				Data  struct {
+					Saved *bool `json:"saved"`
+				} `json:"data"`
+			} `json:"lookup"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(data, &r) == nil && len(r.Data.Lookup) > 0 {
+		e := r.Data.Lookup[0]
+		if e.Data.Saved != nil {
+			return *e.Data.Saved, nil
+		}
+		if e.Saved != nil {
+			return *e.Saved, nil
+		}
+	}
+	return false, nil
+}
+
+// adds or removes the track or local file from liked songs
+func (p *AppPlayer) setTrackSaved(ctx context.Context, uri string, saved bool) error {
+	if !strings.HasPrefix(uri, "spotify:") {
+		return ErrBadRequest
+	}
+
+	var body []byte
+	switch {
+	case saved && strings.HasPrefix(uri, "spotify:local:"):
+		body = applyCurationsBody(uri, "CURATE")
+	case saved:
+		body, _ = json.Marshal(map[string]any{
+			"operationName": "addToLibrary",
+			"variables":     map[string]any{"libraryItemUris": []string{uri}},
+			"extensions": map[string]any{
+				"persistedQuery": map[string]any{"version": 1, "sha256Hash": pfAddToLibraryHash},
+			},
+		})
+	default:
+		body = applyCurationsBody(uri, "UNCURATE")
+	}
+
+	if _, err := p.pathfinderQuery(ctx, body); err != nil {
+		return err
+	}
+	p.app.log.Infof("liked songs: %s %s", map[bool]string{true: "added", false: "removed"}[saved], uri)
+	return nil
+}
+
+func applyCurationsBody(uri, curationType string) []byte {
+	body, _ := json.Marshal(map[string]any{
+		"operationName": "applyCurations",
+		"variables": map[string]any{
+			"input": map[string]any{
+				"curations": []any{
+					map[string]any{"contextUri": "spotify:collection:tracks", "curationType": curationType},
+				},
+				"itemUris": []string{uri},
+			},
+		},
+		"extensions": map[string]any{
+			"persistedQuery": map[string]any{"version": 1, "sha256Hash": pfApplyCurationsHash},
+		},
+	})
+	return body
+}
+
 func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -812,6 +952,21 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 
 	case ApiRequestTypeAddToQueue:
 		return nil, fmt.Errorf("not yet available in observer mode")
+
+	case ApiRequestTypeGetSaved:
+		data, _ := req.Data.(ApiRequestDataSaved)
+		saved, err := p.checkTrackSaved(ctx, data.Uri)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"saved": saved}, nil
+
+	case ApiRequestTypeSetSaved:
+		data, _ := req.Data.(ApiRequestDataSaved)
+		if err := p.setTrackSaved(ctx, data.Uri, data.Saved); err != nil {
+			return nil, err
+		}
+		return map[string]any{"saved": data.Saved}, nil
 
 	default:
 		return nil, fmt.Errorf("unknown request type: %s", req.Type)

@@ -128,6 +128,8 @@ const (
 	ApiRequestTypeSetRepeatingTrack   ApiRequestType = "repeating_track"
 	ApiRequestTypeSetShufflingContext ApiRequestType = "shuffling_context"
 	ApiRequestTypeAddToQueue          ApiRequestType = "add_to_queue"
+	ApiRequestTypeGetSaved            ApiRequestType = "get_saved"
+	ApiRequestTypeSetSaved            ApiRequestType = "set_saved"
 	ApiRequestTypeToken               ApiRequestType = "token"
 	ApiRequestTypeObserverStatus      ApiRequestType = "observer_status"
 	ApiRequestTypeConnectDevices      ApiRequestType = "connect_devices"
@@ -231,6 +233,11 @@ type ApiRequestDataTransfer struct {
 
 type ApiRequestDataNext struct {
 	Uri *string `json:"uri"`
+}
+
+type ApiRequestDataSaved struct {
+	Uri   string `json:"uri"`
+	Saved bool   `json:"saved"`
 }
 
 type apiResponse struct {
@@ -905,6 +912,31 @@ func (s *ConcreteApiServer) serve() {
 		}
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeAddToQueue, Data: data.Uri}, w)
+	})
+	// adds or removes the track from the users liked Songs.
+	m.HandleFunc("/player/saved", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			uri := r.URL.Query().Get("uri")
+			if uri == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			s.handleRequest(ApiRequest{Type: ApiRequestTypeGetSaved, Data: ApiRequestDataSaved{Uri: uri}}, w)
+		case "POST":
+			var data ApiRequestDataSaved
+			if err := jsonDecode(r, &data); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if data.Uri == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			s.handleRequest(ApiRequest{Type: ApiRequestTypeSetSaved, Data: data}, w)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
 	})
 	m.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
