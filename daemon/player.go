@@ -1229,7 +1229,7 @@ func (p *AppPlayer) handleLyricsAsync(ctx context.Context, req ApiRequest) {
 
 	lp := p.lyricsProvider
 	go func() {
-		result, err := lp.FetchLyrics(ctx, data.TrackId, trackName, artistName, albumName, durationMs)
+		result, err := lp.FetchLyrics(ctx, data.TrackId, trackName, artistName, albumName, durationMs, data.Richsync)
 		if err != nil {
 			if errors.Is(err, ErrNoLyrics) {
 				req.Reply(nil, ErrNotFound)

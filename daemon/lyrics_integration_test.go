@@ -219,6 +219,7 @@ func TestFetchLyrics_SecondaryHappyPathReturnsSyncedLyrics(t *testing.T) {
 		"Test",
 		"",
 		60_000,
+		false,
 	)
 	if err != nil {
 		t.Fatalf("FetchLyrics: %v", err)
@@ -274,6 +275,7 @@ func TestFetchLyrics_SecondaryFailsFallsBackToLRCLIB(t *testing.T) {
 		"Test",
 		"",
 		60_000,
+		false,
 	)
 	if err != nil {
 		t.Fatalf("FetchLyrics: %v", err)
@@ -314,7 +316,7 @@ func TestFetchLyrics_AllSourcesFailReturnsErrNoLyrics(t *testing.T) {
 	ter.url = lrc.URL
 	lp := newTestOrchestrator(sec, ter)
 
-	_, err := lp.FetchLyrics(context.Background(), "track-nothing", "X", "Y", "", 60_000)
+	_, err := lp.FetchLyrics(context.Background(), "track-nothing", "X", "Y", "", 60_000, false)
 	if err == nil {
 		t.Fatal("expected ErrNoLyrics, got nil")
 	}
@@ -329,7 +331,7 @@ func TestFetchLyrics_EmptyTrackNameReturnsErrorImmediately(t *testing.T) {
 	// no track name = no useful query
 	lp := newTestOrchestrator(newTestSecondaryProviderHTTP(), newTestTertiaryProviderHTTP())
 
-	_, err := lp.FetchLyrics(context.Background(), "track-x", "", "Artist", "", 60_000)
+	_, err := lp.FetchLyrics(context.Background(), "track-x", "", "Artist", "", 60_000, false)
 	if err == nil {
 		t.Error("empty trackName should error, got nil")
 	}
@@ -356,7 +358,7 @@ func TestFetchLyrics_CacheHitSkipsUpstream(t *testing.T) {
 	ter.url = "http://localhost:1/nope"
 	lp := newTestOrchestrator(sec, ter)
 
-	if _, err := lp.FetchLyrics(context.Background(), "k", "Hi", "X", "", 60_000); err != nil {
+	if _, err := lp.FetchLyrics(context.Background(), "k", "Hi", "X", "", 60_000, false); err != nil {
 		t.Fatalf("first FetchLyrics: %v", err)
 	}
 	requestsAfterFirst := atomic.LoadInt32(&requests)
@@ -365,7 +367,7 @@ func TestFetchLyrics_CacheHitSkipsUpstream(t *testing.T) {
 	}
 
 	// should be a cache hit
-	if _, err := lp.FetchLyrics(context.Background(), "k", "Hi", "X", "", 60_000); err != nil {
+	if _, err := lp.FetchLyrics(context.Background(), "k", "Hi", "X", "", 60_000, false); err != nil {
 		t.Fatalf("second FetchLyrics: %v", err)
 	}
 	if got := atomic.LoadInt32(&requests); got != requestsAfterFirst {
@@ -468,7 +470,7 @@ func TestFetchLyrics_ConcurrentCallsForSameTrackDoNotDeadlock(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = lp.FetchLyrics(context.Background(), "concurrent-key", "X", "Y", "", 60_000)
+			_, _ = lp.FetchLyrics(context.Background(), "concurrent-key", "X", "Y", "", 60_000, false)
 		}()
 	}
 
