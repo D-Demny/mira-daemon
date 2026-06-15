@@ -122,6 +122,7 @@ const (
 	ApiRequestTypePrev                ApiRequestType = "prev"
 	ApiRequestTypeNext                ApiRequestType = "next"
 	ApiRequestTypePlay                ApiRequestType = "play"
+	ApiRequestTypeResumeLast          ApiRequestType = "resume_last"
 	ApiRequestTypeGetVolume           ApiRequestType = "get_volume"
 	ApiRequestTypeSetVolume           ApiRequestType = "set_volume"
 	ApiRequestTypeSetRepeatingContext ApiRequestType = "repeating_context"
@@ -767,6 +768,15 @@ func (s *ConcreteApiServer) serve() {
 		}
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeResume}, w)
+	})
+	// resume playback on the last active device
+	m.HandleFunc("/player/resume_last", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeResumeLast}, w)
 	})
 	m.HandleFunc("/player/pause", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {

@@ -408,6 +408,11 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 	trackChanged := prevState == nil || prevState.TrackUri != rs.TrackUri
 
 	p.state.remoteState = rs
+	// remember the active device
+	if rs.DeviceId != "" {
+		p.state.lastActiveDeviceId = rs.DeviceId
+		p.state.lastActiveDeviceName = rs.DeviceName
+	}
 
 	if trackChanged {
 		p.app.log.Debugf("observer: track changed to %q by %s on %s", rs.TrackName, rs.TrackArtist, rs.DeviceName)
@@ -862,6 +867,8 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 
 	case ApiRequestTypeResume:
 		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "resume"})
+	case ApiRequestTypeResumeLast:
+		return nil, p.resumeLastDevice(ctx)
 	case ApiRequestTypePause:
 		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "pause"})
 	case ApiRequestTypePlayPause:
@@ -1031,8 +1038,17 @@ func (p *AppPlayer) sendActiveDeviceCommand(ctx context.Context, cmd connectComm
 	if rs == nil || rs.DeviceId == "" {
 		return fmt.Errorf("no active remote device known yet")
 	}
-	if rs.DeviceId == p.app.deviceId {
-		return fmt.Errorf("active device is us; cannot remote-control self")
+	// always target the current active device
+	return p.sendDeviceCommand(ctx, rs.DeviceId, rs.DeviceName, cmd)
+}
+
+// sendDeviceCommand sends a connect player command to an explicit device id.
+func (p *AppPlayer) sendDeviceCommand(ctx context.Context, deviceId, deviceName string, cmd connectCommand) error {
+	if deviceId == "" {
+		return fmt.Errorf("no target device")
+	}
+	if deviceId == p.app.deviceId {
+		return fmt.Errorf("target device is us; cannot remote-control self")
 	}
 	if !p.hasSpotConnId {
 		return fmt.Errorf("dealer not connected (no spotify-connection-id)")
@@ -1043,11 +1059,32 @@ func (p *AppPlayer) sendActiveDeviceCommand(ctx context.Context, cmd connectComm
 		return fmt.Errorf("marshal connect command: %w", err)
 	}
 
-	if err := p.sess.Spclient().SendPlayerCommand(ctx, p.app.deviceId, rs.DeviceId, p.spotConnId, body); err != nil {
-		return fmt.Errorf("send %s to %s: %w", cmd.Endpoint, rs.DeviceId, err)
+	if err := p.sess.Spclient().SendPlayerCommand(ctx, p.app.deviceId, deviceId, p.spotConnId, body); err != nil {
+		return fmt.Errorf("send %s to %s: %w", cmd.Endpoint, deviceId, err)
 	}
-	p.app.log.Debugf("observer: sent %s to %s (%s)", cmd.Endpoint, rs.DeviceId, rs.DeviceName)
+	p.app.log.Debugf("observer: sent %s to %s (%s)", cmd.Endpoint, deviceId, deviceName)
 	return nil
+}
+
+// resumeLastDevice resumes playback on the most-recent active device
+func (p *AppPlayer) resumeLastDevice(ctx context.Context) error {
+	targetId := p.state.lastActiveDeviceId
+	if targetId == "" {
+		return ErrNotFound
+	}
+
+	present := false
+	for _, d := range p.state.connectDevices {
+		if d.Id == targetId {
+			present = true
+			break
+		}
+	}
+	if !present {
+		return ErrNotFound
+	}
+
+	return p.sendDeviceCommand(ctx, targetId, p.state.lastActiveDeviceName, connectCommand{Endpoint: "resume"})
 }
 
 // sendActiveDeviceVolume sets the active device's volume using a connect-state endpoint

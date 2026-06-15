@@ -25,6 +25,10 @@ type State struct {
 	// remoteState tracks what is playing on another device when in observer mode.
 	remoteState *RemoteState
 
+	// lastActiveDeviceId/Name remember the most-recent active device
+	lastActiveDeviceId   string
+	lastActiveDeviceName string
+
 	// connectDevices is the latest snapshot of selectable Connect devices
 	connectDevices []ConnectDevice
 	// connectDevSig identical per-second clusters dont re-emit events
