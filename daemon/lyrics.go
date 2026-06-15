@@ -20,9 +20,16 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 )
 
-type LyricsLine struct {
+// LyricsWord is one word segment with its own start time
+type LyricsWord struct {
 	StartTimeMs string `json:"startTimeMs"`
-	Words       string `json:"words"`
+	Word        string `json:"word"`
+}
+
+type LyricsLine struct {
+	StartTimeMs string       `json:"startTimeMs"`
+	Words       string       `json:"words"`
+	Syllables   []LyricsWord `json:"syllables,omitempty"` // word-level timing
 }
 
 type LyricsResult struct {
@@ -49,29 +56,42 @@ type lyricSource interface {
 }
 
 type LyricsProvider struct {
-	log     librespot.Logger
-	sources []lyricSource
-	episode *episodeTextProvider
+	log       librespot.Logger
+	sources   []lyricSource
+	episode   *episodeTextProvider
+	secondary *secondaryLyricProvider
 
 	mu    sync.RWMutex
 	cache map[string]*LyricsResult // keyed by trackId/episode id
 }
 
 func NewLyricsProvider(logger librespot.Logger, getAccessToken func(ctx context.Context, force bool) (string, error)) *LyricsProvider {
+	secondary := newSecondaryLyricProvider(logger)
 	return &LyricsProvider{
 		log: logger,
 		sources: []lyricSource{
 			newPrimaryLyricProvider(logger, getAccessToken),
-			newSecondaryLyricProvider(logger),
+			secondary,
 			newTertiaryLyricProvider(logger),
 		},
-		episode: newEpisodeTextProvider(logger, getAccessToken),
-		cache:   make(map[string]*LyricsResult),
+		episode:   newEpisodeTextProvider(logger, getAccessToken),
+		secondary: secondary,
+		cache:     make(map[string]*LyricsResult),
 	}
 }
 
-// first source to return synced lyrics wins
-func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, artistName, albumName string, durationMs int) (*LyricsResult, error) {
+// hasWords reports whether a result carries word by word timing.
+func hasWords(r *LyricsResult) bool {
+	for i := range r.Lines {
+		if len(r.Lines[i].Syllables) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// FetchLyrics returns the best lyrics for a track
+func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, artistName, albumName string, durationMs int, wantRichsync bool) (*LyricsResult, error) {
 	if trackName == "" {
 		return nil, fmt.Errorf("track name is required")
 	}
@@ -84,7 +104,10 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 		if cached == nil {
 			return nil, ErrNoLyrics
 		}
-		return cached, nil
+		// a positive hit serves directly, unless we want word-by-word timing
+		if !wantRichsync || hasWords(cached) {
+			return cached, nil
+		}
 	}
 
 	q := lyricsQuery{
@@ -93,6 +116,16 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 		artistName: artistName,
 		albumName:  albumName,
 		durationMs: durationMs,
+	}
+
+	if wantRichsync && lp.secondary != nil {
+		if res, err := lp.secondary.fetchRichsync(ctx, q); err != nil {
+			lp.log.Debugf("lyrics: richsync unavailable: %v", err)
+		} else if res != nil {
+			lp.store(trackId, res)
+			lp.log.Debugf("lyrics: richsync (word-level) for %q by %q (%d lines)", trackName, artistName, len(res.Lines))
+			return res, nil
+		}
 	}
 
 	var result, firstUnsynced *LyricsResult
@@ -133,12 +166,16 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 		return nil, ErrNoLyrics
 	}
 
-	lp.mu.Lock()
-	lp.storeLocked(trackId, result)
-	lp.mu.Unlock()
+	lp.store(trackId, result)
 
 	lp.log.Debugf("lyrics found for %q by %q (%s, %d lines)", trackName, artistName, result.SyncType, len(result.Lines))
 	return result, nil
+}
+
+func (lp *LyricsProvider) store(trackId string, result *LyricsResult) {
+	lp.mu.Lock()
+	lp.storeLocked(trackId, result)
+	lp.mu.Unlock()
 }
 
 // returns the synced text track for podcasts, these are not cached
@@ -804,6 +841,174 @@ func (s *secondaryLyricProvider) parsePlain(raw json.RawMessage) (*LyricsResult,
 	}
 
 	return plainTextToResult(lyr.Message.Body.Lyrics.LyricsBody), nil
+}
+
+// fetchRichsync gets word by word timing
+func (s *secondaryLyricProvider) fetchRichsync(ctx context.Context, q lyricsQuery) (*LyricsResult, error) {
+	if s.tokenURL == "" || s.subtitleURL == "" {
+		return nil, errors.New("richsync disabled (no env config)")
+	}
+
+	s.mu.Lock()
+	cooling := time.Now().Before(s.cooldownUntil)
+	s.mu.Unlock()
+	if cooling {
+		return nil, errors.New("richsync cooling down")
+	}
+
+	token, err := s.getToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("richsync token: %w", err)
+	}
+
+	commonTrackID, err := s.resolveCommonTrackID(ctx, token, q)
+	if err != nil {
+		return nil, err
+	}
+
+	base := s.subtitleURL[:strings.LastIndex(s.subtitleURL, "/")+1]
+	params := url.Values{
+		"format":         {"json"},
+		"app_id":         {s.appID},
+		"usertoken":      {token},
+		"commontrack_id": {commonTrackID},
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", base+"track.richsync.get?"+params.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating richsync request: %w", err)
+	}
+	s.addHeaders(req)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("richsync request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var env struct {
+		Message struct {
+			Header struct {
+				StatusCode int `json:"status_code"`
+			} `json:"header"`
+			Body json.RawMessage `json:"body"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("parsing richsync envelope: %w", err)
+	}
+
+	sc := env.Message.Header.StatusCode
+	switch {
+	case sc == 401 || sc == 403 || sc == 429:
+		s.invalidateToken()
+		return nil, fmt.Errorf("richsync rate-limit (status %d), cooling down", sc)
+	case sc != 200:
+		// 404
+		return nil, fmt.Errorf("richsync status %d (no word-level for track)", sc)
+	}
+
+	var rb struct {
+		Richsync struct {
+			RichsyncBody string `json:"richsync_body"`
+		} `json:"richsync"`
+	}
+	if err := json.Unmarshal(env.Message.Body, &rb); err != nil {
+		// ratelimit
+		s.invalidateToken()
+		return nil, fmt.Errorf("richsync rate-limit (200 + non-object body), cooling down")
+	}
+
+	return parseRichsync(rb.Richsync.RichsyncBody)
+}
+
+func (s *secondaryLyricProvider) resolveCommonTrackID(ctx context.Context, token string, q lyricsQuery) (string, error) {
+	base := s.subtitleURL[:strings.LastIndex(s.subtitleURL, "/")+1]
+	params := url.Values{
+		"format":    {"json"},
+		"app_id":    {s.appID},
+		"usertoken": {token},
+		"q_track":   {q.trackName},
+		"q_artist":  {q.artistName},
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", base+"matcher.track.get?"+params.Encode(), nil)
+	if err != nil {
+		return "", fmt.Errorf("creating matcher request: %w", err)
+	}
+	s.addHeaders(req)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("matcher request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	// decode the header separately from a raw body
+	var env struct {
+		Message struct {
+			Header struct {
+				StatusCode int `json:"status_code"`
+			} `json:"header"`
+			Body json.RawMessage `json:"body"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return "", fmt.Errorf("parsing matcher envelope: %w", err)
+	}
+	sc := env.Message.Header.StatusCode
+	var b struct {
+		Track struct {
+			CommonTrackID int64 `json:"commontrack_id"`
+		} `json:"track"`
+	}
+	if sc == 401 || sc == 403 || sc == 429 || json.Unmarshal(env.Message.Body, &b) != nil {
+		s.invalidateToken()
+		return "", fmt.Errorf("matcher rate-limit (status %d), cooling down", sc)
+	}
+	if b.Track.CommonTrackID == 0 {
+		return "", fmt.Errorf("richsync: no track match")
+	}
+	return strconv.FormatInt(b.Track.CommonTrackID, 10), nil
+}
+
+func parseRichsync(richsyncBody string) (*LyricsResult, error) {
+	if richsyncBody == "" {
+		return nil, fmt.Errorf("richsync: empty body")
+	}
+
+	var segs []struct {
+		Ts float64 `json:"ts"`
+		X  string  `json:"x"`
+		L  []struct {
+			C string  `json:"c"`
+			O float64 `json:"o"`
+		} `json:"l"`
+	}
+	if err := json.Unmarshal([]byte(richsyncBody), &segs); err != nil {
+		return nil, fmt.Errorf("parsing richsync body: %w", err)
+	}
+	if len(segs) == 0 {
+		return nil, fmt.Errorf("richsync: no lines")
+	}
+
+	lines := make([]LyricsLine, 0, len(segs))
+	for _, seg := range segs {
+		words := make([]LyricsWord, 0, len(seg.L))
+		for _, w := range seg.L {
+			words = append(words, LyricsWord{
+				StartTimeMs: strconv.Itoa(int((seg.Ts + w.O) * 1000)),
+				Word:        w.C,
+			})
+		}
+		lines = append(lines, LyricsLine{
+			StartTimeMs: strconv.Itoa(int(seg.Ts * 1000)),
+			Words:       seg.X,
+			Syllables:   words,
+		})
+	}
+
+	return &LyricsResult{SyncType: "LINE_SYNCED", Lines: lines}, nil
 }
 
 // final source LRCLIB (public api w/no auth but not as much lyrics)

@@ -40,7 +40,7 @@ func TestFetchLyrics_NoLyricsCachedSkipsRefetch(t *testing.T) {
 	lp := newTestOrchestrator(sec, ter)
 
 	// first fetch: hits upstream, finds nothing, caches the negative
-	if _, err := lp.FetchLyrics(context.Background(), "track-instrumental", "X", "Y", "", 60_000); !errors.Is(err, ErrNoLyrics) {
+	if _, err := lp.FetchLyrics(context.Background(), "track-instrumental", "X", "Y", "", 60_000, false); !errors.Is(err, ErrNoLyrics) {
 		t.Fatalf("first fetch: got %v, want ErrNoLyrics", err)
 	}
 	sec1, lrc1 := atomic.LoadInt32(&secReqs), atomic.LoadInt32(&lrcReqs)
@@ -49,7 +49,7 @@ func TestFetchLyrics_NoLyricsCachedSkipsRefetch(t *testing.T) {
 	}
 
 	// second fetch: served from the negative cache
-	if _, err := lp.FetchLyrics(context.Background(), "track-instrumental", "X", "Y", "", 60_000); !errors.Is(err, ErrNoLyrics) {
+	if _, err := lp.FetchLyrics(context.Background(), "track-instrumental", "X", "Y", "", 60_000, false); !errors.Is(err, ErrNoLyrics) {
 		t.Fatalf("second fetch: got %v, want ErrNoLyrics", err)
 	}
 	if got := atomic.LoadInt32(&secReqs); got != sec1 {
@@ -93,7 +93,7 @@ func TestFetchLyrics_TransientFailureNotCached(t *testing.T) {
 	ter.url = "http://localhost:1/nope"
 	lp := newTestOrchestrator(sec, ter)
 
-	if _, err := lp.FetchLyrics(context.Background(), "track-maybe", "X", "Y", "", 60_000); !errors.Is(err, ErrNoLyrics) {
+	if _, err := lp.FetchLyrics(context.Background(), "track-maybe", "X", "Y", "", 60_000, false); !errors.Is(err, ErrNoLyrics) {
 		t.Fatalf("first fetch: got %v, want ErrNoLyrics", err)
 	}
 	sec1 := atomic.LoadInt32(&secReqs)
@@ -107,7 +107,7 @@ func TestFetchLyrics_TransientFailureNotCached(t *testing.T) {
 	}
 
 	// so the second fetch re-queries upstream
-	if _, err := lp.FetchLyrics(context.Background(), "track-maybe", "X", "Y", "", 60_000); !errors.Is(err, ErrNoLyrics) {
+	if _, err := lp.FetchLyrics(context.Background(), "track-maybe", "X", "Y", "", 60_000, false); !errors.Is(err, ErrNoLyrics) {
 		t.Fatalf("second fetch: got %v, want ErrNoLyrics", err)
 	}
 	if got := atomic.LoadInt32(&secReqs); got <= sec1 {

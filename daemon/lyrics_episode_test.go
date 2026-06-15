@@ -45,8 +45,9 @@ func TestParseEpisodeText_MapsSentencesTitlesAndFallback(t *testing.T) {
 		t.Fatalf("expected %d lines, got %d: %+v", len(want), len(res.Lines), res.Lines)
 	}
 	for i, w := range want {
-		if res.Lines[i] != w {
-			t.Errorf("line %d: got %+v, want %+v", i, res.Lines[i], w)
+		got := res.Lines[i]
+		if got.StartTimeMs != w.StartTimeMs || got.Words != w.Words || len(got.Syllables) != 0 {
+			t.Errorf("line %d: got %+v, want %+v", i, got, w)
 		}
 	}
 }
