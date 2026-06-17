@@ -1,8 +1,8 @@
-# thing-daemon
+# mira-daemon
 
-The on-device daemon for **thing**, a standalone Spotify Car Thing controller.
+The on-device daemon for **Mira**, a standalone Spotify Car Thing controller.
 
-Heavily modified fork of [`devgianlu/go-librespot`](https://github.com/devgianlu/go-librespot). Unlike upstream, thing-daemon does not play audio. It runs in _observer_ mode, as a non-playable Spotify Connect device and watches what's playing on the user's other devices, exposes the state to the [thing-ui](https://github.com/thing-project/thing-ui) frontend over HTTP and WebSocket, and forwards playback controls back to whichever device is active.
+Heavily modified fork of [`devgianlu/go-librespot`](https://github.com/devgianlu/go-librespot). Unlike upstream, mira-daemon does not play audio. It runs in _observer_ mode, as a non-playable Spotify Connect device and watches what's playing on the user's other devices, exposes the state to the [mira-ui](https://github.com/thing-project/thing-ui) frontend over HTTP and WebSocket, and forwards playback controls back to whichever device is active.
 
 ## What's different from upstream
 
@@ -16,14 +16,14 @@ Heavily modified fork of [`devgianlu/go-librespot`](https://github.com/devgianlu
 
 ## Companion projects
 
-- **[thing-ui](https://github.com/thing-project/thing-ui)** - React frontend that consumes this daemon's API
-- **thing-firmware** - firmware build pipeline that bundles ui + daemon + kernel into a flashable image
+- **[mira-ui](https://github.com/thing-project/thing-ui)** - React frontend that consumes this daemon's API
+- **mira-firmware** - firmware build pipeline that bundles ui + daemon + kernel into a flashable image
 - **[thing-releases](https://github.com/thing-project/thing-releases)** - prebuilt firmware images for end users
 
 ## Building
 
 ```bash
-go build ./cmd/thing-daemon
+go build ./cmd/mira-daemon
 ```
 
 For cross-compile to the Car Thing (armv6 userspace):
