@@ -121,6 +121,9 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 	if wantRichsync && lp.secondary != nil {
 		if res, err := lp.secondary.fetchRichsync(ctx, q); err != nil {
 			lp.log.Debugf("lyrics: richsync unavailable: %v", err)
+			if cached != nil {
+				return cached, nil
+			}
 		} else if res != nil {
 			lp.store(trackId, res)
 			lp.log.Debugf("lyrics: richsync (word-level) for %q by %q (%d lines)", trackName, artistName, len(res.Lines))
