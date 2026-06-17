@@ -23,6 +23,6 @@ CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" GOARM="$GOARM" \
     -trimpath \
     -ldflags "-s -w -X github.com/devgianlu/go-librespot.version=$VERSION" \
     -o "./go-librespot-$VARIANT" \
-    ./cmd/thing-daemon
+    ./cmd/mira-daemon
 
 file "./go-librespot-$VARIANT"
