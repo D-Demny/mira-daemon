@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -47,6 +48,9 @@ type App struct {
 	// App-level actions like resume-from-suspend can reach its dealer.
 	currentPlayer atomic.Pointer[AppPlayer]
 
+	// holds the live pathfinder hashes
+	hashes *hashStore
+
 	// virtualTouch is a lazily-created uinput touchscreen used to inject a tap
 	// on resume (re-engages Chromium's keyboard seat). nil until first created.
 	virtualTouchMu sync.Mutex
@@ -60,6 +64,9 @@ type App struct {
 	authKnown bool
 
 	bt *bluetooth.Manager
+
+	// voice is the on-device voice service
+	voice *voiceService
 
 	retryNowCh chan struct{}
 
@@ -102,6 +109,7 @@ func New(opts *Options) (*App, error) {
 		client:     &http.Client{Timeout: 30 * time.Second},
 		retryNowCh: make(chan struct{}, 1),
 		onlineCh:   make(chan struct{}),
+		hashes:     newHashStore(),
 	}
 
 	var err error
@@ -227,6 +235,13 @@ func New(opts *Options) (*App, error) {
 	}
 	startNetworkMonitor(app.log, app.server, onNetTransition)
 
+	// on device voice service
+	if app.cfg.Voice.Enabled {
+		app.voice = newVoiceService(app)
+		app.server.SetVoiceHandler(app.voice)
+		app.voice.Start()
+	}
+
 	return app, nil
 }
 
@@ -304,6 +319,9 @@ func (app *App) Close() error {
 	}
 	app.closed = true
 
+	if app.voice != nil {
+		app.voice.Stop()
+	}
 	if app.server != nil {
 		return app.server.Close()
 	}
@@ -338,7 +356,22 @@ func (app *App) PutSettings(body []byte) error {
 	app.state.Unlock()
 	// keep the firmware auto_brightness service in sync
 	app.mirrorBacklightConf(body)
+	// react to the voice mic on/off toggle
+	if app.voice != nil {
+		app.voice.setWakeEnabled(voiceMicFromSettings(body))
+	}
 	return app.persistState()
+}
+
+// reads the "voiceMic" preference from the UI settings
+func voiceMicFromSettings(body []byte) bool {
+	var s struct {
+		VoiceMic *bool `json:"voiceMic"`
+	}
+	if json.Unmarshal(body, &s) == nil && s.VoiceMic != nil {
+		return *s.VoiceMic
+	}
+	return true
 }
 
 // PerformReset wipes the device to a full factory state and reboots
@@ -348,10 +381,10 @@ func (app *App) PerformReset() {
 	// 02a-firstboot runs reset-data + reset-settings before /var is
 	// mounted, reformatting /dev/data (and /dev/settings) which wipes everything
 	if err := exec.Command("/usr/bin/uenv", "set", "firstboot", "1").Run(); err != nil {
-		app.log.WithError(err).Error("system: 'uenv set firstboot 1' failed — falling back to surgical wipe")
+		app.log.WithError(err).Error("system: 'uenv set firstboot 1' failed - falling back to surgical wipe")
 		app.surgicalWipe()
 	} else {
-		app.log.Warn("system: firstboot=1 flagged — /dev/data will be reformatted on next boot")
+		app.log.Warn("system: firstboot=1 flagged - /dev/data will be reformatted on next boot")
 	}
 
 	time.Sleep(500 * time.Millisecond)

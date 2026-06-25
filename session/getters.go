@@ -37,3 +37,7 @@ func (s *Session) WebApi(ctx context.Context, method string, path string, query 
 func (s *Session) PartnerApi(ctx context.Context, body []byte) (*http.Response, error) {
 	return s.sp.PartnerApiRequest(ctx, body)
 }
+
+func (s *Session) PartnerApiEx(ctx context.Context, body []byte, force bool) (*http.Response, error) {
+	return s.sp.PartnerApiRequestEx(ctx, body, force)
+}

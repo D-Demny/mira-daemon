@@ -14,7 +14,37 @@ type Config struct {
 	// "default", "small", "medium", "large", "xlarge".
 	ImageSize string
 
+	// on device voice service
+	Voice VoiceConfig
+
 	Credentials CredentialsConfig
+}
+
+// configures the on device voice service
+type VoiceConfig struct {
+	// starts the voice service
+	Enabled bool
+	// spawns the always on wake-word listener
+	Wake bool
+
+	BinDir   string
+	LibDir   string
+	ModelDir string
+
+	WakeThreshold float64
+	MicDevice     string
+
+	Cascade         bool
+	EspeakBin       string
+	EspeakDataDir   string
+	CacheDir        string
+	CatalogSync     bool
+	HashRotate      bool
+	AcceptThreshold float64
+
+	SherpaEnabled  bool
+	SherpaBin      string
+	SherpaModelDir string
 }
 
 type CredentialsConfig struct {

@@ -430,7 +430,7 @@ func (m *Manager) tryRecoverPan() {
 		if !allowed {
 			if threshold == panStableRetryAllowed {
 				m.markManualDisconnect(addr)
-				m.log.Warnf("bluetooth: PAN to %s dropped again within %s of recovering — treating as a deliberate disconnect, pausing auto-reconnect (reconnect from the phone or the Bluetooth menu)",
+				m.log.Warnf("bluetooth: PAN to %s dropped again within %s of recovering treating as a deliberate disconnect, pausing auto-reconnect (reconnect from the phone or the Bluetooth menu)",
 					addr, panRetryWindow)
 			} else {
 				m.log.Warnf("bluetooth: PAN dropped %d times in %s, backing off auto-recover (assuming intentional disconnect)",

@@ -47,6 +47,26 @@ type cliConfig struct {
 		ImageSize string `koanf:"image_size"`
 	} `koanf:"server"`
 
+	Voice struct {
+		Enabled         bool    `koanf:"enabled"`
+		Wake            bool    `koanf:"wake"`
+		BinDir          string  `koanf:"bin_dir"`
+		LibDir          string  `koanf:"lib_dir"`
+		ModelDir        string  `koanf:"model_dir"`
+		WakeThreshold   float64 `koanf:"wake_threshold"`
+		MicDevice       string  `koanf:"mic_device"`
+		Cascade         bool    `koanf:"cascade"`
+		EspeakBin       string  `koanf:"espeak_bin"`
+		EspeakDataDir   string  `koanf:"espeak_data_dir"`
+		CacheDir        string  `koanf:"cache_dir"`
+		CatalogSync     bool    `koanf:"catalog_sync"`
+		HashRotate      bool    `koanf:"hash_rotate"`
+		AcceptThreshold float64 `koanf:"accept_threshold"`
+		SherpaEnabled   bool    `koanf:"sherpa_enabled"`
+		SherpaBin       string  `koanf:"sherpa_bin"`
+		SherpaModelDir  string  `koanf:"sherpa_model_dir"`
+	} `koanf:"voice"`
+
 	Credentials struct {
 		Type         string `koanf:"type"`
 		SpotifyToken struct {
@@ -64,6 +84,25 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 		ClientToken:  c.ClientToken,
 		ObserverMode: c.ObserverMode,
 		ImageSize:    c.Server.ImageSize,
+		Voice: daemon.VoiceConfig{
+			Enabled:         c.Voice.Enabled,
+			Wake:            c.Voice.Wake,
+			BinDir:          c.Voice.BinDir,
+			LibDir:          c.Voice.LibDir,
+			ModelDir:        c.Voice.ModelDir,
+			WakeThreshold:   c.Voice.WakeThreshold,
+			MicDevice:       c.Voice.MicDevice,
+			Cascade:         c.Voice.Cascade,
+			EspeakBin:       c.Voice.EspeakBin,
+			EspeakDataDir:   c.Voice.EspeakDataDir,
+			CacheDir:        c.Voice.CacheDir,
+			CatalogSync:     c.Voice.CatalogSync,
+			HashRotate:      c.Voice.HashRotate,
+			AcceptThreshold: c.Voice.AcceptThreshold,
+			SherpaEnabled:   c.Voice.SherpaEnabled,
+			SherpaBin:       c.Voice.SherpaBin,
+			SherpaModelDir:  c.Voice.SherpaModelDir,
+		},
 	}
 	dc.Credentials.Type = c.Credentials.Type
 	dc.Credentials.SpotifyToken.Username = c.Credentials.SpotifyToken.Username
@@ -114,6 +153,17 @@ func loadCLIConfig(cfg *cliConfig) error {
 
 		"server.address":    "localhost",
 		"server.image_size": "default",
+
+		"voice.bin_dir":        "/opt/voice/bin",
+		"voice.lib_dir":        "/opt/voice/lib",
+		"voice.model_dir":      "/opt/voice/models",
+		"voice.wake_threshold": 0.5,
+		"voice.mic_device":     "hw:0,0",
+		"voice.cascade":        true,
+		"voice.espeak_bin":     "espeak-ng",
+		"voice.catalog_sync":   true,
+		"voice.hash_rotate":    true,
+		"voice.sherpa_bin":     "sherpa_asr_server",
 	}, "."), nil)
 
 	var configPath string

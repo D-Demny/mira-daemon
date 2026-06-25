@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,10 +39,10 @@ type AppPlayer struct {
 
 	spotConnId string
 
-	registerGen atomic.Uint64
-	registered atomic.Bool
+	registerGen       atomic.Uint64
+	registered        atomic.Bool
 	heartbeatInFlight atomic.Bool
-	clusterCh chan *connectpb.Cluster
+	clusterCh         chan *connectpb.Cluster
 
 	prodInfo    *ProductInfo
 	countryCode *string
@@ -610,6 +611,24 @@ const (
 	pfAreEntitiesInLibraryHash = "134337999233cc6fdd6b1e6dbf94841409f04a946c5c7b744b09ba0dfe5a85ed"
 )
 
+// returns the current hash for an operation
+func (p *AppPlayer) hashOf(op string) string {
+	return p.app.hashes.hash(op)
+}
+
+// fires re-scrape when a pathfinder call reports a rotated hash
+func (p *AppPlayer) onPersistedDrift() {
+	if v := p.app.voice; v != nil {
+		v.triggerHashRotate()
+	}
+}
+
+// reports whether a graphQL error signals a rotated hash
+func isPersistedQueryErr(e error) bool {
+	s := e.Error()
+	return strings.Contains(s, "PersistedQueryNotFound") || strings.Contains(s, "PersistedQueryNotSupported")
+}
+
 func pathfinderGraphQLError(body []byte) error {
 	var r struct {
 		Errors []struct {
@@ -651,9 +670,74 @@ func (p *AppPlayer) pathfinderQuery(ctx context.Context, body []byte) ([]byte, e
 	}
 
 	if e := pathfinderGraphQLError(data); e != nil {
+		if isPersistedQueryErr(e) {
+			p.onPersistedDrift()
+		}
 		return nil, e
 	}
 	return data, nil
+}
+
+type pathfinderError struct {
+	Status         int
+	RetryAfter     time.Duration
+	PersistedQuery bool
+	msg            string
+}
+
+func (e *pathfinderError) Error() string { return e.msg }
+
+// for the catalog sync
+func (p *AppPlayer) pathfinderQueryEx(ctx context.Context, body []byte, force bool) ([]byte, error) {
+	resp, err := p.sess.PartnerApiEx(ctx, body, force)
+	if err != nil {
+		return nil, fmt.Errorf("pathfinder request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	data, _ := io.ReadAll(resp.Body)
+	retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet := string(data)
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		return nil, &pathfinderError{
+			Status:     resp.StatusCode,
+			RetryAfter: retryAfter,
+			msg:        fmt.Sprintf("pathfinder status %d: %s", resp.StatusCode, snippet),
+		}
+	}
+
+	if msg := pathfinderGraphQLErrorMsg(data); msg != "" {
+		pq := strings.Contains(msg, "PersistedQueryNotFound") || strings.Contains(msg, "PersistedQueryNotSupported")
+		return nil, &pathfinderError{Status: 200, PersistedQuery: pq, msg: "pathfinder: " + msg}
+	}
+	return data, nil
+}
+
+func pathfinderGraphQLErrorMsg(body []byte) string {
+	var r struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal(body, &r) == nil && len(r.Errors) > 0 {
+		return r.Errors[0].Message
+	}
+	return ""
+}
+
+func parseRetryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(h); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return 0
 }
 
 // report whether the URI is in liked songs
@@ -666,7 +750,7 @@ func (p *AppPlayer) checkTrackSaved(ctx context.Context, uri string) (bool, erro
 		"operationName": "areEntitiesInLibrary",
 		"variables":     map[string]any{"uris": []string{uri}},
 		"extensions": map[string]any{
-			"persistedQuery": map[string]any{"version": 1, "sha256Hash": pfAreEntitiesInLibraryHash},
+			"persistedQuery": map[string]any{"version": 1, "sha256Hash": p.hashOf("areEntitiesInLibrary")},
 		},
 	})
 
@@ -706,17 +790,17 @@ func (p *AppPlayer) setTrackSaved(ctx context.Context, uri string, saved bool) e
 	var body []byte
 	switch {
 	case saved && strings.HasPrefix(uri, "spotify:local:"):
-		body = applyCurationsBody(uri, "CURATE")
+		body = p.applyCurationsBody(uri, "CURATE")
 	case saved:
 		body, _ = json.Marshal(map[string]any{
 			"operationName": "addToLibrary",
 			"variables":     map[string]any{"libraryItemUris": []string{uri}},
 			"extensions": map[string]any{
-				"persistedQuery": map[string]any{"version": 1, "sha256Hash": pfAddToLibraryHash},
+				"persistedQuery": map[string]any{"version": 1, "sha256Hash": p.hashOf("addToLibrary")},
 			},
 		})
 	default:
-		body = applyCurationsBody(uri, "UNCURATE")
+		body = p.applyCurationsBody(uri, "UNCURATE")
 	}
 
 	if _, err := p.pathfinderQuery(ctx, body); err != nil {
@@ -726,7 +810,7 @@ func (p *AppPlayer) setTrackSaved(ctx context.Context, uri string, saved bool) e
 	return nil
 }
 
-func applyCurationsBody(uri, curationType string) []byte {
+func (p *AppPlayer) applyCurationsBody(uri, curationType string) []byte {
 	body, _ := json.Marshal(map[string]any{
 		"operationName": "applyCurations",
 		"variables": map[string]any{
@@ -738,7 +822,7 @@ func applyCurationsBody(uri, curationType string) []byte {
 			},
 		},
 		"extensions": map[string]any{
-			"persistedQuery": map[string]any{"version": 1, "sha256Hash": pfApplyCurationsHash},
+			"persistedQuery": map[string]any{"version": 1, "sha256Hash": p.hashOf("applyCurations")},
 		},
 	})
 	return body
@@ -807,9 +891,14 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 
 	case ApiRequestTypeObserverStatus:
 		if p.state.remoteState == nil {
+			// during the FIRST EVER catalog we show a setting things up splash since it usually takes longer
+			message := "no remote device is currently playing"
+			if v := p.app.voice; v != nil && v.firstSyncInProgress.Load() {
+				message = "setting things up"
+			}
 			return map[string]any{
 				"active":  false,
-				"message": "no remote device is currently playing",
+				"message": message,
 				"devices": p.connectDevicesOrEmpty(),
 			}, nil
 		}
@@ -953,12 +1042,39 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if data.SkipToUri != "" {
 			cmd.Options.SkipTo = connectSkipTo{TrackUri: data.SkipToUri}
 		}
+		shuf := "inherit"
+		if data.Shuffle != nil {
+			cmd.Options.PlayerOptionsOverride.ShufflingContext = data.Shuffle
+			shuf = fmt.Sprintf("%v", *data.Shuffle)
+		}
 		// TEMP diagnostic logging while verifying the play envelope on hardware.
-		p.app.log.Infof("play: context=%s skipTo=%q -> active device", data.Uri, data.SkipToUri)
+		p.app.log.Infof("play: context=%s skipTo=%q shuffle=%s -> active device", data.Uri, data.SkipToUri, shuf)
 		return nil, p.sendActiveDeviceCommand(ctx, cmd)
 
+	case ApiRequestTypeSearch:
+		data, _ := req.Data.(ApiRequestDataSearch)
+		if data.TopN {
+			return p.searchTracks(ctx, data.Query)
+		}
+		return p.searchTrack(ctx, data.Query)
+
+	case ApiRequestTypeCatalogPage:
+		data, _ := req.Data.(ApiRequestDataCatalogPage)
+		return p.catalogPage(ctx, data)
+
 	case ApiRequestTypeAddToQueue:
-		return nil, fmt.Errorf("not yet available in observer mode")
+		uri, _ := req.Data.(string)
+		if uri == "" {
+			return nil, fmt.Errorf("add_to_queue requires a uri")
+		}
+		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{
+			Endpoint: "add_to_queue",
+			Track: &connectQueueTrack{
+				Uri:      uri,
+				Provider: "queue",
+				Metadata: map[string]string{"is_queued": "true"},
+			},
+		})
 
 	case ApiRequestTypeGetSaved:
 		data, _ := req.Data.(ApiRequestDataSaved)
@@ -982,12 +1098,19 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 
 // connectCommand is the JSON shape of a single Spotify Connect remote-control command
 type connectCommand struct {
-	Endpoint      string          `json:"endpoint"`
-	Value         any             `json:"value,omitempty"`
-	Context       *connectContext `json:"context,omitempty"`
-	Options       *connectOptions `json:"options,omitempty"`
-	PlayOrigin    *connectOrigin  `json:"play_origin,omitempty"`
-	LoggingParams *connectLogging `json:"logging_params,omitempty"`
+	Endpoint      string             `json:"endpoint"`
+	Value         any                `json:"value,omitempty"`
+	Context       *connectContext    `json:"context,omitempty"`
+	Options       *connectOptions    `json:"options,omitempty"`
+	PlayOrigin    *connectOrigin     `json:"play_origin,omitempty"`
+	LoggingParams *connectLogging    `json:"logging_params,omitempty"`
+	Track         *connectQueueTrack `json:"track,omitempty"`
+}
+
+type connectQueueTrack struct {
+	Uri      string            `json:"uri"`
+	Provider string            `json:"provider,omitempty"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // connectContext/connectOptions/connectOrigin/connectLogging are the play-command sub-objects
@@ -998,9 +1121,13 @@ type connectContext struct {
 }
 
 type connectOptions struct {
-	License               string        `json:"license,omitempty"`
-	SkipTo                connectSkipTo `json:"skip_to"`
-	PlayerOptionsOverride struct{}      `json:"player_options_override"`
+	License               string                       `json:"license,omitempty"`
+	SkipTo                connectSkipTo                `json:"skip_to"`
+	PlayerOptionsOverride connectPlayerOptionsOverride `json:"player_options_override"`
+}
+
+type connectPlayerOptionsOverride struct {
+	ShufflingContext *bool `json:"shuffling_context,omitempty"`
 }
 
 type connectSkipTo struct {

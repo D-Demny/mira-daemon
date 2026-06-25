@@ -165,6 +165,92 @@
             }
           }
         },
+        "voice": {
+          "type": "object",
+          "description": "On-device voice control: 'hey mira' -> ASR -> Spotify search -> play",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the voice service (the /voice/trigger endpoint + flow)",
+              "default": false
+            },
+            "wake": {
+              "type": "boolean",
+              "description": "Also run the always-on 'hey mira' wake-word listener",
+              "default": false
+            },
+            "bin_dir": {
+              "type": "string",
+              "description": "Directory holding the oww_wake + sherpa_asr_server + espeak-ng binaries",
+              "default": "/opt/voice/bin"
+            },
+            "lib_dir": {
+              "type": "string",
+              "description": "Directory holding the bundled aarch64 loader + libraries",
+              "default": "/opt/voice/lib"
+            },
+            "model_dir": {
+              "type": "string",
+              "description": "Directory holding the wake-word tflite models",
+              "default": "/opt/voice/models"
+            },
+            "wake_threshold": {
+              "type": "number",
+              "description": "Wake-word fire threshold (0..1)",
+              "default": 0.5
+            },
+            "mic_device": {
+              "type": "string",
+              "description": "ALSA capture device for the wake-word listener",
+              "default": "hw:0,0"
+            },
+            "cascade": {
+              "type": "boolean",
+              "description": "Enable the phonetic cascade resolver: intent grammar -> routed local index (tracks/artists/playlists/albums) -> IPA phoneme re-rank -> accept/reject threshold -> searchDesktop fallback. Strictly additive (a miss falls through to searchDesktop).",
+              "default": true
+            },
+            "espeak_bin": {
+              "type": "string",
+              "description": "espeak-ng binary name under bin_dir, used for grapheme->IPA (g2p) at sync + query time. aarch64, run via the bundled loader.",
+              "default": "espeak-ng"
+            },
+            "espeak_data_dir": {
+              "type": "string",
+              "description": "The espeak --path arg: the dir CONTAINING the espeak-ng-data/ folder (NOT the data folder itself). Empty => <bin_dir>/.. at runtime.",
+              "default": ""
+            },
+            "cache_dir": {
+              "type": "string",
+              "description": "Writable dir (persists on /root) for the catalog checkpoint + cached phonetic index. Empty => <model_dir>/../cache.",
+              "default": ""
+            },
+            "catalog_sync": {
+              "type": "boolean",
+              "description": "Run the one-shot Pathfinder catalog sync at startup to build the routed phonetic indexes (liked + playlist names + artists + albums + playlist tracks). No refresh logic yet.",
+              "default": true
+            },
+            "accept_threshold": {
+              "type": "number",
+              "description": "Combined phoneme-distance gate (~0.42). At or below it the local match is accepted; above it the command falls to searchDesktop. 0 => the built-in default.",
+              "default": 0.42
+            },
+            "sherpa_enabled": {
+              "type": "boolean",
+              "description": "Route ASR through the resident sherpa gigaspeech-Zipformer sidecar. Loads the model once at startup (~20s) and stays resident; strong local-accept, faster per command.",
+              "default": false
+            },
+            "sherpa_bin": {
+              "type": "string",
+              "description": "sherpa ASR sidecar binary name under bin_dir (aarch64, run via the bundled loader).",
+              "default": "sherpa_asr_server"
+            },
+            "sherpa_model_dir": {
+              "type": "string",
+              "description": "Directory holding the gigaspeech encoder/decoder/joiner int8 onnx + tokens.txt.",
+              "default": ""
+            }
+          }
+        },
         "zeroconf_enabled": {
           "type": "boolean",
           "description": "Whether Zeroconf discovery should always be enabled (even when logging in with credentials)",

@@ -133,7 +133,7 @@ func (m *Manager) handleDisconnectReason(address string, reason uint8) {
 		// the PAN just dropped: 
 		if m.recentNetworkDrop() {
 			m.clearManualDisconnect(address)
-			m.log.Infof("bluetooth: %s disconnected right after PAN dropped — tethering/network change, keeping auto-reconnect", address)
+			m.log.Infof("bluetooth: %s disconnected right after PAN dropped tethering/network change, keeping auto-reconnect", address)
 			return
 		}
 		m.markManualDisconnect(address)

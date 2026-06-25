@@ -147,7 +147,14 @@ const (
 )
 
 func (c *Spclient) PartnerApiRequest(ctx context.Context, body []byte) (*http.Response, error) {
-	accessToken, err := c.accessToken(ctx, false)
+	return c.PartnerApiRequestEx(ctx, body, false)
+}
+
+func (c *Spclient) PartnerApiRequestEx(ctx context.Context, body []byte, force bool) (*http.Response, error) {
+	if force {
+		c.InvalidateWebPlayerClientToken()
+	}
+	accessToken, err := c.accessToken(ctx, force)
 	if err != nil {
 		return nil, fmt.Errorf("failed obtaining access token: %w", err)
 	}
@@ -170,6 +177,13 @@ func (c *Spclient) PartnerApiRequest(ctx context.Context, body []byte) (*http.Re
 	req.Header.Set("Origin", "https://open.spotify.com")
 	req.Header.Set("Client-Token", clientToken)
 	return c.client.Do(req)
+}
+
+func (c *Spclient) InvalidateWebPlayerClientToken() {
+	c.webClientTokenMu.Lock()
+	c.webClientToken = ""
+	c.webClientTokenExp = time.Time{}
+	c.webClientTokenMu.Unlock()
 }
 
 func (c *Spclient) webPlayerClientToken(ctx context.Context) (string, error) {
