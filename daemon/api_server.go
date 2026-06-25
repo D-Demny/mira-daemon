@@ -29,7 +29,8 @@ const (
 	wsWriteTimeout = 2 * time.Second
 	// buffered events per client before Emit starts dropping. Every event we emit
 	// is a full-state snapshot, so a dropped one is superseded by the next.
-	wsClientBuffer = 64
+	wsClientBuffer      = 64
+	wsHeartbeatInterval = 15 * time.Second
 )
 
 // returns (required, url, known). known=false while we haven't yet determined auth state
@@ -54,6 +55,11 @@ type ApiServer interface {
 
 	// /settings uses this, nil = 503
 	SetSettingsHandler(h SettingsHandler)
+
+	// /voice/* uses this, nil = 503
+	SetVoiceHandler(h VoiceHandler)
+
+	Submit(ctx context.Context, t ApiRequestType, data any) (any, error)
 }
 
 // destructive whole-device actions
@@ -98,6 +104,9 @@ type ConcreteApiServer struct {
 
 	setMu sync.RWMutex
 	setFn SettingsHandler
+
+	voiceMu sync.RWMutex
+	voiceFn VoiceHandler
 }
 
 var (
@@ -122,6 +131,8 @@ const (
 	ApiRequestTypePrev                ApiRequestType = "prev"
 	ApiRequestTypeNext                ApiRequestType = "next"
 	ApiRequestTypePlay                ApiRequestType = "play"
+	ApiRequestTypeSearch              ApiRequestType = "search"
+	ApiRequestTypeCatalogPage         ApiRequestType = "catalog_page"
 	ApiRequestTypeResumeLast          ApiRequestType = "resume_last"
 	ApiRequestTypeGetVolume           ApiRequestType = "get_volume"
 	ApiRequestTypeSetVolume           ApiRequestType = "set_volume"
@@ -168,6 +179,8 @@ const (
 	ApiEventTypeBluetoothNetworkConnect    ApiEventType = "bluetooth/network/connect"
 	ApiEventTypeBluetoothNetworkDisconnect ApiEventType = "bluetooth/network/disconnect"
 	ApiEventTypeNetworkStatus              ApiEventType = "network_status"
+	ApiEventTypeVoice                      ApiEventType = "voice"
+	ApiEventTypePing                       ApiEventType = "ping"
 )
 
 type ApiRequest struct {
@@ -227,6 +240,7 @@ type ApiRequestDataPlay struct {
 	Uri       string `json:"uri"`
 	SkipToUri string `json:"skip_to_uri"`
 	Paused    bool   `json:"paused"`
+	Shuffle   *bool  `json:"shuffle,omitempty"`
 }
 
 type ApiRequestDataTransfer struct {
@@ -610,7 +624,20 @@ func jsonDecode(r *http.Request, v any) error {
 	return json.Unmarshal(data, v)
 }
 
+func (s *ConcreteApiServer) heartbeatLoop() {
+	t := time.NewTicker(wsHeartbeatInterval)
+	defer t.Stop()
+	for range t.C {
+		if s.close.Load() {
+			return
+		}
+		s.Emit(&ApiEvent{Type: ApiEventTypePing})
+	}
+}
+
 func (s *ConcreteApiServer) serve() {
+	go s.heartbeatLoop()
+
 	m := http.NewServeMux()
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
@@ -762,6 +789,45 @@ func (s *ConcreteApiServer) serve() {
 		}
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypePlay, Data: data}, w)
+	})
+	m.HandleFunc("/player/search", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var data ApiRequestDataSearch
+		if err := jsonDecode(r, &data); err != nil || strings.TrimSpace(data.Query) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeSearch, Data: data}, w)
+	})
+	// /voice/trigger drives the in-daemon voice flow without the mic
+	m.HandleFunc("/voice/trigger", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var data struct {
+			Transcript string `json:"transcript"`
+			Clip       string `json:"clip"`
+		}
+		_ = jsonDecode(r, &data) // body is optional
+		s.voiceMu.RLock()
+		fn := s.voiceFn
+		s.voiceMu.RUnlock()
+		if fn == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		text, err := fn.TriggerVoice(r.Context(), data.Transcript, data.Clip)
+		if err != nil {
+			s.log.WithError(err).Warn("voice trigger failed")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"text": text})
 	})
 	m.HandleFunc("/player/resume", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
@@ -1005,7 +1071,7 @@ func (s *ConcreteApiServer) serve() {
 		go h.PerformSuspend()
 	})
 
-	// ambient light 
+	// ambient light
 	m.HandleFunc("GET /system/ambient", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if lux, ok := readAmbientLux(); ok {
