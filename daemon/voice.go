@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"math"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -25,6 +27,8 @@ type voiceService struct {
 	gen  uint64
 	busy bool
 
+	bannerSeq atomic.Uint64
+
 	// cascade resolver + g2p
 	g2p      *g2p
 	resolver *cascadeResolver
@@ -39,6 +43,13 @@ type voiceService struct {
 	wakeEnabled atomic.Bool
 	wakeSignal  chan struct{}
 	wakeCancel  atomic.Pointer[context.CancelFunc]
+
+	// playback-aware wake threshold
+	playbackActive atomic.Bool
+	thrGen         atomic.Uint64
+	runningThr     atomic.Uint64
+	thrRestart     atomic.Bool
+	capturing      atomic.Bool
 
 	// pathfinder hash rotation
 	hashRotateGate atomic.Bool
@@ -174,6 +185,7 @@ func (v *voiceService) Stop() {
 }
 
 func (v *voiceService) emit(state, text string) {
+	v.bannerSeq.Add(1)
 	v.app.server.Emit(&ApiEvent{Type: ApiEventTypeVoice, Data: ApiEventDataVoice{State: state, Text: text}})
 }
 
@@ -440,11 +452,25 @@ func (v *voiceService) flash(gen uint64, state, text string) {
 }
 
 func (v *voiceService) scheduleIdle(gen uint64, d time.Duration) {
+	seq := v.bannerSeq.Load()
 	time.AfterFunc(d, func() {
+		if v.bannerSeq.Load() != seq {
+			return
+		}
 		v.mu.Lock()
 		cur := v.gen
 		v.mu.Unlock()
 		if cur == gen {
+			v.emit("idle", "")
+		}
+	})
+}
+
+// flips the banner to idle
+func (v *voiceService) scheduleClear(d time.Duration) {
+	seq := v.bannerSeq.Load()
+	time.AfterFunc(d, func() {
+		if v.bannerSeq.Load() == seq {
 			v.emit("idle", "")
 		}
 	})
@@ -469,11 +495,58 @@ func (v *voiceService) setWakeEnabled(on bool) {
 	}
 }
 
+const wakeThresholdDebounce = 10 * time.Second
+
+// the wake threshold for the current playback state
+func (v *voiceService) wakeThreshold() float64 {
+	if v.playbackActive.Load() && v.cfg.WakeThresholdPlaying > 0 {
+		return v.cfg.WakeThresholdPlaying
+	}
+	return v.cfg.WakeThreshold
+}
+
+func (v *voiceService) notifyPlayback(playing bool) {
+	if !v.cfg.Wake {
+		return // no listener to retune
+	}
+	if v.playbackActive.Swap(playing) == playing {
+		return // no change
+	}
+	gen := v.thrGen.Add(1)
+	time.AfterFunc(wakeThresholdDebounce, func() { v.applyWakeThreshold(gen) })
+}
+
+// restarts the wake listener
+func (v *voiceService) applyWakeThreshold(gen uint64) {
+	if v.thrGen.Load() != gen {
+		return // a newer flip superseded this one
+	}
+	if v.ctx.Err() != nil || !v.wakeEnabled.Load() {
+		return
+	}
+	want := v.wakeThreshold()
+	if math.Float64frombits(v.runningThr.Load()) == want {
+		return
+	}
+	// a command is mid flight
+	v.mu.Lock()
+	busy := v.busy
+	v.mu.Unlock()
+	if busy || v.capturing.Load() {
+		time.AfterFunc(2*time.Second, func() { v.applyWakeThreshold(gen) })
+		return
+	}
+	v.app.log.Infof("voice: wake threshold -> %.2f (playing=%v)", want, v.playbackActive.Load())
+	v.thrRestart.Store(true)
+	if c := v.wakeCancel.Load(); c != nil {
+		(*c)()
+	}
+}
+
 func (v *voiceService) runWakeLoop() {
 	mel := filepath.Join(v.cfg.ModelDir, "melspectrogram.tflite")
 	emb := filepath.Join(v.cfg.ModelDir, "embedding_model.tflite")
 	wake := filepath.Join(v.cfg.ModelDir, "hey_mira.tflite")
-	thr := fmt.Sprintf("%.2f", v.cfg.WakeThreshold)
 
 	for v.ctx.Err() == nil {
 		// mic disabled
@@ -486,11 +559,16 @@ func (v *voiceService) runWakeLoop() {
 			continue
 		}
 
+		thr := v.wakeThreshold()
+		v.runningThr.Store(math.Float64bits(thr))
+
 		runCtx, cancel := context.WithCancel(v.ctx)
 		v.wakeCancel.Store(&cancel)
 		cmd := exec.CommandContext(runCtx, v.loader(), "--library-path", v.cfg.LibDir,
 			filepath.Join(v.cfg.BinDir, "oww_wake"), mel, emb, wake,
-			"--mic", v.cfg.MicDevice, "--threshold", thr)
+			"--mic", v.cfg.MicDevice, "--threshold", fmt.Sprintf("%.2f", thr))
+
+		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			v.app.log.WithError(err).Error("voice: wake stdout pipe")
@@ -498,6 +576,9 @@ func (v *voiceService) runWakeLoop() {
 			v.wakeCancel.Store(nil)
 			time.Sleep(time.Second)
 			continue
+		}
+		if stderr, err := cmd.StderrPipe(); err == nil {
+			go drainLog(v, stderr)
 		}
 		if err := cmd.Start(); err != nil {
 			v.app.log.WithError(err).Error("voice: wake listener start failed")
@@ -513,10 +594,15 @@ func (v *voiceService) runWakeLoop() {
 			// wake fires the instant "hey mira" is detected
 			if strings.HasPrefix(line, "WAKE") {
 				v.app.log.Info("voice: wake word detected")
+				v.capturing.Store(true)
 				v.emit("listening", "")
+				// if no CLIP ever follows (silence timeout, capture death)
+				// nothing else would dismiss the banner
+				v.scheduleClear(15 * time.Second)
 				continue
 			}
 			if clip, ok := strings.CutPrefix(line, "CLIP "); ok {
+				v.capturing.Store(false)
 				clip = strings.TrimSpace(clip)
 				go func() {
 					if _, err := v.TriggerVoice(v.ctx, "", clip); err != nil {
@@ -525,6 +611,7 @@ func (v *voiceService) runWakeLoop() {
 				}()
 			}
 		}
+		v.capturing.Store(false)
 		_ = cmd.Wait()
 		cancel()
 		v.wakeCancel.Store(nil)
@@ -533,6 +620,9 @@ func (v *voiceService) runWakeLoop() {
 		}
 		if !v.wakeEnabled.Load() {
 			v.app.log.Info("voice: wake listener stopped (mic off)")
+			continue
+		}
+		if v.thrRestart.Swap(false) {
 			continue
 		}
 		v.app.log.Warn("voice: wake listener exited; restarting in 1s")

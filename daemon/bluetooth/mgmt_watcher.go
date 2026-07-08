@@ -25,7 +25,7 @@ const (
 	mgmtReasonSuspend = 0x05 // local host suspending
 )
 
-// a remote-initiated drop within this window after connecting is treated as profile-negotiation teardown 
+// a remote-initiated drop within this window after connecting is treated as profile-negotiation teardown
 const manualDisconnectMinUptime = 45 * time.Second
 
 // a remote disconnect within this window of a bnep0/PAN drop is not deliberate
@@ -126,21 +126,30 @@ func (m *Manager) handleDisconnectReason(address string, reason uint8) {
 		}
 		// post pair profile teardown
 		if uptime, ok := m.connectionUptime(address); ok && uptime < manualDisconnectMinUptime {
+			m.clearPanSession(address)
 			m.log.Infof("bluetooth: %s disconnected by remote %.0fs after connecting, treating as profile churn (will still auto-reconnect)",
 				address, uptime.Seconds())
 			return
 		}
-		// the PAN just dropped: 
+		// the PAN just dropped:
 		if m.recentNetworkDrop() {
+			m.clearPanSession(address)
 			m.clearManualDisconnect(address)
 			m.log.Infof("bluetooth: %s disconnected right after PAN dropped tethering/network change, keeping auto-reconnect", address)
 			return
 		}
+		// PAN never came up this ACL session
+		if !m.panSessionWasUp(address) {
+			m.log.Infof("bluetooth: %s disconnected by remote but PAN was never up this session, keeping auto-reconnect", address)
+			return
+		}
+		m.clearPanSession(address)
 		m.markManualDisconnect(address)
 		m.log.Infof("bluetooth: %s disconnected from the phone side, pausing auto-reconnect (reconnect from the phone or the Bluetooth menu)", address)
 
 	case mgmtReasonTimeout:
 		// link lost
+		m.clearPanSession(address)
 		m.clearManualDisconnect(address)
 		if m.isKnownDevice(address) {
 			m.log.Infof("bluetooth: link to %s lost (timeout), reconnecting when it's back in range", address)
@@ -152,6 +161,7 @@ func (m *Manager) handleDisconnectReason(address string, reason uint8) {
 
 	default:
 		// local/suspend/auth
+		m.clearPanSession(address)
 	}
 }
 

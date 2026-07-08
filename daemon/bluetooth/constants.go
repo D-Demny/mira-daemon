@@ -24,5 +24,5 @@ const (
 	EventDisconnect        = "bluetooth/disconnect"
 	EventNetworkConnect    = "bluetooth/network/connect"
 	EventNetworkDisconnect = "bluetooth/network/disconnect"
-	EventNAPUnavailable = "bluetooth/network/unavailable"
+	EventNAPUnavailable    = "bluetooth/network/unavailable"
 )

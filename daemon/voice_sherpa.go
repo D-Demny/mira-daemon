@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +21,7 @@ type sherpaSidecar struct {
 
 	mu    sync.Mutex
 	stdin io.WriteCloser
+	proc  *os.Process
 	lines chan string
 
 	readyMu sync.Mutex
@@ -106,6 +108,8 @@ func (s *sherpaSidecar) runOnce() error {
 	args := []string{"--library-path", s.v.cfg.LibDir, bin,
 		enc, dec, joi, tokens, fmt.Sprintf("%d", sherpaThreads), sherpaMethod}
 	cmd := exec.CommandContext(s.v.ctx, s.v.loader(), args...)
+	// die with the daemon
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -126,6 +130,7 @@ func (s *sherpaSidecar) runOnce() error {
 
 	s.mu.Lock()
 	s.stdin = stdin
+	s.proc = cmd.Process
 	s.mu.Unlock()
 
 	go drainLog(s.v, stderr)
@@ -134,7 +139,7 @@ func (s *sherpaSidecar) runOnce() error {
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
-		if strings.TrimSpace(line) == "READY" {
+		if strings.TrimSpace(line) == "READY" && !s.isReady() {
 			s.setReady(true)
 			s.v.app.log.Info("voice: sherpa sidecar READY (model loaded)")
 			continue
@@ -145,7 +150,30 @@ func (s *sherpaSidecar) runOnce() error {
 		}
 	}
 	_ = cmd.Wait()
+	s.mu.Lock()
+	s.stdin = nil
+	s.proc = nil
+	s.mu.Unlock()
 	return fmt.Errorf("sherpa sidecar process ended")
+}
+
+func (s *sherpaSidecar) isReady() bool {
+	s.readyMu.Lock()
+	defer s.readyMu.Unlock()
+	return s.ready
+}
+
+// forces the given sidecar process down so the supervisor respawns a fresh one
+func (s *sherpaSidecar) killProc(p *os.Process) {
+	if p == nil {
+		return
+	}
+	s.mu.Lock()
+	cur := s.proc
+	s.mu.Unlock()
+	if cur == p {
+		_ = p.Kill()
+	}
 }
 
 func drainLog(v *voiceService, r io.Reader) {
@@ -195,6 +223,7 @@ func (s *sherpaSidecar) transcribe(ctx context.Context, clipPath string) (string
 
 	s.mu.Lock()
 	stdin := s.stdin
+	proc := s.proc
 	s.mu.Unlock()
 	if stdin == nil {
 		return "", fmt.Errorf("sherpa stdin unavailable")
@@ -218,6 +247,7 @@ func (s *sherpaSidecar) transcribe(ctx context.Context, clipPath string) (string
 		}
 		return cleanTranscript(line), nil
 	case <-dctx.Done():
+		s.killProc(proc)
 		return "", fmt.Errorf("sherpa decode timeout: %w", dctx.Err())
 	}
 }

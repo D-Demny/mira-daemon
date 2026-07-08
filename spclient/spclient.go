@@ -482,7 +482,7 @@ func (c *Spclient) ExtendedMetadataSimple(ctx context.Context, id librespot.Spot
 				continue
 			}
 
-			if extData.Header.StatusCode != 200 {
+			if extData.Header != nil && extData.Header.StatusCode != 200 {
 				return fmt.Errorf("extended metadata request returned status %d", extData.Header.StatusCode)
 			}
 

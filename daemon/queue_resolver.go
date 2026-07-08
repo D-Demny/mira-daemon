@@ -138,6 +138,17 @@ func (r *queueResolver) resolve(uris []string) {
 			resolved++
 		}
 	}
+	// bound the cache
+	if len(r.cache) > 500 {
+		n := len(r.cache) / 2
+		for k := range r.cache {
+			if n == 0 {
+				break
+			}
+			delete(r.cache, k)
+			n--
+		}
+	}
 	r.mu.Unlock()
 
 	r.log.Debugf("queue resolver: resolved %d/%d tracks", resolved, len(uris))

@@ -32,7 +32,9 @@ type VoiceConfig struct {
 	ModelDir string
 
 	WakeThreshold float64
-	MicDevice     string
+	// stricter wake threshold when music is playing
+	WakeThresholdPlaying float64
+	MicDevice            string
 
 	Cascade         bool
 	EspeakBin       string
