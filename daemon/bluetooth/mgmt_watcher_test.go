@@ -77,11 +77,30 @@ func TestHandleDisconnectReason_RemoteAfterRealUseMarksManual(t *testing.T) {
 	m.manualMu.Lock()
 	m.connectedSince["AA:BB:CC:DD:EE:FF"] = time.Now().Add(-5 * time.Minute)
 	m.manualMu.Unlock()
+	m.setPanSessionUp("AA:BB:CC:DD:EE:FF")
 
 	m.handleDisconnectReason("AA:BB:CC:DD:EE:FF", mgmtReasonRemote)
 
 	if !m.isManualDisconnect("AA:BB:CC:DD:EE:FF") {
 		t.Fatal("remote disconnect after real use should mark manual")
+	}
+	if m.panSessionWasUp("AA:BB:CC:DD:EE:FF") {
+		t.Fatal("the ACL session ended, the PAN-session flag must reset")
+	}
+}
+
+func TestHandleDisconnectReason_RemoteWithoutPanSessionKeepsReconnect(t *testing.T) {
+	t.Parallel()
+
+	m := newWatcherTestManager("AA:BB:CC:DD:EE:FF")
+	m.manualMu.Lock()
+	m.connectedSince["AA:BB:CC:DD:EE:FF"] = time.Now().Add(-5 * time.Minute)
+	m.manualMu.Unlock()
+
+	m.handleDisconnectReason("AA:BB:CC:DD:EE:FF", mgmtReasonRemote)
+
+	if m.isManualDisconnect("AA:BB:CC:DD:EE:FF") {
+		t.Fatal("remote disconnect with no PAN this session must not mark manual")
 	}
 }
 
@@ -103,12 +122,13 @@ func TestHandleDisconnectReason_RemoteRightAfterConnectIsProfileChurn(t *testing
 func TestHandleDisconnectReason_RemoteWithoutConnectTimestampMarksManual(t *testing.T) {
 	t.Parallel()
 
-	// seeded-at-boot device that was connected before the daemon started
+	// device connected before the daemon started
 	m := newWatcherTestManager("AA:BB:CC:DD:EE:FF")
+	m.setPanSessionUp("AA:BB:CC:DD:EE:FF")
 	m.handleDisconnectReason("AA:BB:CC:DD:EE:FF", mgmtReasonRemote)
 
 	if !m.isManualDisconnect("AA:BB:CC:DD:EE:FF") {
-		t.Fatal("remote disconnect with unknown uptime should mark manual")
+		t.Fatal("remote disconnect with unknown uptime but PAN up should mark manual")
 	}
 }
 

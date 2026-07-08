@@ -361,18 +361,25 @@ loop:
 	select {
 	case <-ap.done:
 	default:
-		ap.connMu.Lock()
-		if err := backoff.Retry(ap.reconnect, backoff.NewExponentialBackOff()); err != nil {
-			ap.log.WithError(err).Errorf("failed reconnecting accesspoint")
+		// must keep retrying across long network outages
+		bo := backoff.NewExponentialBackOff()
+		bo.MaxElapsedTime = 0
+	retryLoop:
+		for {
+			ap.connMu.Lock()
+			err := ap.reconnect()
 			ap.connMu.Unlock()
+			if err == nil {
+				// reconnection was successful, do not close receivers
+				return
+			}
+			ap.log.WithError(err).Warnf("failed reconnecting accesspoint, retrying")
 
-			// something went very wrong, give up
-			ap.Close()
-		} else {
-			ap.connMu.Unlock()
-
-			// reconnection was successful, do not close receivers
-			return
+			select {
+			case <-ap.done:
+				break retryLoop
+			case <-time.After(bo.NextBackOff()):
+			}
 		}
 	}
 

@@ -444,6 +444,21 @@ type localCandidate struct {
 	bare     bool
 }
 
+// reports whether the transcript starts with a play verb
+func (c *cascadeResolver) hasPlayIntentLead(ctx context.Context, h string) bool {
+	words := strings.Fields(resolverNormalize(h))
+	if len(words) < 2 {
+		return false
+	}
+	if words[0] == "play" || leadPlayVariants[words[0]] {
+		return true
+	}
+	if len(words) > 2 && ((words[0] == "put" && words[1] == "on") || (words[0] == "listen" && words[1] == "to")) {
+		return true
+	}
+	return c.wordMatch(ctx, words[0], "play")
+}
+
 // resolve runs the cascade over the transcript hypotheses
 func (c *cascadeResolver) resolve(ctx context.Context, hyps []string) resolveResult {
 	idx := c.index()
@@ -452,6 +467,7 @@ func (c *cascadeResolver) resolve(ctx context.Context, hyps []string) resolveRes
 	var firstControlHyp string
 	var specialHyp string
 	playLiked, random := false, false
+	searchIntent := false
 
 	var queueSeen bool
 	var bestQueueAccepted, bestQueueAny *localCandidate
@@ -506,6 +522,10 @@ func (c *cascadeResolver) resolve(ctx context.Context, hyps []string) resolveRes
 			continue
 		}
 
+		if !searchIntent && (in.kind != kindBare || c.hasPlayIntentLead(ctx, h)) {
+			searchIntent = true
+		}
+
 		if fallbackQuery == "" {
 			// small clean for the search query
 			if lq, lt, la := searchTermsLight(h); lq != "" {
@@ -554,6 +574,13 @@ func (c *cascadeResolver) resolve(ctx context.Context, hyps []string) resolveRes
 	}
 
 	// Priority 6: search
+	if !searchIntent {
+		r := resolveResult{Tier: "abstain", Kind: kindBare, Via: fallbackHyp}
+		if bestAny != nil {
+			r.Score, r.Name = bestAny.score, bestAny.name
+		}
+		return r
+	}
 	q := fallbackQuery
 	if q == "" && len(hyps) > 0 {
 		q = parseVoiceQuery(hyps[0])

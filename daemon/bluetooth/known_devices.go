@@ -15,7 +15,7 @@ type KnownDevice struct {
 	Starred       bool      `json:"starred"`
 	LastConnected time.Time `json:"last_connected"`
 	Connected     bool      `json:"connected"`
-	Network bool `json:"network"`
+	Network       bool      `json:"network"`
 }
 
 // sortKnownDevices orders the reconnect list by priority
@@ -127,7 +127,7 @@ func (m *Manager) StarDevice(address string, starred bool) error {
 	return nil
 }
 
-// ForgetDevice removes the BlueZ bonding and drops the device 
+// ForgetDevice removes the BlueZ bonding and drops the device
 func (m *Manager) ForgetDevice(address string) error {
 	if err := m.RemoveDevice(address); err != nil {
 		return err
@@ -213,7 +213,7 @@ func (m *Manager) reconnectCandidates() []string {
 
 	var out []string
 	for _, d := range devs {
-		if m.isManualDisconnect(d.Address) {
+		if m.isManualDisconnect(d.Address) || m.inPanBackoff(d.Address) {
 			continue
 		}
 		out = append(out, d.Address)

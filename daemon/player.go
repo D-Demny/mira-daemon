@@ -415,6 +415,10 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 		p.state.lastActiveDeviceName = rs.DeviceName
 	}
 
+	if v := p.app.voice; v != nil {
+		v.notifyPlayback(rs.IsPlaying && !rs.IsPaused)
+	}
+
 	if trackChanged {
 		p.app.log.Debugf("observer: track changed to %q by %s on %s", rs.TrackName, rs.TrackArtist, rs.DeviceName)
 		p.app.server.Emit(&ApiEvent{
@@ -506,6 +510,9 @@ func (p *AppPlayer) clearActiveDevice() {
 		return
 	}
 	p.state.remoteState = nil
+	if v := p.app.voice; v != nil {
+		v.notifyPlayback(false)
+	}
 	p.app.server.Emit(&ApiEvent{Type: ApiEventTypeObserverInactive})
 }
 
@@ -1394,12 +1401,17 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 
 	for {
 		select {
+		case <-ctx.Done():
+			p.sess.Close()
+			return
 		case <-p.stop:
 			return
 		case <-heartbeat.C:
 			p.heartbeatConnectState()
 		case pkt, ok := <-apRecv:
 			if !ok {
+				p.app.log.Warnf("accesspoint receiver closed")
+				apRecv = nil
 				continue
 			}
 			if err := p.handleAccesspointPacket(pkt.Type, pkt.Payload); err != nil {
@@ -1407,6 +1419,8 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			}
 		case msg, ok := <-msgRecv:
 			if !ok {
+				p.app.log.Warnf("dealer message receiver closed")
+				msgRecv = nil
 				continue
 			}
 			if err := p.handleDealerMessage(ctx, msg); err != nil {
@@ -1419,6 +1433,8 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			cancel()
 		case req, ok := <-reqRecv:
 			if !ok {
+				p.app.log.Warnf("dealer request receiver closed")
+				reqRecv = nil
 				continue
 			}
 			if err := p.handleDealerRequest(ctx, req); err != nil {
@@ -1429,6 +1445,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			}
 		case req, ok := <-apiRecv:
 			if !ok {
+				apiRecv = nil
 				continue
 			}
 			// fetching lyrics sometimes block the HTTP connection between the ui
@@ -1443,11 +1460,15 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 		case <-p.queueResolvedCh:
 			// Background queue-metadata resolution landed
 			if rs := p.state.remoteState; rs != nil && p.queueResolver != nil {
-				p.queueResolver.applyCache(rs.NextTracks)
-				p.queueResolver.applyCache(rs.PrevTracks)
+				updated := *rs
+				updated.NextTracks = append([]QueueTrack(nil), rs.NextTracks...)
+				updated.PrevTracks = append([]QueueTrack(nil), rs.PrevTracks...)
+				p.queueResolver.applyCache(updated.NextTracks)
+				p.queueResolver.applyCache(updated.PrevTracks)
+				p.state.remoteState = &updated
 				p.app.server.Emit(&ApiEvent{
 					Type: ApiEventTypeObserverStateChanged,
-					Data: rs,
+					Data: &updated,
 				})
 			}
 		}

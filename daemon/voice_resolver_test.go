@@ -466,3 +466,28 @@ func TestSearchTermsLight(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveVerblessNoSearchFallback(t *testing.T) {
+	r := newTestResolver()
+	ctx := context.Background()
+
+	d := r.resolve(ctx, []string{"and"})
+	if d.Tier != "abstain" {
+		t.Fatalf("verbless fragment tier = %q, want abstain", d.Tier)
+	}
+
+	d = r.resolve(ctx, []string{"play zorblax quantum theremin"})
+	if d.Tier != "search" {
+		t.Fatalf("verbed unknown tier = %q, want search", d.Tier)
+	}
+
+	d = r.resolve(ctx, []string{"zorblax quantum by theremin nine"})
+	if d.Tier != "search" {
+		t.Fatalf("typed unknown tier = %q, want search", d.Tier)
+	}
+
+	d = r.resolve(ctx, []string{"pray zorblax quantum theremin"})
+	if d.Tier != "search" {
+		t.Fatalf("mishear-verbed unknown tier = %q, want search", d.Tier)
+	}
+}
