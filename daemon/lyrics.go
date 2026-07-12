@@ -160,7 +160,7 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 	}
 	if result == nil {
 		// cache the negative only when every source returns no lyrics
-		if !sawTransientError {
+		if !sawTransientError && artistName != "" {
 			lp.mu.Lock()
 			lp.storeLocked(trackId, nil)
 			lp.mu.Unlock()

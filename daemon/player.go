@@ -63,6 +63,17 @@ type AppPlayer struct {
 	// queueResolver fills in artist/album names for queue entries
 	queueResolver   *queueResolver
 	queueResolvedCh chan struct{}
+
+	// async artist/album resolution
+	metaResolvedCh       chan resolvedTrackMeta
+	metaResolveInFlight  string
+	metaResolveFailedUri string
+}
+
+type resolvedTrackMeta struct {
+	uri    string
+	artist string
+	album  string
 }
 
 func (p *AppPlayer) playbackReady() bool {
@@ -393,11 +404,16 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 			if prevState != nil && prevState.TrackUri == rs.TrackUri && prevState.TrackArtist != "" {
 				artistName = prevState.TrackArtist
 				albumName = prevState.TrackAlbum
-			} else if strings.HasPrefix(rs.TrackUri, "spotify:episode:") {
-				// Podcasts carry no artist_name
-				artistName, albumName = p.resolveEpisodeMetadata(ctx, *spotId)
 			} else {
-				artistName, albumName = p.resolveTrackMetadata(ctx, *spotId)
+				if p.queueResolver != nil {
+					if a, alb, ok := p.queueResolver.lookup(rs.TrackUri); ok {
+						artistName, albumName = a, alb
+					}
+				}
+				if artistName == "" {
+					// resolve via spclient WITHOUT blocking the run loop
+					p.resolveCurrentTrackMetaAsync(rs.TrackUri, *spotId)
+				}
 			}
 		}
 	}
@@ -529,6 +545,30 @@ func (p *AppPlayer) resolveTrackMetadata(ctx context.Context, spotId librespot.S
 		return wbArtist, wbAlbum
 	}
 	return artist, album
+}
+
+// fetches artist/album for the current track off the run loop
+func (p *AppPlayer) resolveCurrentTrackMetaAsync(uri string, spotId librespot.SpotifyId) {
+	if p.metaResolveInFlight == uri || p.metaResolveFailedUri == uri {
+		return
+	}
+	p.metaResolveInFlight = uri
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		var artist, album string
+		if strings.HasPrefix(uri, "spotify:episode:") {
+			// podcasts dont carry an artist name
+			artist, album = p.resolveEpisodeMetadata(ctx, spotId)
+		} else {
+			artist, album = p.resolveTrackMetadata(ctx, spotId)
+		}
+		select {
+		case p.metaResolvedCh <- resolvedTrackMeta{uri: uri, artist: artist, album: album}:
+		default:
+			// drop
+		}
+	}()
 }
 
 // resolveEpisodeMetadata resolves a podcast episode's show name
@@ -1391,6 +1431,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	p.app.log.Infof("lyrics provider initialized")
 
 	p.queueResolver = newQueueResolver(p.app.log, p.sess.Spclient(), p.queueResolvedCh)
+	p.metaResolvedCh = make(chan resolvedTrackMeta, 4)
 
 	apRecv := p.sess.Accesspoint().Receive(ap.PacketTypeProductInfo, ap.PacketTypeCountryCode)
 	msgRecv := p.sess.Dealer().ReceiveMessage("hm://pusher/v1/connections/", "hm://connect-state/v1/")
@@ -1457,6 +1498,24 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			}
 			data, err := p.handleApiRequest(ctx, req)
 			req.Reply(data, err)
+		case meta := <-p.metaResolvedCh:
+			// background current track metadata
+			if p.metaResolveInFlight == meta.uri {
+				p.metaResolveInFlight = ""
+			}
+			if meta.artist == "" {
+				p.metaResolveFailedUri = meta.uri
+			}
+			if rs := p.state.remoteState; rs != nil && rs.TrackUri == meta.uri && meta.artist != "" {
+				updated := *rs
+				updated.TrackArtist = meta.artist
+				updated.TrackAlbum = firstNonEmpty(meta.album, updated.RawMetadata["album_title"])
+				p.state.remoteState = &updated
+				p.app.server.Emit(&ApiEvent{
+					Type: ApiEventTypeObserverStateChanged,
+					Data: &updated,
+				})
+			}
 		case <-p.queueResolvedCh:
 			// Background queue-metadata resolution landed
 			if rs := p.state.remoteState; rs != nil && p.queueResolver != nil {

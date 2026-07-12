@@ -72,6 +72,17 @@ func (r *queueResolver) applyCache(tracks []QueueTrack) (needsResolve []string) 
 	return needsResolve
 }
 
+// lookup returns cached artist/album for a single uri
+func (r *queueResolver) lookup(uri string) (artist, album string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, found := r.cache[uri]
+	if !found || v.artist == "" {
+		return "", "", false
+	}
+	return v.artist, v.album, true
+}
+
 // ResolveAsync batch-fetches metadata + populates cache, signals on completion
 func (r *queueResolver) ResolveAsync(uris []string) {
 	if len(uris) == 0 {
