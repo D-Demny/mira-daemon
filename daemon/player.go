@@ -1047,6 +1047,14 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if rs == nil || rs.DeviceId == "" {
 			return nil, fmt.Errorf("no active remote device known yet")
 		}
+		if rs.VolumeDisabled {
+			// route volume controls to phone directly
+			if data.Relative && rs.DeviceType == "SMARTPHONE" && p.app.bt != nil && p.app.bt.SendPhoneVolumeSteps(int(data.Volume)) {
+				p.app.log.Debugf("set_volume: routed %+d phone-volume step(s) (%s)", data.Volume, rs.DeviceName)
+				return nil, nil
+			}
+			return nil, fmt.Errorf("active device does not allow volume control")
+		}
 		target := int64(data.Volume)
 		if data.Relative {
 			target = int64(rs.Volume) + int64(data.Volume)

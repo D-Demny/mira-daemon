@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -27,6 +28,11 @@ type BluetoothHandler interface {
 	StarDevice(address string, starred bool) error
 	ForgetDevice(address string) error
 	PageDevice(address string) error
+
+	// phone volume
+	HIDVolumeStatus() (registered, subscribed bool)
+	SendHIDVolumeSteps(steps int) bool
+	SendPhoneVolumeSteps(steps int) bool
 }
 
 func writeBluetoothJSON(w http.ResponseWriter, v any) {
@@ -53,6 +59,34 @@ func registerBluetoothRoutes(log librespot.Logger, m *http.ServeMux, get func() 
 			log.Debugf("http: %s %s exit", r.Method, r.URL.Path)
 		}
 	}
+
+	m.HandleFunc("GET /bluetooth/hid", trace(func(w http.ResponseWriter, r *http.Request) {
+		bm := get()
+		if bm == nil {
+			bluetoothUnavailable(w)
+			return
+		}
+		registered, subscribed := bm.HIDVolumeStatus()
+		writeBluetoothJSON(w, map[string]bool{"registered": registered, "subscribed": subscribed})
+	}))
+
+	m.HandleFunc("POST /bluetooth/hid/volume", trace(func(w http.ResponseWriter, r *http.Request) {
+		bm := get()
+		if bm == nil {
+			bluetoothUnavailable(w)
+			return
+		}
+		var body struct {
+			Steps int `json:"steps"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Steps == 0 {
+			writeBluetoothError(w, http.StatusBadRequest, fmt.Errorf("body must be {\"steps\": ±N}"))
+			return
+		}
+		sent := bm.SendHIDVolumeSteps(body.Steps)
+		registered, subscribed := bm.HIDVolumeStatus()
+		writeBluetoothJSON(w, map[string]any{"sent": sent, "registered": registered, "subscribed": subscribed})
+	}))
 
 	m.HandleFunc("POST /bluetooth/discover/on", trace(func(w http.ResponseWriter, r *http.Request) {
 		bm := get()

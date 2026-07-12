@@ -322,6 +322,9 @@ func (app *App) Close() error {
 	if app.voice != nil {
 		app.voice.Stop()
 	}
+	if app.bt != nil {
+		app.bt.Close()
+	}
 	if app.server != nil {
 		return app.server.Close()
 	}

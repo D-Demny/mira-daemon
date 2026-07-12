@@ -64,6 +64,7 @@ type Manager struct {
 	manualMu          sync.Mutex
 	manualDisconnects map[string]time.Time
 	connectedSince    map[string]time.Time
+	connectedNow      map[string]bool
 
 	// most recent bnep0 (PAN) drop
 	networkDropMu     sync.Mutex
@@ -76,6 +77,12 @@ type Manager struct {
 	// prevents overlapping Device1.Connect calls
 	activeReconnectMu       sync.Mutex
 	activeReconnectInFlight bool
+
+	// volume key peripheral BLE
+	hid *hidVolume
+
+	// iAP2 sidecar for ios volume
+	iap2 *iap2Volume
 }
 
 const (
@@ -116,6 +123,7 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 		emit:              emit,
 		manualDisconnects: make(map[string]time.Time),
 		connectedSince:    make(map[string]time.Time),
+		connectedNow:      make(map[string]bool),
 		panBackoffUntil:   make(map[string]time.Time),
 		panBackoffDelay:   make(map[string]time.Duration),
 		panBackoffBumped:  make(map[string]time.Time),
@@ -132,12 +140,46 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 		return nil, fmt.Errorf("power on adapter: %w", err)
 	}
 
+	// BLE HID volume keys register here
+	if hv, err := newHIDVolume(log, conn, adapter, m.adapterAlias()); err != nil {
+		log.WithError(err).Warn("bluetooth: hid: volume key service unavailable")
+	} else {
+		m.hid = hv
+		hv.peerConnected = m.anyDeviceConnected
+		hv.start()
+	}
+
+	// ios volume path
+	m.iap2 = newIap2Volume(log)
+
 	m.monitorDisconnects()
 	m.monitorNetworkInterfaces()
 
 	// disconnect reasons let us tell a deliberate phone-side disconnect from a dropout
 	if err := m.watchMgmtDisconnects(); err != nil {
 		m.log.WithError(err).Warn("bluetooth: mgmt watcher unavailable, deliberate disconnects will look like dropouts")
+	}
+
+	if devs, err := m.GetDevices(); err == nil {
+		for _, d := range devs {
+			if !d.Connected {
+				continue
+			}
+			addr := d.Address
+			m.manualMu.Lock()
+			m.connectedNow[addr] = true
+			m.connectedSince[addr] = time.Now()
+			m.manualMu.Unlock()
+			m.log.Debugf("bluetooth: %s already connected at startup", addr)
+			if m.iap2 != nil && d.Paired {
+				go func() {
+					if m.waitForServiceUUID(addr, iap2ServiceUUID, 15*time.Second) {
+						m.log.Infof("bluetooth: %s advertises iAP2, establishing volume session", addr)
+						m.iap2.EnsureSession(addr)
+					}
+				}()
+			}
+		}
 	}
 
 	return m, nil
@@ -254,6 +296,7 @@ func (m *Manager) handleDeviceConnected(devicePath, address string) {
 	m.manualMu.Lock()
 	delete(m.manualDisconnects, address)
 	m.connectedSince[address] = time.Now()
+	m.connectedNow[address] = true
 	m.manualMu.Unlock()
 
 	info, err := m.GetDeviceInfo(address)
@@ -269,6 +312,16 @@ func (m *Manager) handleDeviceConnected(devicePath, address string) {
 	// only chase PAN for paired devices, random discovering peripherals shouldn't trigger Connect
 	if info == nil || !info.Paired {
 		return
+	}
+
+	// ios controls volume over iap2
+	if m.iap2 != nil {
+		go func() {
+			if m.waitForServiceUUID(address, iap2ServiceUUID, 15*time.Second) {
+				m.log.Infof("bluetooth: %s advertises iAP2, establishing volume session", address)
+				m.iap2.EnsureSession(address)
+			}
+		}()
 	}
 
 	// if we are already online, a newly connected device must not take over
@@ -373,6 +426,41 @@ func (m *Manager) waitForNAPService(ctx context.Context, address string) (bool, 
 	}
 }
 
+// polls until the device service list carries the UUID, the device disconnects, or the timeout passes
+func (m *Manager) waitForServiceUUID(address, uuid string, timeout time.Duration) bool {
+	devicePath := formatDevicePath(m.adapter, address)
+	obj := m.conn.Object(bluezBusName, devicePath)
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		props := make(map[string]dbus.Variant)
+		if err := m.dbusCall(obj, "org.freedesktop.DBus.Properties.GetAll", bluezDeviceInterface).Store(&props); err != nil {
+			return false
+		}
+		if v, ok := props["Connected"]; ok {
+			if connected, _ := v.Value().(bool); !connected {
+				return false
+			}
+		}
+		if v, ok := props["UUIDs"]; ok {
+			if uuids, ok := v.Value().([]string); ok {
+				for _, u := range uuids {
+					if strings.EqualFold(u, uuid) {
+						return true
+					}
+				}
+			}
+		}
+		if v, ok := props["ServicesResolved"]; ok {
+			if resolved, _ := v.Value().(bool); resolved {
+				return false
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	return false
+}
+
 func (m *Manager) handleDeviceDisconnected(devicePath, address string) {
 	if _, pending := m.pendingDisconnects.LoadAndDelete(address); !pending {
 		if m.emit != nil {
@@ -381,6 +469,13 @@ func (m *Manager) handleDeviceDisconnected(devicePath, address string) {
 	}
 
 	m.log.Infof("bluetooth: device disconnected: %s", devicePath)
+
+	m.manualMu.Lock()
+	delete(m.connectedNow, address)
+	m.manualMu.Unlock()
+
+	// tear down the iAP2 volume session
+	m.iap2.DropSession(address)
 
 	if m.agent != nil {
 		m.agent.clearCurrentIfDevice(devicePath)
@@ -774,6 +869,64 @@ func (m *Manager) RecoverNetworkAfterResume(addr string) {
 }
 
 // invokes a D-Bus method with dbusCallTimeout
+// returns the adapters user visible name
+func (m *Manager) adapterAlias() string {
+	obj := m.conn.Object(bluezBusName, m.adapter)
+	var v dbus.Variant
+	if err := m.dbusCall(obj, "org.freedesktop.DBus.Properties.Get", bluezAdapterInterface, "Alias").Store(&v); err == nil {
+		if alias, ok := v.Value().(string); ok && alias != "" {
+			return alias
+		}
+	}
+	return "Mira"
+}
+
+// reports whether any peer currently holds an ACL link
+func (m *Manager) anyDeviceConnected() bool {
+	m.manualMu.Lock()
+	defer m.manualMu.Unlock()
+	return len(m.connectedNow) > 0
+}
+
+// queues a signed volume key event
+func (m *Manager) SendHIDVolumeSteps(steps int) bool {
+	if m == nil || m.hid == nil {
+		return false
+	}
+	return m.hid.sendSteps(steps)
+}
+
+// routes a volume event to whichever phone volume path is live
+func (m *Manager) SendPhoneVolumeSteps(steps int) bool {
+	if m == nil {
+		return false
+	}
+	if m.iap2.SendVolumeSteps(steps) {
+		return true
+	}
+	return m.SendHIDVolumeSteps(steps)
+}
+
+// reports whether the HID service is registered with bluez
+func (m *Manager) HIDVolumeStatus() (registered, subscribed bool) {
+	if m == nil || m.hid == nil {
+		return false, false
+	}
+	h := m.hid
+	h.regMu.Lock()
+	registered = h.appRegistered && h.advRegistered
+	h.regMu.Unlock()
+	return registered, h.input.isNotifying()
+}
+
+// releases bluez registrations
+func (m *Manager) Close() {
+	m.iap2.Close()
+	if m.hid != nil {
+		m.hid.close()
+	}
+}
+
 func (m *Manager) dbusCall(obj dbus.BusObject, method string, args ...any) *dbus.Call {
 	ctx, cancel := context.WithTimeout(context.Background(), dbusCallTimeout)
 	defer cancel()
