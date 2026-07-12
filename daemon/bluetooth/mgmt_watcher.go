@@ -31,6 +31,39 @@ const manualDisconnectMinUptime = 45 * time.Second
 // a remote disconnect within this window of a bnep0/PAN drop is not deliberate
 const networkDropGrace = 15 * time.Second
 
+// this signals a user likely forgot the pairing
+const (
+	bondLostThreshold = 2
+	bondLostWindow    = 10 * time.Minute
+)
+
+// counts consecutive auth failure disconnects
+func (m *Manager) noteAuthFailure(address string) bool {
+	m.recoveryMu.Lock()
+	defer m.recoveryMu.Unlock()
+	if m.authFailCount == nil {
+		m.authFailCount = make(map[string]int)
+		m.authFailLast = make(map[string]time.Time)
+	}
+	if last, ok := m.authFailLast[address]; ok && time.Since(last) > bondLostWindow {
+		m.authFailCount[address] = 0
+	}
+	m.authFailCount[address]++
+	m.authFailLast[address] = time.Now()
+	if m.authFailCount[address] >= bondLostThreshold {
+		m.authFailCount[address] = 0
+		return true
+	}
+	return false
+}
+
+func (m *Manager) clearAuthFailures(address string) {
+	m.recoveryMu.Lock()
+	delete(m.authFailCount, address)
+	delete(m.authFailLast, address)
+	m.recoveryMu.Unlock()
+}
+
 func (m *Manager) markNetworkDrop() {
 	m.networkDropMu.Lock()
 	m.lastNetworkDropAt = time.Now()
@@ -159,8 +192,21 @@ func (m *Manager) handleDisconnectReason(address string, reason uint8) {
 			}()
 		}
 
+	case mgmtReasonAuth:
+		m.clearPanSession(address)
+		if !m.isKnownDevice(address) {
+			return
+		}
+		if m.noteAuthFailure(address) {
+			m.markManualDisconnect(address)
+			m.log.Warnf("bluetooth: %s keeps failing authentication, the phone likely deleted the pairing forget this device on the phone and pair again", address)
+			if m.emit != nil {
+				m.emit(EventBondLost, DeviceDisconnectedPayload{Address: address})
+			}
+		}
+
 	default:
-		// local/suspend/auth
+		// local/suspend
 		m.clearPanSession(address)
 	}
 }

@@ -130,7 +130,7 @@ func (m *Manager) StarDevice(address string, starred bool) error {
 // ForgetDevice removes the BlueZ bonding and drops the device
 func (m *Manager) ForgetDevice(address string) error {
 	if err := m.RemoveDevice(address); err != nil {
-		return err
+		m.log.WithError(err).Debugf("bluetooth: forget %s: bluez remove failed, pruning known list", address)
 	}
 
 	m.knownMu.Lock()
