@@ -2,7 +2,7 @@
 
 The on-device daemon for **Mira**, a standalone Spotify Car Thing controller.
 
-Heavily modified fork of [`devgianlu/go-librespot`](https://github.com/devgianlu/go-librespot). Unlike upstream, mira-daemon does not play audio. It runs in _observer_ mode, as a non-playable Spotify Connect device and watches what's playing on the user's other devices, exposes the state to the [mira-ui](https://github.com/thing-project/thing-ui) frontend over HTTP and WebSocket, and forwards playback controls back to whichever device is active.
+mira-daemon does not play audio. It runs in _observer_ mode, as a non-playable Spotify Connect device that watches what's playing on the user's other devices, exposes the state to the [mira-ui](https://github.com/mira-thing/mira-ui) frontend over HTTP and WebSocket, and forwards playback controls back to whichever device is active.
 
 ## What's different from upstream
 
@@ -39,3 +39,15 @@ GPLv3, see [LICENSE](LICENSE). Inherited from upstream `devgianlu/go-librespot`.
 The original Spotify Connect protocol implementation and most of the audio, dealer, spclient, and login5 packages are authored by [devgianlu](https://github.com/devgianlu) and the go-librespot contributors. Full authorship history is preserved in the git log of this repo.
 
 For upstream's docs (Docker setup, standalone usage, etc.), see the upstream README at https://github.com/devgianlu/go-librespot.
+
+## Support
+
+Mira is free and open source. If you'd like to support development, you can sponsor on [GitHub Sponsors](https://github.com/sponsors/MustakimK) or [Ko-fi](https://ko-fi.com/MustakimK). Questions and updates are on [Discord](https://discord.gg/SR2Pne7EPM).
+
+## Attributions
+
+mira-daemon is a heavily modified fork of [`devgianlu/go-librespot`](https://github.com/devgianlu/go-librespot) - the Spotify Connect protocol implementation and most of the dealer, spclient, and login5 packages are authored by devgianlu and the go-librespot contributors.
+
+ios volume controls is built on [`usenocturne/iap2-rs`](https://github.com/usenocturne/iap2-rs), Nocturne's iAP2 protocol implementation, in [`iap2/`](iap2/).
+
+> "Spotify" and "Car Thing" are trademarks of Spotify AB. This software is not affiliated with or endorsed by Spotify AB.

@@ -1,0 +1,22 @@
+[package]
+name = "iap2-sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "iAP2 accessory sidecar for ios knob volume"
+license = "GPL-3.0"
+
+[dependencies]
+iap2-rs = { path = "../iap2-rs" }
+bluer = { version = "0.17", features = ["rfcomm"], default-features = false }
+tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "signal"] }
+async-trait = "0.1"
+libc = "0.2"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
+
+[profile.release]
+strip = true
+lto = true
