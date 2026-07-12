@@ -78,6 +78,11 @@ type Manager struct {
 	activeReconnectMu       sync.Mutex
 	activeReconnectInFlight bool
 
+	recoveryMu    sync.Mutex
+	authFailCount map[string]int
+	authFailLast  map[string]time.Time
+	sdpBounceAt   map[string]time.Time
+
 	// volume key peripheral BLE
 	hid *hidVolume
 
@@ -128,6 +133,9 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 		panBackoffDelay:   make(map[string]time.Duration),
 		panBackoffBumped:  make(map[string]time.Time),
 		panSessionUp:      make(map[string]bool),
+		authFailCount:     make(map[string]int),
+		authFailLast:      make(map[string]time.Time),
+		sdpBounceAt:       make(map[string]time.Time),
 	}
 
 	a, err := newAgent(log, conn, m)
@@ -154,6 +162,8 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 
 	m.monitorDisconnects()
 	m.monitorNetworkInterfaces()
+
+	go m.routeArbiterLoop()
 
 	// disconnect reasons let us tell a deliberate phone-side disconnect from a dropout
 	if err := m.watchMgmtDisconnects(); err != nil {
@@ -283,6 +293,9 @@ func (m *Manager) handleDevicePaired(devicePath, address string) {
 	}
 	m.recordPairedDevice(address, name)
 
+	m.clearAuthFailures(address)
+	m.clearManualDisconnect(address)
+
 	if m.emit != nil {
 		m.emit(EventPaired, DevicePairedPayload{Device: info})
 	}
@@ -298,6 +311,7 @@ func (m *Manager) handleDeviceConnected(devicePath, address string) {
 	m.connectedSince[address] = time.Now()
 	m.connectedNow[address] = true
 	m.manualMu.Unlock()
+	m.clearAuthFailures(address)
 
 	info, err := m.GetDeviceInfo(address)
 	if err != nil {
@@ -355,6 +369,8 @@ func (m *Manager) handleDeviceConnected(devicePath, address string) {
 			if m.emit != nil {
 				m.emit(EventNAPUnavailable, NetworkConnectedPayload{Address: address})
 			}
+			// a pairing created while the hotspot was not up
+			m.trySdpRefreshBounce(address)
 			return
 		}
 
@@ -459,6 +475,38 @@ func (m *Manager) waitForServiceUUID(address, uuid string, timeout time.Duration
 		time.Sleep(time.Second)
 	}
 	return false
+}
+
+// disconnects and reconnects the device once to retrigger the pan connection
+func (m *Manager) trySdpRefreshBounce(address string) {
+	const sdpBounceCooldown = 3 * time.Minute
+
+	m.recoveryMu.Lock()
+	if m.sdpBounceAt == nil {
+		m.sdpBounceAt = make(map[string]time.Time)
+	}
+	if last, ok := m.sdpBounceAt[address]; ok && time.Since(last) < sdpBounceCooldown {
+		m.recoveryMu.Unlock()
+		return
+	}
+	m.sdpBounceAt[address] = time.Now()
+	m.recoveryMu.Unlock()
+
+	m.log.Infof("bluetooth: bouncing %s once to refresh its service record (stale-SDP recovery)", address)
+
+	devicePath := formatDevicePath(m.adapter, address)
+	obj := m.conn.Object(bluezBusName, devicePath)
+
+	m.pendingDisconnects.Store(address, true)
+	if err := m.dbusCall(obj, bluezDeviceInterface+".Disconnect").Err; err != nil {
+		m.pendingDisconnects.Delete(address)
+		m.log.WithError(err).Debugf("bluetooth: SDP-refresh disconnect failed for %s", address)
+		return
+	}
+	time.Sleep(2 * time.Second)
+	if err := m.dbusCall(obj, bluezDeviceInterface+".Connect").Err; err != nil {
+		m.log.WithError(err).Debugf("bluetooth: SDP-refresh reconnect failed for %s (device will auto-reconnect)", address)
+	}
 }
 
 func (m *Manager) handleDeviceDisconnected(devicePath, address string) {

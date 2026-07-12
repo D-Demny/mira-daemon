@@ -183,3 +183,66 @@ func TestHandleDisconnectReason_LocalReasonsNoPolicyChange(t *testing.T) {
 		}
 	}
 }
+
+func TestHandleDisconnectReason_RepeatedAuthFailureEmitsBondLost(t *testing.T) {
+	t.Parallel()
+
+	m := newWatcherTestManager("AA:BB:CC:DD:EE:FF")
+	var events []string
+	m.emit = func(eventType string, payload any) {
+		events = append(events, eventType)
+	}
+
+	// first auth failure
+	m.handleDisconnectReason("AA:BB:CC:DD:EE:FF", mgmtReasonAuth)
+	if len(events) != 0 {
+		t.Fatalf("one auth-failure must not emit, got %v", events)
+	}
+	if m.isManualDisconnect("AA:BB:CC:DD:EE:FF") {
+		t.Fatal("one auth-failure must not pause auto-reconnect")
+	}
+
+	// second within the window
+	m.handleDisconnectReason("AA:BB:CC:DD:EE:FF", mgmtReasonAuth)
+	if len(events) != 1 || events[0] != EventBondLost {
+		t.Fatalf("expected [%s], got %v", EventBondLost, events)
+	}
+	if !m.isManualDisconnect("AA:BB:CC:DD:EE:FF") {
+		t.Fatal("bond-lost must pause auto-reconnect (stop hammering the phone)")
+	}
+}
+
+func TestHandleDisconnectReason_AuthFailureStreakResetByConnect(t *testing.T) {
+	t.Parallel()
+
+	m := newWatcherTestManager("AA:BB:CC:DD:EE:FF")
+	var events []string
+	m.emit = func(eventType string, payload any) {
+		events = append(events, eventType)
+	}
+
+	m.handleDisconnectReason("AA:BB:CC:DD:EE:FF", mgmtReasonAuth)
+	m.clearAuthFailures("AA:BB:CC:DD:EE:FF") // what a successful connect does
+	m.handleDisconnectReason("AA:BB:CC:DD:EE:FF", mgmtReasonAuth)
+
+	if len(events) != 0 {
+		t.Fatalf("streak broken by a successful connect must not emit, got %v", events)
+	}
+}
+
+func TestHandleDisconnectReason_AuthFailureUnknownDeviceIgnored(t *testing.T) {
+	t.Parallel()
+
+	m := newTestManager()
+	var events []string
+	m.emit = func(eventType string, payload any) {
+		events = append(events, eventType)
+	}
+
+	m.handleDisconnectReason("11:22:33:44:55:66", mgmtReasonAuth)
+	m.handleDisconnectReason("11:22:33:44:55:66", mgmtReasonAuth)
+
+	if len(events) != 0 {
+		t.Fatalf("auth-failures from unknown devices must not emit, got %v", events)
+	}
+}
