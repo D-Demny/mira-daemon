@@ -937,16 +937,20 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		return &ApiResponseToken{Token: accessToken}, nil
 
 	case ApiRequestTypeObserverStatus:
+		settingUp := false
+		if v := p.app.voice; v != nil && v.firstSyncInProgress.Load() {
+			settingUp = true
+		}
 		if p.state.remoteState == nil {
-			// during the FIRST EVER catalog we show a setting things up splash since it usually takes longer
 			message := "no remote device is currently playing"
-			if v := p.app.voice; v != nil && v.firstSyncInProgress.Load() {
+			if settingUp {
 				message = "setting things up"
 			}
 			return map[string]any{
-				"active":  false,
-				"message": message,
-				"devices": p.connectDevicesOrEmpty(),
+				"active":     false,
+				"message":    message,
+				"setting_up": settingUp,
+				"devices":    p.connectDevicesOrEmpty(),
 			}, nil
 		}
 
@@ -991,6 +995,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			"next_tracks":     rs.NextTracks,
 			"lyrics_url":      lyricsUrl,
 			"raw_metadata":    rs.RawMetadata,
+			"setting_up":      settingUp,
 			"devices":         p.connectDevicesOrEmpty(),
 		}, nil
 

@@ -546,3 +546,32 @@ func TestPlayerRepeatContext_ParsesBoolBody(t *testing.T) {
 		t.Errorf("Data: got %v want true", got)
 	}
 }
+
+func TestOnPlayerReady_FiresOnTransitionAndImmediatelyWhenReady(t *testing.T) {
+	t.Parallel()
+	srv, _ := newTestApiServer(t)
+
+	var a, b, c atomic.Int32
+
+	srv.OnPlayerReady(func() { a.Add(1) })
+	srv.OnPlayerReady(func() { b.Add(1) })
+	if a.Load() != 0 || b.Load() != 0 {
+		t.Fatalf("subscribers fired before ready: a=%d b=%d", a.Load(), b.Load())
+	}
+
+	srv.SetPlayerReady(true)
+	if a.Load() != 1 || b.Load() != 1 {
+		t.Fatalf("subscribers not fired on transition: a=%d b=%d", a.Load(), b.Load())
+	}
+
+	srv.SetPlayerReady(false)
+	srv.SetPlayerReady(true)
+	if a.Load() != 1 || b.Load() != 1 {
+		t.Fatalf("subscribers re-fired on second transition: a=%d b=%d", a.Load(), b.Load())
+	}
+
+	srv.OnPlayerReady(func() { c.Add(1) })
+	if c.Load() != 1 {
+		t.Fatalf("late subscriber not fired immediately: c=%d", c.Load())
+	}
+}
