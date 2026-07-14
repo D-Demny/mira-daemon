@@ -50,6 +50,8 @@ type ApiServer interface {
 	// while false, fast-fail 503 instead of hanging during OAuth pairing
 	SetPlayerReady(ready bool)
 
+	OnPlayerReady(fn func())
+
 	// /system/* uses this, nil = 503
 	SetSystemHandler(h SystemHandler)
 
@@ -98,6 +100,9 @@ type ConcreteApiServer struct {
 
 	// read on every channel-bound HTTP request
 	playerReady atomic.Bool
+
+	readyMu  sync.Mutex
+	readyFns []func()
 
 	sysMu sync.RWMutex
 	sysFn SystemHandler
@@ -489,6 +494,8 @@ func (s *StubApiServer) SetAuthHandler(_ AuthStatusFunc) {}
 
 func (s *StubApiServer) SetPlayerReady(_ bool) {}
 
+func (s *StubApiServer) OnPlayerReady(_ func()) {}
+
 func (s *StubApiServer) SetSystemHandler(_ SystemHandler)     {}
 func (s *StubApiServer) SetSettingsHandler(_ SettingsHandler) {}
 
@@ -508,7 +515,28 @@ func (s *ConcreteApiServer) getAuthHandler() AuthStatusFunc {
 
 // while false, channel-bound endpoints short-circuit instead of blocking
 func (s *ConcreteApiServer) SetPlayerReady(ready bool) {
-	s.playerReady.Store(ready)
+	prev := s.playerReady.Swap(ready)
+	if !ready || prev {
+		return
+	}
+	s.readyMu.Lock()
+	fns := s.readyFns
+	s.readyFns = nil
+	s.readyMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+func (s *ConcreteApiServer) OnPlayerReady(fn func()) {
+	s.readyMu.Lock()
+	if s.playerReady.Load() {
+		s.readyMu.Unlock()
+		fn()
+		return
+	}
+	s.readyFns = append(s.readyFns, fn)
+	s.readyMu.Unlock()
 }
 
 func (s *ConcreteApiServer) SetBluetoothHandler(bm BluetoothHandler) {

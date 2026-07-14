@@ -143,25 +143,20 @@ func (v *voiceService) runCatalogSync(syncer *catalogSyncer, hadIndex bool) {
 		v.app.log.Warn("voice: espeak-ng g2p unavailable, phonetic re-rank disabled, commands fall through to searchDesktop")
 		return
 	}
-	// wait until the player can serve pathfinder requests
-	for v.ctx.Err() == nil {
-		ctx, cancel := context.WithTimeout(v.ctx, 15*time.Second)
-		_, err := v.app.server.Submit(ctx, ApiRequestTypeCatalogPage,
-			ApiRequestDataCatalogPage{Kind: catalogKindLiked, Offset: 0, Limit: 1})
-		cancel()
-		if err == nil {
-			break
-		}
-		if v.ctx.Err() != nil {
-			return
-		}
-		v.app.log.Debugf("voice: catalog sync waiting for session: %v", err)
-		select {
-		case <-time.After(30 * time.Second):
-		case <-v.ctx.Done():
-			return
-		}
+	if !hadIndex {
+		v.firstSyncInProgress.Store(true)
+		defer v.firstSyncInProgress.Store(false)
 	}
+
+	ready := make(chan struct{})
+	var once sync.Once
+	v.app.server.OnPlayerReady(func() { once.Do(func() { close(ready) }) })
+	select {
+	case <-ready:
+	case <-v.ctx.Done():
+		return
+	}
+
 	if hadIndex {
 		// voice already works on the cached index, so we run sync in the background now
 		if _, _, err := syncer.Refresh(v.ctx); err != nil && v.ctx.Err() == nil {
@@ -169,11 +164,8 @@ func (v *voiceService) runCatalogSync(syncer *catalogSyncer, hadIndex bool) {
 		}
 		return
 	}
-	// first ever sync we show a setting things up dialog with the start splash
-	v.firstSyncInProgress.Store(true)
-	_, err := syncer.Run(v.ctx)
-	v.firstSyncInProgress.Store(false)
-	if err != nil && v.ctx.Err() == nil {
+	// first ever sync
+	if _, err := syncer.Run(v.ctx); err != nil && v.ctx.Err() == nil {
 		v.app.log.Warnf("voice: catalog sync ended with error: %v", err)
 	}
 }
