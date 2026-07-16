@@ -6,7 +6,6 @@
 !.vscode/settings.json
 
 # Configuration files
-/config.yml
 /credentials.json
 /state.json
 /lockfile
