@@ -1,0 +1,18 @@
+device_name: "Mira"
+device_type: "car_thing"
+log_level: "debug"
+
+observer_mode: true
+
+credentials:
+  type: interactive
+
+server:
+  enabled: true
+  address: "0.0.0.0"
+  port: 3678
+  allow_origin: "*"
+
+voice:
+  enabled: false
+  wake: false
