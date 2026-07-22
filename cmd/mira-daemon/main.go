@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -37,6 +39,14 @@ func main() {
 		DisableTimestamp: cfg.LogDisableTimestamp,
 	})
 	log.SetLevel(cfg.LogLevel)
+
+	// force ipv4
+	if tr, ok := http.DefaultTransport.(*http.Transport); ok {
+		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		tr.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp4", addr)
+		}
+	}
 
 	logEntry := &LogrusAdapter{Log: log.NewEntry(logger)}
 

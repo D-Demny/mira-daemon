@@ -96,7 +96,8 @@ func (ap *Accesspoint) init(ctx context.Context) (err error) {
 		attempts++
 		ctx_, cancel := context.WithTimeout(ctx, time.Second*30)
 		addr := ap.addr(ctx_)
-		conn, err := proxy.Dial(ctx_, "tcp", addr)
+		// tcp4
+		conn, err := proxy.Dial(ctx_, "tcp4", addr)
 		cancel()
 		if err == nil {
 			// close previous connection if any

@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"math/rand"
 	"testing"
+	"time"
 
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 )
@@ -162,6 +164,134 @@ func TestProjectQueue_NilMetadataAndEmptyImageUrlAreSafe(t *testing.T) {
 		}
 		if q.Name != "" {
 			t.Errorf("entry[%d] Name: got %q want empty", i, q.Name)
+		}
+	}
+}
+
+// RemotePosition must not compare the local clock against the server sidetime
+func TestRemotePosition_ClockSkewImmune(t *testing.T) {
+	t.Parallel()
+
+	rs := &RemoteState{
+		PositionAsOfTimestamp: 10_000,
+		Timestamp:     time.Now().Add(5 * time.Hour).UnixMilli(),
+		IsPlaying:     true,
+		PlaybackSpeed: 1,
+		ReceivedAt:    time.Now().Add(-2 * time.Second),
+	}
+	if got := rs.RemotePosition(); got < 11_900 || got > 13_000 {
+		t.Errorf("RemotePosition with skewed server Timestamp: got %d, want ~12000 (must advance from ReceivedAt)", got)
+	}
+
+	rs.ReceivedAt = time.Time{}
+	if got := rs.RemotePosition(); got != 10_000 {
+		t.Errorf("RemotePosition with zero ReceivedAt: got %d, want 10000", got)
+	}
+
+	rs.ReceivedAt = time.Now().Add(-2 * time.Second)
+	rs.IsPaused = true
+	if got := rs.RemotePosition(); got != 10_000 {
+		t.Errorf("RemotePosition while paused: got %d, want 10000", got)
+	}
+
+	rs.IsPaused = false
+	rs.ReceivedAt = time.Now().Add(-11 * time.Minute)
+	if got := rs.RemotePosition(); got != 10_000 {
+		t.Errorf("RemotePosition with stale snapshot: got %d, want 10000", got)
+	}
+}
+
+// cluster snapshots can be stale at delivery
+func TestRemotePosition_StaleSnapshotAged(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	rs := &RemoteState{
+		PositionAsOfTimestamp: 5_000,
+		Timestamp:             now.UnixMilli() - 100_000
+		ReceivedAt:            now.Add(-1 * time.Second),
+		ReceivedAtWallMs:      now.UnixMilli() - 1_000,
+		clockOffsetMs:         0,
+		offsetKnown:           true,
+		IsPlaying:             true,
+		PlaybackSpeed:         1,
+	}
+	if got := rs.RemotePosition(); got < 104_000 || got > 106_500 {
+		t.Errorf("stale snapshot: got %d, want ~105000 (age must be added back)", got)
+	}
+}
+
+// The age correction must cancel clock skew instead of trusting clock
+func TestRemotePosition_StaleSnapshotAgedUnderSkew(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	const skew = int64(-7_200_000) // local clock 2h behind server
+	rs := &RemoteState{
+		PositionAsOfTimestamp: 5_000,
+		Timestamp:        now.UnixMilli() - skew - 50_000,
+		ReceivedAt:       now.Add(-1 * time.Second),
+		ReceivedAtWallMs: now.UnixMilli() - 1_000,
+		clockOffsetMs:    skew,
+		offsetKnown:      true,
+		IsPlaying:        true,
+		PlaybackSpeed:    1,
+	}
+	if got := rs.RemotePosition(); got < 54_000 || got > 56_500 {
+		t.Errorf("stale snapshot under skew: got %d, want ~55000", got)
+	}
+}
+
+func TestClockOffsetEstimator(t *testing.T) {
+	t.Parallel()
+
+	var e clockOffsetEstimator
+	if _, ok := e.offset(); ok {
+		t.Fatal("empty estimator must report unknown")
+	}
+	e.add(-7_200_000 + 90_000)
+	e.add(-7_200_000 + 300)
+	if off, ok := e.offset(); !ok || off != -7_199_700 {
+		t.Errorf("offset: got %d ok=%v, want -7199700", off, ok)
+	}
+	for i := 0; i < clockOffsetWindow; i++ {
+		e.add(1_000)
+	}
+	if off, _ := e.offset(); off != 1_000 {
+		t.Errorf("offset after window slide: got %d, want 1000", off)
+	}
+}
+
+// on a synced clock the new position formula must produce identical results to what we had before
+func TestRemotePosition_MatchesLegacyOnSyncedClock(t *testing.T) {
+	t.Parallel()
+
+	rng := rand.New(rand.NewSource(20260720))
+	for i := 0; i < 25_000; i++ {
+		age := rng.Int63n(8 * 60 * 1000) 
+		sinceRecv := rng.Int63n(90 * 1000) 
+		base := rng.Int63n(300_000)
+
+		now := time.Now()
+		recvAt := now.Add(-time.Duration(sinceRecv) * time.Millisecond)
+		serverTs := recvAt.UnixMilli() - age
+
+		rs := &RemoteState{
+			PositionAsOfTimestamp: base,
+			Timestamp:             serverTs,
+			ReceivedAt:            recvAt,
+			ReceivedAtWallMs:      recvAt.UnixMilli(),
+			clockOffsetMs:         0,
+			offsetKnown:           true,
+			IsPlaying:             true,
+			PlaybackSpeed:         1,
+		}
+
+		legacy := base + (time.Now().UnixMilli() - serverTs)
+		got := rs.RemotePosition()
+		if d := got - legacy; d < -25 || d > 25 {
+			t.Fatalf("case %d (age=%dms sinceRecv=%dms base=%d): new=%d legacy=%d diff=%d",
+				i, age, sinceRecv, base, got, legacy, d)
 		}
 	}
 }
