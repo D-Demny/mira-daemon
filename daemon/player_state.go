@@ -65,8 +65,18 @@ type RemoteState struct {
 	Duration int64
 	// PositionAsOfTimestamp is the playback position at the time of Timestamp.
 	PositionAsOfTimestamp int64
-	// Timestamp is the server-side unix timestamp (ms) when position was captured.
+	// server side unix timestamp
 	Timestamp int64
+	// the projected position
+	Position int64
+	// when this snapshot arrived
+	ReceivedAt time.Time `json:"-"`
+	// the wall clock 
+	ReceivedAtWallMs int64 `json:"-"`
+
+	// estimated clock offset
+	clockOffsetMs int64
+	offsetKnown   bool
 	// IsPlaying indicates whether the remote device is actively playing.
 	IsPlaying bool
 	// IsPaused indicates whether the remote device is paused.
@@ -277,22 +287,62 @@ func (p *AppPlayer) initState() {
 	p.state.reset()
 }
 
-// RemotePosition computes the current playback position of the remote device
+const maxPositionProjectionMs = 10 * 60 * 1000
+
+// computes the current playback position of the remote device
 func (rs *RemoteState) RemotePosition() int64 {
 	if rs == nil {
 		return 0
 	}
-	if rs.IsPaused || !rs.IsPlaying {
+	if rs.IsPaused || !rs.IsPlaying || rs.ReceivedAt.IsZero() {
 		return rs.PositionAsOfTimestamp
 	}
 
-	now := time.Now().UnixMilli()
-	elapsed := now - rs.Timestamp
-	if elapsed < 0 || elapsed > 10*60*1000 {
-		return rs.PositionAsOfTimestamp
+	var age int64
+	if rs.offsetKnown && rs.Timestamp > 0 {
+		age = rs.ReceivedAtWallMs - rs.Timestamp - rs.clockOffsetMs
+		if age < 0 {
+			age = 0
+		} else if age > maxPositionProjectionMs {
+			age = maxPositionProjectionMs
+		}
 	}
 
-	return rs.PositionAsOfTimestamp + int64(float64(elapsed)*rs.PlaybackSpeed)
+	elapsed := time.Since(rs.ReceivedAt).Milliseconds()
+	if elapsed < 0 {
+		elapsed = 0
+	} else if elapsed > maxPositionProjectionMs {
+		// snapshot has gone stale while "playing"; stop projecting
+		elapsed = 0
+	}
+
+	return rs.PositionAsOfTimestamp + int64(float64(age+elapsed)*rs.PlaybackSpeed)
+}
+
+type clockOffsetEstimator struct {
+	samples []int64
+}
+
+const clockOffsetWindow = 16
+
+func (e *clockOffsetEstimator) add(sample int64) {
+	e.samples = append(e.samples, sample)
+	if len(e.samples) > clockOffsetWindow {
+		e.samples = e.samples[1:]
+	}
+}
+
+func (e *clockOffsetEstimator) offset() (int64, bool) {
+	if len(e.samples) == 0 {
+		return 0, false
+	}
+	min := e.samples[0]
+	for _, s := range e.samples[1:] {
+		if s < min {
+			min = s
+		}
+	}
+	return min, true
 }
 
 func (p *AppPlayer) updateState(ctx context.Context) {

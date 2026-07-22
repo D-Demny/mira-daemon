@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,6 +55,11 @@ type AppPlayer struct {
 	playbackReadyOnce      sync.Once
 
 	state *State
+
+	// clockEst learns the local-vs-server clock offset from cluster deliveries
+	// so stale snapshots can be aged correctly without trusting wall time.
+	clockEst       clockOffsetEstimator
+	clockEstSeeded bool
 
 	prefetchTimer *time.Timer
 
@@ -345,7 +351,7 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 		contextName = ps.ContextMetadata["context_description"]
 	}
 
-	return &RemoteState{
+	rs := &RemoteState{
 		DeviceId:              activeDeviceId,
 		DeviceName:            deviceName,
 		DeviceType:            deviceType,
@@ -373,6 +379,30 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 		NextTracks:            projectQueue(ps.NextTracks, QueueLimit),
 		RawMetadata:           rawMeta,
 	}
+	now := time.Now()
+	rs.ReceivedAt = now
+	rs.ReceivedAtWallMs = now.UnixMilli()
+	rs.Position = rs.RemotePosition()
+	return rs
+}
+
+const clockSyncedFlag = "/run/clock_synced"
+
+func (p *AppPlayer) noteClusterTiming(rs *RemoteState) {
+	if !p.clockEstSeeded {
+		if _, err := os.Stat(clockSyncedFlag); err == nil {
+			p.clockEst.add(0)
+			p.clockEstSeeded = true
+		}
+	}
+	if rs.Timestamp > 0 {
+		p.clockEst.add(rs.ReceivedAtWallMs - rs.Timestamp)
+	}
+	if off, ok := p.clockEst.offset(); ok {
+		rs.clockOffsetMs = off
+		rs.offsetKnown = true
+	}
+	rs.Position = rs.RemotePosition()
 }
 
 func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cluster) {
@@ -380,6 +410,7 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 	if rs == nil {
 		return
 	}
+	p.noteClusterTiming(rs)
 	track := cluster.PlayerState.Track
 
 	// Fill in any cached artist/album for the queue entries
@@ -1523,6 +1554,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 				updated := *rs
 				updated.TrackArtist = meta.artist
 				updated.TrackAlbum = firstNonEmpty(meta.album, updated.RawMetadata["album_title"])
+				updated.Position = updated.RemotePosition()
 				p.state.remoteState = &updated
 				p.app.server.Emit(&ApiEvent{
 					Type: ApiEventTypeObserverStateChanged,
@@ -1537,6 +1569,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 				updated.PrevTracks = append([]QueueTrack(nil), rs.PrevTracks...)
 				p.queueResolver.applyCache(updated.NextTracks)
 				p.queueResolver.applyCache(updated.PrevTracks)
+				updated.Position = updated.RemotePosition()
 				p.state.remoteState = &updated
 				p.app.server.Emit(&ApiEvent{
 					Type: ApiEventTypeObserverStateChanged,
