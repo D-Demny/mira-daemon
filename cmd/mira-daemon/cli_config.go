@@ -176,10 +176,22 @@ func loadCLIConfig(cfg *cliConfig) error {
 		configPath = filepath.Join(cfg.ConfigDir, "config.yaml")
 	}
 
+	// A corrupt config file must not crash loop daemon
+	quarantineConfig := func(reason error) error {
+		target := configPath + ".corrupt"
+		if renameErr := os.Rename(configPath, target); renameErr != nil {
+			return fmt.Errorf("failed reading configuration file: %w", reason)
+		}
+		return fmt.Errorf("configuration file unusable, quarantined to %s: %w", target, reason)
+	}
+
+	configFileLoaded := false
 	if err := k.Load(file.Provider(configPath), yaml.Parser()); err != nil {
 		if !os.IsNotExist(err) {
-			return fmt.Errorf("failed reading configuration file: %w", err)
+			return quarantineConfig(err)
 		}
+	} else {
+		configFileLoaded = true
 	}
 
 	if err := k.Load(posflag.Provider(f, ".", k), nil); err != nil {
@@ -206,6 +218,9 @@ func loadCLIConfig(cfg *cliConfig) error {
 	}
 
 	if err := k.Unmarshal("", &cfg); err != nil {
+		if configFileLoaded {
+			return quarantineConfig(fmt.Errorf("failed to unmarshal configuration: %w", err))
+		}
 		return fmt.Errorf("failed to unmarshal configuration: %w", err)
 	}
 

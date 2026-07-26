@@ -42,7 +42,8 @@ func newIap2Volume(log librespot.Logger) *iap2Volume {
 			return &iap2Volume{log: log, path: p}
 		}
 	}
-	log.Debug("bluetooth: no iap2-sidecar binary, ios volume disabled")
+	// missing sidecar
+	log.Warn("bluetooth: no iap2-sidecar binary, iPhone volume DISABLED (firmware build issue)")
 	return nil
 }
 
