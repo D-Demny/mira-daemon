@@ -208,7 +208,7 @@ func TestRemotePosition_StaleSnapshotAged(t *testing.T) {
 	now := time.Now()
 	rs := &RemoteState{
 		PositionAsOfTimestamp: 5_000,
-		Timestamp:             now.UnixMilli() - 100_000
+		Timestamp:             now.UnixMilli() - 100_000,
 		ReceivedAt:            now.Add(-1 * time.Second),
 		ReceivedAtWallMs:      now.UnixMilli() - 1_000,
 		clockOffsetMs:         0,

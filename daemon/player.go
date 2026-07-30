@@ -77,9 +77,11 @@ type AppPlayer struct {
 }
 
 type resolvedTrackMeta struct {
-	uri    string
-	artist string
-	album  string
+	uri      string
+	name     string
+	artist   string
+	album    string
+	imageUrl string
 }
 
 func (p *AppPlayer) playbackReady() bool {
@@ -336,8 +338,11 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 			trackName = track.Metadata["title"]
 			rawMeta = track.Metadata
 
-			if img, ok := track.Metadata["image_url"]; ok {
-				imageUrl = convertSpotifyImageUrl(img)
+			for _, k := range []string{"image_url", "image_xlarge_url", "image_large_url", "image_small_url"} {
+				if img := track.Metadata[k]; img != "" {
+					imageUrl = convertSpotifyImageUrl(img)
+					break
+				}
 			}
 		}
 	}
@@ -420,7 +425,8 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 		p.queueResolver.ResolveAsync(append(needNext, needPrev...))
 	}
 
-	// Resolve artist and album from track metadata or spclient
+	// Resolve artist and album from track metadata or spclient. 
+	// Unofficial connect devices often send a bare URI with empty metadata
 	artistName := ""
 	albumName := ""
 	if track != nil && track.Metadata != nil {
@@ -428,23 +434,32 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 		albumName = track.Metadata["album_title"]
 	}
 
-	if artistName == "" && rs.TrackUri != "" {
+	if rs.TrackUri != "" && (artistName == "" || rs.TrackName == "" || rs.TrackImageUrl == "") {
 		spotId, err := librespot.SpotifyIdFromUri(rs.TrackUri)
 		if err == nil && spotId != nil {
-			prevState := p.state.remoteState
-			if prevState != nil && prevState.TrackUri == rs.TrackUri && prevState.TrackArtist != "" {
-				artistName = prevState.TrackArtist
-				albumName = prevState.TrackAlbum
-			} else {
-				if p.queueResolver != nil {
-					if a, alb, ok := p.queueResolver.lookup(rs.TrackUri); ok {
-						artistName, albumName = a, alb
+			// carry anything already resolved for this same track
+			if prevState := p.state.remoteState; prevState != nil && prevState.TrackUri == rs.TrackUri {
+				if artistName == "" && prevState.TrackArtist != "" {
+					artistName = prevState.TrackArtist
+					if albumName == "" {
+						albumName = prevState.TrackAlbum
 					}
 				}
-				if artistName == "" {
-					// resolve via spclient WITHOUT blocking the run loop
-					p.resolveCurrentTrackMetaAsync(rs.TrackUri, *spotId)
+				if rs.TrackName == "" {
+					rs.TrackName = prevState.TrackName
 				}
+				if rs.TrackImageUrl == "" {
+					rs.TrackImageUrl = prevState.TrackImageUrl
+				}
+			}
+			if artistName == "" && p.queueResolver != nil {
+				if a, alb, ok := p.queueResolver.lookup(rs.TrackUri); ok {
+					artistName, albumName = a, alb
+				}
+			}
+			if artistName == "" || rs.TrackName == "" || rs.TrackImageUrl == "" {
+				// resolve via spclient WITHOUT blocking the run loop
+				p.resolveCurrentTrackMetaAsync(rs.TrackUri, *spotId)
 			}
 		}
 	}
@@ -565,20 +580,19 @@ func (p *AppPlayer) clearActiveDevice() {
 
 // resolveTrackMetadata tries spclient first (fast), falls back to the web API
 // when spclient is unavailable
-func (p *AppPlayer) resolveTrackMetadata(ctx context.Context, spotId librespot.SpotifyId) (artist, album string) {
-	artist, album = p.resolveViaSpclient(ctx, spotId)
-	if artist != "" {
-		return
+func (p *AppPlayer) resolveTrackMetadata(ctx context.Context, spotId librespot.SpotifyId) resolvedTrackMeta {
+	meta := p.resolveViaSpclient(ctx, spotId)
+	if meta.artist != "" {
+		return meta
 	}
 
-	wbArtist, wbAlbum := p.resolveViaWebApi(ctx, spotId)
-	if wbArtist != "" {
-		return wbArtist, wbAlbum
+	if wb := p.resolveViaWebApi(ctx, spotId); wb.artist != "" {
+		return wb
 	}
-	return artist, album
+	return meta
 }
 
-// fetches artist/album for the current track off the run loop
+// fetches metadata for the current track off the run loop
 func (p *AppPlayer) resolveCurrentTrackMetaAsync(uri string, spotId librespot.SpotifyId) {
 	if p.metaResolveInFlight == uri || p.metaResolveFailedUri == uri {
 		return
@@ -587,23 +601,33 @@ func (p *AppPlayer) resolveCurrentTrackMetaAsync(uri string, spotId librespot.Sp
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		var artist, album string
+		var meta resolvedTrackMeta
 		if strings.HasPrefix(uri, "spotify:episode:") {
 			// podcasts dont carry an artist name
-			artist, album = p.resolveEpisodeMetadata(ctx, spotId)
+			meta = p.resolveEpisodeMetadata(ctx, spotId)
 		} else {
-			artist, album = p.resolveTrackMetadata(ctx, spotId)
+			meta = p.resolveTrackMetadata(ctx, spotId)
 		}
+		meta.uri = uri
 		select {
-		case p.metaResolvedCh <- resolvedTrackMeta{uri: uri, artist: artist, album: album}:
+		case p.metaResolvedCh <- meta:
 		default:
 			// drop
 		}
 	}()
 }
 
+// picks the closest cover file id and turns it into an image CDN url
+func coverImageUrl(images []*metadatapb.Image, size string) string {
+	fileId := getBestImageIdForSize(images, size)
+	if fileId == nil {
+		return ""
+	}
+	return "https://i.scdn.co/image/" + hex.EncodeToString(fileId)
+}
+
 // resolveEpisodeMetadata resolves a podcast episode's show name
-func (p *AppPlayer) resolveEpisodeMetadata(ctx context.Context, spotId librespot.SpotifyId) (show, album string) {
+func (p *AppPlayer) resolveEpisodeMetadata(ctx context.Context, spotId librespot.SpotifyId) resolvedTrackMeta {
 	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
@@ -611,17 +635,23 @@ func (p *AppPlayer) resolveEpisodeMetadata(ctx context.Context, spotId librespot
 	if err := p.sess.Spclient().ExtendedMetadataSimple(reqCtx, spotId,
 		extmetadatapb.ExtensionKind_EPISODE_V4, &ep); err != nil {
 		p.app.log.Debugf("observer: spclient episode metadata for %s failed: %v", spotId.Uri(), err)
-		return "", ""
+		return resolvedTrackMeta{}
 	}
 
+	var meta resolvedTrackMeta
+	meta.name = ep.GetName()
 	if ep.Show != nil && ep.Show.Name != nil {
-		show = *ep.Show.Name
+		meta.artist = *ep.Show.Name
+		meta.album = *ep.Show.Name
 	}
-	p.app.log.Debugf("observer: spclient episode metadata for %s: show=%q", spotId.Uri(), show)
-	return show, show
+	if ep.CoverImage != nil {
+		meta.imageUrl = coverImageUrl(ep.CoverImage.Image, p.app.cfg.ImageSize)
+	}
+	p.app.log.Debugf("observer: spclient episode metadata for %s: show=%q", spotId.Uri(), meta.artist)
+	return meta
 }
 
-func (p *AppPlayer) resolveViaSpclient(ctx context.Context, spotId librespot.SpotifyId) (artist, album string) {
+func (p *AppPlayer) resolveViaSpclient(ctx context.Context, spotId librespot.SpotifyId) resolvedTrackMeta {
 	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
@@ -629,58 +659,77 @@ func (p *AppPlayer) resolveViaSpclient(ctx context.Context, spotId librespot.Spo
 	if err := p.sess.Spclient().ExtendedMetadataSimple(reqCtx, spotId,
 		extmetadatapb.ExtensionKind_TRACK_V4, &trackMeta); err != nil {
 		p.app.log.Debugf("observer: spclient metadata for %s failed: %v", spotId.Uri(), err)
-		return "", ""
+		return resolvedTrackMeta{}
 	}
 
+	var meta resolvedTrackMeta
+	if trackMeta.Name != nil {
+		meta.name = *trackMeta.Name
+	}
 	if len(trackMeta.Artist) > 0 && trackMeta.Artist[0].Name != nil {
-		artist = *trackMeta.Artist[0].Name
+		meta.artist = *trackMeta.Artist[0].Name
 	}
-	if trackMeta.Album != nil && trackMeta.Album.Name != nil {
-		album = *trackMeta.Album.Name
+	if trackMeta.Album != nil {
+		if trackMeta.Album.Name != nil {
+			meta.album = *trackMeta.Album.Name
+		}
+		meta.imageUrl = coverImageUrl(trackMeta.Album.Cover, p.app.cfg.ImageSize)
+		if meta.imageUrl == "" && trackMeta.Album.CoverGroup != nil {
+			meta.imageUrl = coverImageUrl(trackMeta.Album.CoverGroup.Image, p.app.cfg.ImageSize)
+		}
 	}
 
-	p.app.log.Debugf("observer: spclient metadata for %s: artist=%q, album=%q",
-		spotId.Uri(), artist, album)
-	return
+	p.app.log.Debugf("observer: spclient metadata for %s: name=%q artist=%q, album=%q",
+		spotId.Uri(), meta.name, meta.artist, meta.album)
+	return meta
 }
 
-func (p *AppPlayer) resolveViaWebApi(ctx context.Context, spotId librespot.SpotifyId) (artist, album string) {
+func (p *AppPlayer) resolveViaWebApi(ctx context.Context, spotId librespot.SpotifyId) resolvedTrackMeta {
 	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	resp, err := p.sess.WebApi(reqCtx, "GET", "/v1/tracks/"+spotId.Base62(), nil, nil, nil)
 	if err != nil {
 		p.app.log.Debugf("observer: web api metadata for %s failed: %v", spotId.Uri(), err)
-		return "", ""
+		return resolvedTrackMeta{}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		p.app.log.Debugf("observer: web api metadata for %s returned status %d", spotId.Uri(), resp.StatusCode)
-		return "", ""
+		return resolvedTrackMeta{}
 	}
 
 	var data struct {
+		Name    string `json:"name"`
 		Artists []struct {
 			Name string `json:"name"`
 		} `json:"artists"`
 		Album struct {
-			Name string `json:"name"`
+			Name   string `json:"name"`
+			Images []struct {
+				Url string `json:"url"`
+			} `json:"images"`
 		} `json:"album"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		p.app.log.Debugf("observer: web api metadata for %s decode failed: %v", spotId.Uri(), err)
-		return "", ""
+		return resolvedTrackMeta{}
 	}
 
+	var meta resolvedTrackMeta
+	meta.name = data.Name
 	if len(data.Artists) > 0 {
-		artist = data.Artists[0].Name
+		meta.artist = data.Artists[0].Name
 	}
-	album = data.Album.Name
+	meta.album = data.Album.Name
+	if len(data.Album.Images) > 0 {
+		meta.imageUrl = data.Album.Images[0].Url
+	}
 
-	p.app.log.Debugf("observer: web api metadata for %s: artist=%q, album=%q",
-		spotId.Uri(), artist, album)
-	return
+	p.app.log.Debugf("observer: web api metadata for %s: name=%q artist=%q, album=%q",
+		spotId.Uri(), meta.name, meta.artist, meta.album)
+	return meta
 }
 
 const (
@@ -1547,19 +1596,38 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			if p.metaResolveInFlight == meta.uri {
 				p.metaResolveInFlight = ""
 			}
-			if meta.artist == "" {
+			if meta.artist == "" && meta.name == "" && meta.imageUrl == "" {
 				p.metaResolveFailedUri = meta.uri
 			}
-			if rs := p.state.remoteState; rs != nil && rs.TrackUri == meta.uri && meta.artist != "" {
+			if rs := p.state.remoteState; rs != nil && rs.TrackUri == meta.uri {
 				updated := *rs
-				updated.TrackArtist = meta.artist
-				updated.TrackAlbum = firstNonEmpty(meta.album, updated.RawMetadata["album_title"])
-				updated.Position = updated.RemotePosition()
-				p.state.remoteState = &updated
-				p.app.server.Emit(&ApiEvent{
-					Type: ApiEventTypeObserverStateChanged,
-					Data: &updated,
-				})
+				changed := false
+				if meta.artist != "" && updated.TrackArtist == "" {
+					updated.TrackArtist = meta.artist
+					changed = true
+				}
+				if updated.TrackAlbum == "" {
+					if alb := firstNonEmpty(meta.album, updated.RawMetadata["album_title"]); alb != "" {
+						updated.TrackAlbum = alb
+						changed = true
+					}
+				}
+				if meta.name != "" && updated.TrackName == "" {
+					updated.TrackName = meta.name
+					changed = true
+				}
+				if meta.imageUrl != "" && updated.TrackImageUrl == "" {
+					updated.TrackImageUrl = meta.imageUrl
+					changed = true
+				}
+				if changed {
+					updated.Position = updated.RemotePosition()
+					p.state.remoteState = &updated
+					p.app.server.Emit(&ApiEvent{
+						Type: ApiEventTypeObserverStateChanged,
+						Data: &updated,
+					})
+				}
 			}
 		case <-p.queueResolvedCh:
 			// Background queue-metadata resolution landed
