@@ -1,6 +1,6 @@
 module github.com/devgianlu/go-librespot
 
-go 1.25
+go 1.25.0
 
 toolchain go1.25.5
 
@@ -20,10 +20,10 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/pflag v1.0.10
 	github.com/vishvananda/netlink v1.3.1
-	golang.org/x/crypto v0.46.0
+	golang.org/x/crypto v0.54.0
 	golang.org/x/exp v0.0.0-20251209150349-8475f28825e9
-	golang.org/x/net v0.48.0
-	golang.org/x/sys v0.39.0
+	golang.org/x/net v0.57.0
+	golang.org/x/sys v0.47.0
 	google.golang.org/protobuf v1.36.11
 )
 
