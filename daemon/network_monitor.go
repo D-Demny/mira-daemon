@@ -23,8 +23,8 @@ func linkUp(name string) bool {
 // startNetworkMonitor pings + emits network_status on transition
 func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition func(online bool)) {
 	const (
-		interval       = 1 * time.Second
-		failThreshold  = 5
+		interval = 1 * time.Second
+		failThreshold  = 3
 		rebroadcastSec = 15
 	)
 
@@ -43,6 +43,15 @@ func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition fu
 			return cmd.Run() == nil
 		}
 
+		confirm := func() bool {
+			conn, err := net.DialTimeout("tcp", networkMonitorTarget+":443", 1200*time.Millisecond)
+			if err != nil {
+				return false
+			}
+			_ = conn.Close()
+			return true
+		}
+
 		emit := func(status string) {
 			server.Emit(&ApiEvent{
 				Type: ApiEventTypeNetworkStatus,
@@ -57,6 +66,9 @@ func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition fu
 
 		for {
 			ok := ping()
+			if !ok {
+				ok = confirm()
+			}
 			if ok {
 				failCount = 0
 				if !online || !emitted {
