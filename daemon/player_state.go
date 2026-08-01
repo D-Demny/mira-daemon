@@ -324,8 +324,18 @@ type clockOffsetEstimator struct {
 }
 
 const clockOffsetWindow = 16
+const clockJumpFlushMs = 60_000
 
 func (e *clockOffsetEstimator) add(sample int64) {
+	if cur, ok := e.offset(); ok {
+		d := sample - cur
+		if d < 0 {
+			d = -d
+		}
+		if d > clockJumpFlushMs {
+			e.samples = e.samples[:0]
+		}
+	}
 	e.samples = append(e.samples, sample)
 	if len(e.samples) > clockOffsetWindow {
 		e.samples = e.samples[1:]

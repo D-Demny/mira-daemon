@@ -295,3 +295,33 @@ func TestRemotePosition_MatchesLegacyOnSyncedClock(t *testing.T) {
 		}
 	}
 }
+
+func TestClockOffsetEstimator_FlushesOnClockJump(t *testing.T) {
+	t.Parallel()
+
+	var e clockOffsetEstimator
+	e.add(-4 * 3600 * 1000)
+	e.add(250)
+	if off, ok := e.offset(); !ok || off != 250 {
+		t.Errorf("after forward jump: got %d ok=%v, want 250 (stale window flushed)", off, ok)
+	}
+
+	e2 := clockOffsetEstimator{}
+	e2.add(500)
+	e2.add(-3_600_000)
+	if off, _ := e2.offset(); off != -3_600_000 {
+		t.Errorf("after backward jump: got %d, want -3600000", off)
+	}
+}
+
+func TestClockOffsetEstimator_KeepsNormalJitter(t *testing.T) {
+	t.Parallel()
+
+	var e clockOffsetEstimator
+	for _, s := range []int64{400, 2_500, 130, 9_000, 700} {
+		e.add(s)
+	}
+	if off, _ := e.offset(); off != 130 {
+		t.Errorf("jittery-but-sane window: got %d, want min 130", off)
+	}
+}
