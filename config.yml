@@ -13,6 +13,8 @@ server:
   port: 3678
   allow_origin: "*"
 
+report_url: "https://mira-reports.mira-thing.workers.dev/"
+
 voice:
   enabled: false
   wake: false

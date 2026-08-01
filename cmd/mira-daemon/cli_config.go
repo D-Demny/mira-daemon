@@ -36,6 +36,8 @@ type cliConfig struct {
 
 	ObserverMode bool `koanf:"observer_mode"`
 
+	ReportURL string `koanf:"report_url"`
+
 	Server struct {
 		Enabled     bool   `koanf:"enabled"`
 		Address     string `koanf:"address"`
@@ -84,6 +86,7 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 		DeviceType:   c.DeviceType,
 		ClientToken:  c.ClientToken,
 		ObserverMode: c.ObserverMode,
+		ReportURL:    c.ReportURL,
 		ImageSize:    c.Server.ImageSize,
 		Voice: daemon.VoiceConfig{
 			Enabled:              c.Voice.Enabled,
@@ -156,9 +159,9 @@ func loadCLIConfig(cfg *cliConfig) error {
 		"server.address":    "localhost",
 		"server.image_size": "default",
 
-		"voice.bin_dir":   "/opt/voice/bin",
-		"voice.lib_dir":   "/opt/voice/lib",
-		"voice.model_dir": "/opt/voice/models",
+		"voice.bin_dir":                "/opt/voice/bin",
+		"voice.lib_dir":                "/opt/voice/lib",
+		"voice.model_dir":              "/opt/voice/models",
 		"voice.wake_threshold":         0.4,
 		"voice.wake_threshold_playing": 0.6,
 		"voice.mic_device":             "hw:0,0",
