@@ -944,6 +944,14 @@ func (m *Manager) SendHIDVolumeSteps(steps int) bool {
 	return m.hid.sendSteps(steps)
 }
 
+// reports the iAP2 session state
+func (m *Manager) Iap2Status() (state, lastErr string, present bool) {
+	if m == nil {
+		return "unavailable", "", false
+	}
+	return m.iap2.Status()
+}
+
 // routes a volume event to whichever phone volume path is live
 func (m *Manager) SendPhoneVolumeSteps(steps int) bool {
 	if m == nil {
@@ -1360,4 +1368,18 @@ func (m *Manager) IsOnline() bool {
 	m.onlineMu.Lock()
 	defer m.onlineMu.Unlock()
 	return m.online
+}
+
+func (m *Manager) TetherRouteState() string {
+	if m == nil {
+		return ""
+	}
+	r := panDefaultRoute()
+	if r == nil {
+		return ""
+	}
+	if r.Priority >= demotedMetric {
+		return "demoted"
+	}
+	return "ok"
 }

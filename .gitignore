@@ -8,6 +8,7 @@
 # Configuration files
 /credentials.json
 /state.json
+/.report-key
 /lockfile
 
 # Env files (local dev only, never committed)

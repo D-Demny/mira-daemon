@@ -74,6 +74,10 @@ type App struct {
 	onlineMu sync.Mutex
 	isOnline bool
 	onlineCh chan struct{}
+	netDrops int // online->offline transitions this session
+
+	// daemon uptime
+	startedAt time.Time
 
 	closed bool
 }
@@ -110,6 +114,7 @@ func New(opts *Options) (*App, error) {
 		retryNowCh: make(chan struct{}, 1),
 		onlineCh:   make(chan struct{}),
 		hashes:     newHashStore(),
+		startedAt:  time.Now(),
 	}
 
 	var err error
@@ -162,6 +167,7 @@ func New(opts *Options) (*App, error) {
 	// app owns reset because it touches BT manager + state store
 	app.server.SetSystemHandler(app)
 	app.server.SetSettingsHandler(app)
+	app.server.SetDebugHandler(app)
 
 	// mirror persisted settings into the firmware brightness conf
 	if len(app.state.Settings) > 0 {
@@ -234,6 +240,13 @@ func New(opts *Options) (*App, error) {
 		app.bt.SetOfflineRetry(!online)
 	}
 	startNetworkMonitor(app.log, app.server, onNetTransition)
+
+	app.startButtonFallback()
+	time.AfterFunc(3*time.Minute, func() {
+		if app.server.WSClients() == 0 {
+			app.log.Warnf("ui: no UI client since boot (chromium/weston down?)")
+		}
+	})
 
 	// on device voice service
 	if app.cfg.Voice.Enabled {
@@ -697,6 +710,9 @@ func (app *App) setOnlineState(online bool) {
 
 	if app.isOnline == online {
 		return
+	}
+	if app.isOnline && !online {
+		app.netDrops++ // was online, now offline: an internet drop this session
 	}
 	app.isOnline = online
 	if online {

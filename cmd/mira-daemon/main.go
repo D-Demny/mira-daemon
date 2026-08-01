@@ -40,6 +40,9 @@ func main() {
 	})
 	log.SetLevel(cfg.LogLevel)
 
+	// keep recent WARN/ERROR lines
+	daemon.InstallLogBuffer(logger)
+
 	// force ipv4
 	if tr, ok := http.DefaultTransport.(*http.Transport); ok {
 		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}

@@ -49,11 +49,17 @@ type ApiServer interface {
 
 	// while false, fast-fail 503 instead of hanging during OAuth pairing
 	SetPlayerReady(ready bool)
+	PlayerReady() bool
+	// connected /events websocket clients (0 = the on-device UI lost its socket)
+	WSClients() int
 
 	OnPlayerReady(fn func())
 
 	// /system/* uses this, nil = 503
 	SetSystemHandler(h SystemHandler)
+
+	// /debug/* uses this, nil = 503
+	SetDebugHandler(h DebugHandler)
 
 	// /settings uses this, nil = 503
 	SetSettingsHandler(h SettingsHandler)
@@ -69,6 +75,50 @@ type SystemHandler interface {
 	PerformReset()
 	PerformRestart()
 	PerformSuspend()
+}
+
+// produces the on device debug screens status snapshot + logs.
+type DebugHandler interface {
+	DebugStatus() DebugStatusPayload
+	DebugBundle() []byte
+	SendReport() (string, error)
+}
+
+// the diagnostic shown on the debug screen
+type DebugStatusPayload struct {
+	FirmwareVersion  string `json:"firmware_version"`
+	DaemonVersion    string `json:"daemon_version"`
+	UptimeSecs       int64  `json:"uptime_secs"`
+	DaemonUptimeSecs int64  `json:"daemon_uptime_secs"`
+	ClockTime        string `json:"clock_time"`
+	ClockOK          bool   `json:"clock_ok"`
+	RAMFreeMB        int    `json:"ram_free_mb"`
+	RAMTotalMB       int    `json:"ram_total_mb"`
+	DiskFreeMB       int    `json:"disk_free_mb"`
+	TempC            int    `json:"temp_c"`
+	Load1            string `json:"load_1m"`
+	WSClients        int    `json:"ws_clients"`
+
+	Online        bool   `json:"online"`
+	NetworkPath   string `json:"network_path"`
+	IP            string `json:"ip"`
+	DNSServers    int    `json:"dns_servers"`
+	USBBounces    int    `json:"usb_bounces"`
+	InternetDrops int    `json:"internet_drops"`
+	TetherHealth  string `json:"tether_health"`
+
+	Spotify string `json:"spotify"`
+
+	BluetoothDevice string `json:"bluetooth_device"`
+	PhoneVolume     string `json:"phone_volume"`
+	PhoneVolumeErr  string `json:"phone_volume_err"`
+	AndroidVolume   string `json:"android_volume"`
+
+	VoiceEnabled bool `json:"voice_enabled"`
+	VoiceReady   bool `json:"voice_ready"`
+
+	RecentProblems []string `json:"recent_problems"`
+	PreviousProblems []string `json:"previous_problems"`
 }
 
 // durable store for the frontends settings
@@ -106,6 +156,9 @@ type ConcreteApiServer struct {
 
 	sysMu sync.RWMutex
 	sysFn SystemHandler
+
+	dbgMu sync.RWMutex
+	dbgFn DebugHandler
 
 	setMu sync.RWMutex
 	setFn SettingsHandler
@@ -494,9 +547,14 @@ func (s *StubApiServer) SetAuthHandler(_ AuthStatusFunc) {}
 
 func (s *StubApiServer) SetPlayerReady(_ bool) {}
 
+func (s *StubApiServer) PlayerReady() bool { return false }
+
+func (s *StubApiServer) WSClients() int { return 0 }
+
 func (s *StubApiServer) OnPlayerReady(_ func()) {}
 
 func (s *StubApiServer) SetSystemHandler(_ SystemHandler)     {}
+func (s *StubApiServer) SetDebugHandler(_ DebugHandler)       {}
 func (s *StubApiServer) SetSettingsHandler(_ SettingsHandler) {}
 
 func (s *StubApiServer) SetBluetoothHandler(_ BluetoothHandler) {}
@@ -511,6 +569,14 @@ func (s *ConcreteApiServer) getAuthHandler() AuthStatusFunc {
 	s.authMu.RLock()
 	defer s.authMu.RUnlock()
 	return s.authFn
+}
+
+func (s *ConcreteApiServer) PlayerReady() bool { return s.playerReady.Load() }
+
+func (s *ConcreteApiServer) WSClients() int {
+	s.clientsLock.RLock()
+	defer s.clientsLock.RUnlock()
+	return len(s.clients)
 }
 
 // while false, channel-bound endpoints short-circuit instead of blocking
@@ -561,6 +627,18 @@ func (s *ConcreteApiServer) getSystemHandler() SystemHandler {
 	s.sysMu.RLock()
 	defer s.sysMu.RUnlock()
 	return s.sysFn
+}
+
+func (s *ConcreteApiServer) SetDebugHandler(h DebugHandler) {
+	s.dbgMu.Lock()
+	s.dbgFn = h
+	s.dbgMu.Unlock()
+}
+
+func (s *ConcreteApiServer) getDebugHandler() DebugHandler {
+	s.dbgMu.RLock()
+	defer s.dbgMu.RUnlock()
+	return s.dbgFn
 }
 
 func (s *ConcreteApiServer) SetSettingsHandler(h SettingsHandler) {
@@ -692,6 +770,73 @@ func (s *ConcreteApiServer) serve() {
 		}
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeStatus}, w)
+	})
+	m.HandleFunc("/debug/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		h := s.getDebugHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		_ = json.NewEncoder(w).Encode(h.DebugStatus())
+	})
+	m.HandleFunc("/debug/bundle", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		h := s.getDebugHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Disposition", `attachment; filename="mira-support-bundle.tar.gz"`)
+		_, _ = w.Write(h.DebugBundle())
+	})
+	m.HandleFunc("/debug/report", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		h := s.getDebugHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		id, err := h.SendReport()
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
+	})
+	// the frontend forwards its uncaught errors here so they land in the
+	// recent-problems ring; the UI is otherwise a black box in the field
+	m.HandleFunc("/debug/ui-error", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Message string `json:"message"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.Message == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len(body.Message) > 300 {
+			body.Message = body.Message[:300]
+		}
+		s.log.Warnf("ui: %s", body.Message)
+		w.WriteHeader(http.StatusNoContent)
 	})
 	m.HandleFunc("/observer/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {

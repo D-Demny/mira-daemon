@@ -30,6 +30,7 @@ type iap2Volume struct {
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
 	state   string
+	lastErr string
 	addr    string
 	want    string
 	stopped bool
@@ -94,9 +95,15 @@ func (v *iap2Volume) pump(stdout io.Reader, cmd *exec.Cmd) {
 			v.mu.Lock()
 			v.state = ev.State
 			v.addr = ev.Addr
+			if ev.State == "connected" {
+				v.lastErr = ""
+			}
 			v.mu.Unlock()
 			v.log.Infof("bluetooth: iap2 session %s (%s)", ev.State, ev.Addr)
 		case "error":
+			v.mu.Lock()
+			v.lastErr = ev.Error
+			v.mu.Unlock()
 			v.log.Warnf("bluetooth: iap2 sidecar: %s", ev.Error)
 		}
 	}
@@ -185,6 +192,21 @@ func (v *iap2Volume) Connected() bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.state == "connected"
+}
+
+// Status reports the iAP2 session state for diagnostics.
+// present is false when no sidecar binary was found at startup (build issue).
+func (v *iap2Volume) Status() (state, lastErr string, present bool) {
+	if v == nil {
+		return "unavailable", "", false
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	st := v.state
+	if st == "" {
+		st = "idle"
+	}
+	return st, v.lastErr, true
 }
 
 func (v *iap2Volume) Close() {
