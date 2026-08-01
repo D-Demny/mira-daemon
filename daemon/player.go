@@ -395,10 +395,12 @@ const clockSyncedFlag = "/run/clock_synced"
 
 func (p *AppPlayer) noteClusterTiming(rs *RemoteState) {
 	if !p.clockEstSeeded {
-		if _, err := os.Stat(clockSyncedFlag); err == nil {
-			p.clockEst.add(0)
-			p.clockEstSeeded = true
+		if _, err := os.Stat(clockSyncedFlag); err != nil {
+			rs.Position = rs.RemotePosition()
+			return
 		}
+		p.clockEst.add(0)
+		p.clockEstSeeded = true
 	}
 	if rs.Timestamp > 0 {
 		p.clockEst.add(rs.ReceivedAtWallMs - rs.Timestamp)
