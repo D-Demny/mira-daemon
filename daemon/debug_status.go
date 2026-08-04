@@ -92,7 +92,6 @@ func (app *App) DebugStatus() DebugStatusPayload {
 	return p
 }
 
-
 func (app *App) spotifyState() string {
 	app.state.Lock()
 	user := app.state.Credentials.Username
@@ -117,7 +116,7 @@ func firmwareVersion() string {
 	return strings.TrimSpace(string(b))
 }
 
-// reports which interface actually carries internet 
+// reports which interface actually carries internet
 func networkPathAndIP() (path, ip string) {
 	if name := defaultRouteIface(); name != "" {
 		if p, v4 := ifaceLabelAndIP(name); v4 != "" {
