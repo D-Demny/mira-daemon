@@ -71,7 +71,7 @@ type RemoteState struct {
 	Position int64
 	// when this snapshot arrived
 	ReceivedAt time.Time `json:"-"`
-	// the wall clock 
+	// the wall clock
 	ReceivedAtWallMs int64 `json:"-"`
 
 	// estimated clock offset

@@ -32,6 +32,6 @@ type AppState struct {
 	// KnownBluetoothDevices is the prioritized reconnect list managed by the bluetooth manager
 	KnownBluetoothDevices []BluetoothKnownDevice `json:"known_bluetooth_devices,omitempty"`
 
-	// Settings is the user-facing preference blob edited from the ui 
+	// Settings is the user-facing preference blob edited from the ui
 	Settings json.RawMessage `json:"settings,omitempty"`
 }

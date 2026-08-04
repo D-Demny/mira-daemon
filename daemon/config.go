@@ -13,7 +13,7 @@ type Config struct {
 	// ImageSize selects which cover-art image variant the API server returns:
 	// "default", "small", "medium", "large", "xlarge".
 	ImageSize string
-	
+
 	ReportURL string
 
 	// on device voice service

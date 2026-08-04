@@ -427,7 +427,7 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 		p.queueResolver.ResolveAsync(append(needNext, needPrev...))
 	}
 
-	// Resolve artist and album from track metadata or spclient. 
+	// Resolve artist and album from track metadata or spclient.
 	// Unofficial connect devices often send a bare URI with empty metadata
 	artistName := ""
 	albumName := ""

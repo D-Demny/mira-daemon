@@ -25,7 +25,7 @@ func NewLogBuffer(max int) *LogBuffer {
 }
 
 var (
-	globalLogBuffer *LogBuffer
+	globalLogBuffer  *LogBuffer
 	previousProblems []string
 )
 
