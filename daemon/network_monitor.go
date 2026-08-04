@@ -23,7 +23,7 @@ func linkUp(name string) bool {
 // startNetworkMonitor pings + emits network_status on transition
 func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition func(online bool)) {
 	const (
-		interval = 1 * time.Second
+		interval       = 1 * time.Second
 		failThreshold  = 3
 		rebroadcastSec = 15
 	)

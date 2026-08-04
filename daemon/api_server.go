@@ -117,7 +117,7 @@ type DebugStatusPayload struct {
 	VoiceEnabled bool `json:"voice_enabled"`
 	VoiceReady   bool `json:"voice_ready"`
 
-	RecentProblems []string `json:"recent_problems"`
+	RecentProblems   []string `json:"recent_problems"`
 	PreviousProblems []string `json:"previous_problems"`
 }
 

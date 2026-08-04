@@ -174,10 +174,10 @@ func TestRemotePosition_ClockSkewImmune(t *testing.T) {
 
 	rs := &RemoteState{
 		PositionAsOfTimestamp: 10_000,
-		Timestamp:     time.Now().Add(5 * time.Hour).UnixMilli(),
-		IsPlaying:     true,
-		PlaybackSpeed: 1,
-		ReceivedAt:    time.Now().Add(-2 * time.Second),
+		Timestamp:             time.Now().Add(5 * time.Hour).UnixMilli(),
+		IsPlaying:             true,
+		PlaybackSpeed:         1,
+		ReceivedAt:            time.Now().Add(-2 * time.Second),
 	}
 	if got := rs.RemotePosition(); got < 11_900 || got > 13_000 {
 		t.Errorf("RemotePosition with skewed server Timestamp: got %d, want ~12000 (must advance from ReceivedAt)", got)
@@ -229,13 +229,13 @@ func TestRemotePosition_StaleSnapshotAgedUnderSkew(t *testing.T) {
 	const skew = int64(-7_200_000) // local clock 2h behind server
 	rs := &RemoteState{
 		PositionAsOfTimestamp: 5_000,
-		Timestamp:        now.UnixMilli() - skew - 50_000,
-		ReceivedAt:       now.Add(-1 * time.Second),
-		ReceivedAtWallMs: now.UnixMilli() - 1_000,
-		clockOffsetMs:    skew,
-		offsetKnown:      true,
-		IsPlaying:        true,
-		PlaybackSpeed:    1,
+		Timestamp:             now.UnixMilli() - skew - 50_000,
+		ReceivedAt:            now.Add(-1 * time.Second),
+		ReceivedAtWallMs:      now.UnixMilli() - 1_000,
+		clockOffsetMs:         skew,
+		offsetKnown:           true,
+		IsPlaying:             true,
+		PlaybackSpeed:         1,
 	}
 	if got := rs.RemotePosition(); got < 54_000 || got > 56_500 {
 		t.Errorf("stale snapshot under skew: got %d, want ~55000", got)
@@ -268,8 +268,8 @@ func TestRemotePosition_MatchesLegacyOnSyncedClock(t *testing.T) {
 
 	rng := rand.New(rand.NewSource(20260720))
 	for i := 0; i < 25_000; i++ {
-		age := rng.Int63n(8 * 60 * 1000) 
-		sinceRecv := rng.Int63n(90 * 1000) 
+		age := rng.Int63n(8 * 60 * 1000)
+		sinceRecv := rng.Int63n(90 * 1000)
 		base := rng.Int63n(300_000)
 
 		now := time.Now()

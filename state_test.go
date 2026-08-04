@@ -13,9 +13,9 @@ func TestAppState_JSONRoundtripAllFields(t *testing.T) {
 
 	vol := uint32(42)
 	original := AppState{
-		DeviceId:     "device-abc",
-		EventManager: json.RawMessage(`{"foo":"bar"}`),
-		LastVolume:   &vol,
+		DeviceId:                "device-abc",
+		EventManager:            json.RawMessage(`{"foo":"bar"}`),
+		LastVolume:              &vol,
 		LastBluetoothPanAddress: "AA:BB:CC:DD:EE:FF",
 	}
 	original.Credentials.Username = "user@example.com"

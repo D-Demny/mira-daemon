@@ -133,12 +133,11 @@ func (d *Dealer) ForceReconnect() {
 	}
 	d.log.Debugf("forcing dealer reconnect")
 
-	// wake the reconnect loop out of its backoff sleep 
+	// wake the reconnect loop out of its backoff sleep
 	select {
 	case d.reconnectNow <- struct{}{}:
 	default:
 	}
-
 
 	if d.connMu.TryRLock() {
 		conn := d.conn
