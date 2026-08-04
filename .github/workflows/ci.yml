@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          drift="$(git ls-files '*.go' | xargs gofmt -l)"
+          if [ -n "$drift" ]; then
+            echo "gofmt drift in:"
+            echo "$drift"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: cross-compile for device (armv6)
+        run: ./crosscompile.sh armv6
+
+  trigger-firmware-build:
+    if: github.event_name == 'push'
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: dispatch to mira-firmware
+        env:
+          TOKEN: ${{ secrets.FIRMWARE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "FIRMWARE_DISPATCH_TOKEN not set - skipping"
+            exit 0
+          fi
+          curl -sf -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/mira-thing/mira-firmware/dispatches \
+            -d '{"event_type":"upstream-push","client_payload":{"repo":"${{ github.repository }}","sha":"${{ github.sha }}"}}'
