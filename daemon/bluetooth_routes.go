@@ -30,7 +30,7 @@ type BluetoothHandler interface {
 	PageDevice(address string) error
 
 	// phone volume
-	HIDVolumeStatus() (registered, subscribed bool)
+	HIDVolumeStatus() (registered, subscribed, subDead bool)
 	SendHIDVolumeSteps(steps int) bool
 	SendPhoneVolumeSteps(steps int) bool
 }
@@ -66,8 +66,8 @@ func registerBluetoothRoutes(log librespot.Logger, m *http.ServeMux, get func() 
 			bluetoothUnavailable(w)
 			return
 		}
-		registered, subscribed := bm.HIDVolumeStatus()
-		writeBluetoothJSON(w, map[string]bool{"registered": registered, "subscribed": subscribed})
+		registered, subscribed, subDead := bm.HIDVolumeStatus()
+		writeBluetoothJSON(w, map[string]bool{"registered": registered, "subscribed": subscribed, "sub_dead": subDead})
 	}))
 
 	m.HandleFunc("POST /bluetooth/hid/volume", trace(func(w http.ResponseWriter, r *http.Request) {
@@ -84,8 +84,8 @@ func registerBluetoothRoutes(log librespot.Logger, m *http.ServeMux, get func() 
 			return
 		}
 		sent := bm.SendHIDVolumeSteps(body.Steps)
-		registered, subscribed := bm.HIDVolumeStatus()
-		writeBluetoothJSON(w, map[string]any{"sent": sent, "registered": registered, "subscribed": subscribed})
+		registered, subscribed, subDead := bm.HIDVolumeStatus()
+		writeBluetoothJSON(w, map[string]any{"sent": sent, "registered": registered, "subscribed": subscribed, "sub_dead": subDead})
 	}))
 
 	m.HandleFunc("POST /bluetooth/discover/on", trace(func(w http.ResponseWriter, r *http.Request) {

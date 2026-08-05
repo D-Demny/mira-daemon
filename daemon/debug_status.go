@@ -79,14 +79,16 @@ func (app *App) DebugStatus() DebugStatusPayload {
 	}
 	p.PhoneVolumeErr = lastErr
 
-	reg, sub := app.bt.HIDVolumeStatus()
+	reg, sub, dead := app.bt.HIDVolumeStatus()
 	switch {
-	case reg && sub:
+	case sub:
 		p.AndroidVolume = "ready"
+	case dead:
+		p.AndroidVolume = "phone not accepting volume keys (toggle phone Bluetooth to fix)"
 	case reg:
 		p.AndroidVolume = "registered (phone not subscribed)"
 	default:
-		p.AndroidVolume = "off"
+		p.AndroidVolume = "off (" + app.bt.HIDVolumeAdvState() + ")"
 	}
 
 	return p
