@@ -43,7 +43,46 @@ type catalogSyncer struct {
 	log              logger
 	publish          func(*routedIndex)
 	onPersistedDrift func()
+	onProgress       func(catalogProgress)
 	last             time.Time
+}
+
+type catalogProgress struct {
+	Stage   string  `json:"stage"`
+	Done    int     `json:"done"`
+	Total   int     `json:"total"`
+	Percent float64 `json:"percent"`
+}
+
+var catalogStageSpans = map[string][2]float64{
+	"liked":           {0, 25},
+	"playlists":       {25, 5},
+	"artists":         {30, 4},
+	"albums":          {34, 4},
+	"playlist-tracks": {38, 52},
+	"top-artists":     {90, 2},
+	"finalizing":      {92, 8},
+}
+
+// frac < 0 means derive it from done/total
+func (s *catalogSyncer) progress(stage string, done, total int, frac float64) {
+	if s.onProgress == nil {
+		return
+	}
+	span, ok := catalogStageSpans[stage]
+	if !ok {
+		return
+	}
+	if frac < 0 {
+		frac = 0
+		if total > 0 {
+			frac = float64(done) / float64(total)
+		}
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	s.onProgress(catalogProgress{Stage: stage, Done: done, Total: total, Percent: span[0] + span[1]*frac})
 }
 
 type logger interface {
@@ -188,6 +227,7 @@ func (s *catalogSyncer) Run(ctx context.Context) (*routedIndex, error) {
 		{"playlist-tracks", s.syncPlaylistTracks},
 		{"top-artists", s.syncTopArtists},
 	}
+	s.progress("liked", 0, 0, 0)
 	for _, st := range stages {
 		if ctx.Err() != nil {
 			return s.buildIndex(ctx, cp), ctx.Err()
@@ -199,13 +239,16 @@ func (s *catalogSyncer) Run(ctx context.Context) (*routedIndex, error) {
 			// Nonfatal
 			s.log.Warnf("voice catalog: stage %q stopped: %v (falling through to searchDesktop for it)", st.name, err)
 		}
+		s.progress(st.name, 0, 0, 1)
 		s.saveCheckpoint(cp)
 		// publish a live partial index so voice improves as the sync proceeds
 		s.publish(s.buildIndex(ctx, cp))
 	}
 
+	s.progress("finalizing", 0, 0, 0)
 	idx := s.buildIndex(ctx, cp)
 	s.saveIndex(idx)
+	s.progress("finalizing", 0, 0, 1)
 	s.log.Infof("voice catalog: sync complete (tracks=%d artists=%d playlists=%d albums=%d)",
 		len(idx.Tracks), len(idx.Artists), len(idx.Playlists), len(idx.Albums))
 	return idx, nil
@@ -466,6 +509,7 @@ func (s *catalogSyncer) syncLiked(ctx context.Context, cp *checkpoint) error {
 		if len(items) < catalogPageSize || (total > 0 && cp.LikedOffset >= total) {
 			cp.LikedDone = true
 		}
+		s.progress("liked", cp.LikedOffset, cp.LikedTotal, -1)
 		s.saveCheckpoint(cp)
 	}
 	return nil
@@ -488,6 +532,7 @@ func (s *catalogSyncer) syncList(ctx context.Context, filter string, offset *int
 		if len(items) < catalogPageSize || (total > 0 && *offset >= total) {
 			*done = true
 		}
+		s.progress(strings.ToLower(filter), *offset, total, -1)
 	}
 	return nil
 }
@@ -549,6 +594,11 @@ func (s *catalogSyncer) syncPlaylistTracks(ctx context.Context, cp *checkpoint) 
 			cp.PlTracksPlIdx++
 			cp.PlTracksOffset = 0
 		}
+		within := 0.0
+		if total > 0 && cp.PlTracksOffset > 0 {
+			within = float64(cp.PlTracksOffset) / float64(total)
+		}
+		s.progress("playlist-tracks", cp.PlTracksPlIdx, n, (float64(cp.PlTracksPlIdx)+within)/float64(n))
 		s.saveCheckpoint(cp)
 	}
 	cp.PlTracksDone = true

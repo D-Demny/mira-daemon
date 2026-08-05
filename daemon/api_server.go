@@ -239,6 +239,7 @@ const (
 	ApiEventTypeBluetoothNetworkDisconnect ApiEventType = "bluetooth/network/disconnect"
 	ApiEventTypeNetworkStatus              ApiEventType = "network_status"
 	ApiEventTypeVoice                      ApiEventType = "voice"
+	ApiEventTypeSetupProgress              ApiEventType = "setup_progress"
 	ApiEventTypePing                       ApiEventType = "ping"
 )
 

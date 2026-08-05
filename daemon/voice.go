@@ -38,6 +38,8 @@ type voiceService struct {
 
 	// set while the FIRST catalog sync runs
 	firstSyncInProgress atomic.Bool
+	syncProgressMu      sync.Mutex
+	syncProgress        *catalogProgress
 
 	// wake/mic on-off
 	wakeEnabled atomic.Bool
@@ -133,6 +135,10 @@ func (v *voiceService) startCascade() {
 			len(idx.Tracks), len(idx.Artists), len(idx.Playlists), len(idx.Albums))
 	}
 
+	if !hadIndex {
+		syncer.onProgress = v.setSyncProgress
+	}
+
 	if v.cfg.CatalogSync {
 		go v.runCatalogSync(syncer, hadIndex)
 	}
@@ -174,6 +180,23 @@ func (v *voiceService) Stop() {
 	if v.cancel != nil {
 		v.cancel()
 	}
+}
+
+func (v *voiceService) setSyncProgress(p catalogProgress) {
+	v.syncProgressMu.Lock()
+	v.syncProgress = &p
+	v.syncProgressMu.Unlock()
+	v.app.server.Emit(&ApiEvent{Type: ApiEventTypeSetupProgress, Data: p})
+}
+
+func (v *voiceService) syncProgressSnapshot() *catalogProgress {
+	v.syncProgressMu.Lock()
+	defer v.syncProgressMu.Unlock()
+	if v.syncProgress == nil {
+		return nil
+	}
+	p := *v.syncProgress
+	return &p
 }
 
 func (v *voiceService) emit(state, text string) {
