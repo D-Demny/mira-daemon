@@ -65,6 +65,8 @@ func (app *App) DebugBundle() []byte {
 	add("daemon-log.txt", lines(tailFile(daemonLogPath, 500)))
 	add("chromium-log.txt", lines(tailFile("/var/log/chromium/current", 200)))
 	add("weston-log.txt", lines(tailFile("/var/log/weston/current", 100)))
+	add("clock-sync-log.txt", lines(tailFile("/var/log/clock_sync/current", 40)))
+	add("clock-floor-log.txt", lines(tailFile("/var/log/clock_floor/current", 20)))
 	add("dmesg.txt", run(5*time.Second, "sh", "-c", "dmesg | tail -n 300"))
 	add("ip-addr.txt", run(3*time.Second, "ip", "addr"))
 	add("ip-route.txt", run(3*time.Second, "ip", "route"))
