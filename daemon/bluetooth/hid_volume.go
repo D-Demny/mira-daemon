@@ -4,6 +4,8 @@ package bluetooth
 // lets car thing present itself as an input device so the connected phone accepts volume changes
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -48,6 +50,13 @@ const (
 	hidStepGap         = 80 * time.Millisecond
 	hidMaxStepsPerSend = 16
 	hidRegisterRetry   = 30 * time.Second
+
+	// bonded phone connected this long without subscribing -> nudge it once
+	hidSubscribeWatchdogDelay = 45 * time.Second
+	hidWatchdogCooldown       = 10 * time.Minute
+	hidAdvCycleGap            = 2 * time.Second
+
+	hidSuppressTTL = 20 * time.Second
 
 	hidAdvAppearanceKeyboard uint16 = 0x03C1
 )
@@ -151,6 +160,9 @@ type gattChar struct {
 	conn    *dbus.Conn
 	log     librespot.Logger
 
+	onStopNotify  func()
+	onStartNotify func()
+
 	mu        sync.Mutex
 	value     []byte
 	notifying bool
@@ -185,6 +197,9 @@ func (c *gattChar) StartNotify() *dbus.Error {
 	c.mu.Lock()
 	c.notifying = true
 	c.mu.Unlock()
+	if c.onStartNotify != nil {
+		c.onStartNotify()
+	}
 	return nil
 }
 
@@ -193,6 +208,9 @@ func (c *gattChar) StopNotify() *dbus.Error {
 	c.mu.Lock()
 	c.notifying = false
 	c.mu.Unlock()
+	if c.onStopNotify != nil {
+		c.onStopNotify()
+	}
 	return nil
 }
 
@@ -252,13 +270,30 @@ type hidVolume struct {
 	conn    *dbus.Conn
 	adapter dbus.ObjectPath
 	input   *gattChar
+	// battery-level subscription doubles as a "live GATT link" probe
+	battery *gattChar
 
 	regMu         sync.Mutex
 	appRegistered bool
 	advRegistered bool
+	// advertising both identities during initial pairing makes Android bounce
+	// between "phone" and "keyboard"
+	bondGate      bool
+	setupSuppress bool
+	suppressTimer *time.Timer
+	closed        bool
+	advFailures   int
+	// the connected phone was nudged and still won't subscribe to volume
+	subDead bool
+
+	onAdvUp func()
+
+	watchdogMu sync.Mutex
+	watchdogAt map[string]time.Time
 
 	peerConnected func() bool
 
+	pokeCh   chan struct{}
 	sendCh   chan int // signed steps
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -340,63 +375,350 @@ func newHIDVolume(log librespot.Logger, conn *dbus.Conn, adapter dbus.ObjectPath
 		return nil, fmt.Errorf("export hid advertisement props: %w", err)
 	}
 
-	return &hidVolume{
-		log:     log,
-		conn:    conn,
-		adapter: adapter,
-		input:   input,
-		sendCh:  make(chan int, 8),
-		stop:    make(chan struct{}),
-	}, nil
-}
-
-// registers with bluez and launches the send worker
-func (h *hidVolume) start() {
-	if err := h.register(); err != nil {
-		h.log.WithError(err).Warn("bluetooth: hid: registration failed, will retry in background")
-		go h.retryRegister()
-	} else {
-		h.log.Infof("bluetooth: hid: volume-key service registered and advertising")
+	h := &hidVolume{
+		log:        log,
+		conn:       conn,
+		adapter:    adapter,
+		input:      input,
+		battery:    battLevel,
+		watchdogAt: make(map[string]time.Time),
+		pokeCh:     make(chan struct{}, 1),
+		sendCh:     make(chan int, 8),
+		stop:       make(chan struct{}),
 	}
-	go h.sendWorker()
+
+	input.onStopNotify = func() {
+		h.regMu.Lock()
+		rearm := h.onAdvUp
+		h.regMu.Unlock()
+		if rearm != nil {
+			go rearm()
+		}
+	}
+	// an explicit resubscribe proves the knob works again
+	input.onStartNotify = func() { h.setSubDead(false) }
+	return h, nil
 }
 
-func (h *hidVolume) register() error {
+// registers with bluez (via the reconciler goroutine) and launches the send app
+func (h *hidVolume) start(bondExists bool, onAdvUp func()) {
 	h.regMu.Lock()
-	defer h.regMu.Unlock()
-	obj := h.conn.Object(bluezBusName, h.adapter)
-	if !h.appRegistered {
-		call := obj.Call(gattManagerIface+".RegisterApplication", 0, hidAppPath, map[string]dbus.Variant{})
-		if call.Err != nil {
-			return fmt.Errorf("register hid gatt app: %w", call.Err)
-		}
-		h.appRegistered = true
+	h.bondGate = bondExists
+	h.onAdvUp = onAdvUp
+	h.regMu.Unlock()
+	if !bondExists {
+		h.log.Infof("bluetooth: hid: no phone bonded yet, volume-key advertisement gated until first pairing completes")
 	}
-	if !h.advRegistered {
-		call := obj.Call(leAdvManagerIface+".RegisterAdvertisement", 0, hidAdvPath, map[string]dbus.Variant{})
-		if call.Err != nil {
-			return fmt.Errorf("register hid advertisement: %w", call.Err)
-		}
-		h.advRegistered = true
-	}
-	return nil
+	go h.reconcilerLoop()
+	go h.sendWorker()
+	h.poke()
 }
 
-func (h *hidVolume) retryRegister() {
-	t := time.NewTicker(hidRegisterRetry)
-	defer t.Stop()
+func (h *hidVolume) advWantedLocked() bool {
+	return h.bondGate && !h.setupSuppress
+}
+
+func (h *hidVolume) poke() {
+	select {
+	case h.pokeCh <- struct{}{}:
+	default:
+	}
+}
+
+// bluezCall invokes a bluez method with a timeout so a wedged bluetoothd can
+// never hang the reconciler forever
+func (h *hidVolume) bluezCall(method string, args ...interface{}) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dbusCallTimeout)
+	defer cancel()
+	return h.conn.Object(bluezBusName, h.adapter).CallWithContext(ctx, method, 0, args...).Err
+}
+
+// isBluezErr reports whether err is the named org.bluez.Error.*
+func isBluezErr(err error, name string) bool {
+	var dbusErr dbus.Error
+	if !errors.As(err, &dbusErr) {
+		return false
+	}
+	return dbusErr.Name == "org.bluez.Error."+name
+}
+
+func (h *hidVolume) reconcilerLoop() {
 	for {
 		select {
 		case <-h.stop:
 			return
-		case <-t.C:
-			if err := h.register(); err != nil {
-				h.log.WithError(err).Debug("bluetooth: hid: registration retry failed")
-				continue
+		case <-h.pokeCh:
+		}
+		for {
+			h.regMu.Lock()
+			settled := h.reconcileLocked()
+			h.regMu.Unlock()
+			if settled {
+				break
 			}
-			h.log.Infof("bluetooth: hid: volume-key service registered and advertising (after retry)")
+			select {
+			case <-h.stop:
+				return
+			case <-time.After(hidRegisterRetry):
+			case <-h.pokeCh:
+			}
+		}
+	}
+}
+
+// drives bluez registration toward the desired state
+func (h *hidVolume) reconcileLocked() bool {
+	if h.closed {
+		return true
+	}
+	if !h.appRegistered {
+		if err := h.bluezCall(gattManagerIface+".RegisterApplication", hidAppPath, map[string]dbus.Variant{}); err != nil && !isBluezErr(err, "AlreadyExists") {
+			h.log.WithError(err).Warn("bluetooth: hid: gatt app registration failed, will retry in background")
+			return false
+		}
+		h.appRegistered = true
+		h.log.Infof("bluetooth: hid: volume-key gatt service registered")
+	}
+	if h.advWantedLocked() && !h.advRegistered {
+		if err := h.bluezCall(leAdvManagerIface+".RegisterAdvertisement", hidAdvPath, map[string]dbus.Variant{}); err != nil && !isBluezErr(err, "AlreadyExists") {
+			h.advFailures++
+			// keep failing registrations visible in field logs
+			if h.advFailures == 1 || h.advFailures%10 == 0 {
+				h.log.WithError(err).Warnf("bluetooth: hid: advertisement registration failed (attempt %d), retrying every %s", h.advFailures, hidRegisterRetry)
+			} else {
+				h.log.WithError(err).Debug("bluetooth: hid: advertisement registration retry failed")
+			}
+			return false
+		}
+		if h.advFailures > 0 {
+			h.log.Infof("bluetooth: hid: advertisement registered after %d failed attempts", h.advFailures)
+			h.advFailures = 0
+		}
+		h.advRegistered = true
+		h.log.Infof("bluetooth: hid: volume-key advertisement up")
+		if h.onAdvUp != nil {
+			go h.onAdvUp()
+		}
+	} else if !h.advWantedLocked() && h.advRegistered {
+		if err := h.bluezCall(leAdvManagerIface+".UnregisterAdvertisement", hidAdvPath); err != nil && !isBluezErr(err, "DoesNotExist") {
+			// bluez may still be radiating the keyboard identity, keep trying
+			h.log.WithError(err).Warn("bluetooth: hid: advertisement unregister failed, will retry (identity may still be visible)")
+			return false
+		}
+		h.advRegistered = false
+		h.log.Infof("bluetooth: hid: volume-key advertisement down")
+	}
+	return true
+}
+
+func (h *hidVolume) setBondGate(open bool) {
+	h.regMu.Lock()
+	if h.closed || h.bondGate == open {
+		h.regMu.Unlock()
+		return
+	}
+	h.bondGate = open
+	h.regMu.Unlock()
+	if open {
+		h.log.Infof("bluetooth: hid: phone bond present, volume-key advertisement enabled")
+	} else {
+		h.log.Infof("bluetooth: hid: no phone bonds left, volume-key advertisement gated")
+	}
+	h.poke()
+}
+
+// pauses the advertisement while the pairing screen is open
+func (h *hidVolume) setSetupSuppress(on bool) {
+	h.regMu.Lock()
+	if h.closed {
+		h.regMu.Unlock()
+		return
+	}
+	if on {
+		if h.suppressTimer == nil {
+			h.suppressTimer = time.AfterFunc(hidSuppressTTL, h.suppressExpired)
+		} else {
+			h.suppressTimer.Reset(hidSuppressTTL)
+		}
+	} else if h.suppressTimer != nil {
+		h.suppressTimer.Stop()
+	}
+	changed := h.setupSuppress != on
+	h.setupSuppress = on
+	bonded := h.bondGate
+	h.regMu.Unlock()
+	if !changed {
+		return
+	}
+	if on {
+		h.log.Infof("bluetooth: hid: pairing screen open, pausing volume-key advertisement (single identity during setup)")
+	} else if bonded {
+		h.log.Infof("bluetooth: hid: pairing screen closed, resuming volume-key advertisement")
+	}
+	h.poke()
+}
+
+func (h *hidVolume) suppressExpired() {
+	h.regMu.Lock()
+	if h.closed || !h.setupSuppress {
+		h.regMu.Unlock()
+		return
+	}
+	h.setupSuppress = false
+	h.regMu.Unlock()
+	h.log.Warn("bluetooth: hid: pairing-screen suppression expired without discover-off, resuming volume-key advertisement")
+	h.poke()
+}
+
+// drops and re-registers the advertisement to nudge a host
+func (h *hidVolume) cycleAdv() bool {
+	if h.battery.isNotifying() {
+		h.log.Debug("bluetooth: hid: skipping advertisement cycle while phone holds the LE link (re-register would be refused)")
+		return false
+	}
+	h.regMu.Lock()
+	if h.closed || !h.advRegistered {
+		h.regMu.Unlock()
+		return false
+	}
+	if err := h.bluezCall(leAdvManagerIface+".UnregisterAdvertisement", hidAdvPath); err != nil && !isBluezErr(err, "DoesNotExist") {
+		h.log.WithError(err).Debug("bluetooth: hid: advertisement unregister failed during cycle")
+		h.regMu.Unlock()
+		return false
+	}
+	h.advRegistered = false
+	h.regMu.Unlock()
+
+	select {
+	case <-h.stop:
+		return false
+	case <-time.After(hidAdvCycleGap):
+	}
+	h.poke()
+	return true
+}
+
+// reregisters the GATT applicatio
+func (h *hidVolume) cycleApp() bool {
+	h.regMu.Lock()
+	if h.closed || !h.appRegistered {
+		h.regMu.Unlock()
+		return false
+	}
+	if err := h.bluezCall(gattManagerIface+".UnregisterApplication", hidAppPath); err != nil && !isBluezErr(err, "DoesNotExist") {
+		h.log.WithError(err).Debug("bluetooth: hid: gatt app unregister failed during cycle")
+		h.regMu.Unlock()
+		return false
+	}
+	h.appRegistered = false
+	h.regMu.Unlock()
+
+	select {
+	case <-h.stop:
+		return false
+	case <-time.After(hidAdvCycleGap):
+	}
+	h.poke()
+	return true
+}
+
+// flips whether knob sends should be reported as unusable
+func (h *hidVolume) setSubDead(dead bool) {
+	h.regMu.Lock()
+	changed := !h.closed && h.subDead != dead
+	if changed {
+		h.subDead = dead
+	}
+	h.regMu.Unlock()
+	if changed && !dead {
+		h.log.Infof("bluetooth: hid: volume-key subscription restored")
+	}
+}
+
+func (h *hidVolume) watchdogClaim(addr string, now time.Time) bool {
+	h.watchdogMu.Lock()
+	defer h.watchdogMu.Unlock()
+	if h.watchdogAt == nil {
+		h.watchdogAt = make(map[string]time.Time)
+	}
+	if t, ok := h.watchdogAt[addr]; ok && now.Sub(t) < hidWatchdogCooldown {
+		return false
+	}
+	h.watchdogAt[addr] = now
+	return true
+}
+
+// schedules a check that a connected bonded host actually subscribes to volume
+func (h *hidVolume) armSubscribeWatchdog(addr string, stillConnected func() bool) {
+
+	h.setSubDead(false)
+	h.log.Debugf("bluetooth: hid: subscribe watchdog armed for %s", addr)
+	go func() {
+		select {
+		case <-h.stop:
+			return
+		case <-time.After(hidSubscribeWatchdogDelay):
+		}
+		h.regMu.Lock()
+		ready := !h.closed && h.advWantedLocked()
+		h.regMu.Unlock()
+		h.log.Debugf("bluetooth: hid: subscribe watchdog fire check for %s: ready=%v notifying=%v connected=%v",
+			addr, ready, h.input.isNotifying(), stillConnected())
+		if !ready || h.input.isNotifying() || !stillConnected() {
 			return
 		}
+		if !h.watchdogClaim(addr, time.Now()) {
+			return
+		}
+		var nudged bool
+		if h.battery.isNotifying() {
+			h.log.Warnf("bluetooth: hid: %s connected %.0fs without subscribing to volume keys, cycling gatt app to force re-discovery",
+				addr, hidSubscribeWatchdogDelay.Seconds())
+			nudged = h.cycleApp()
+		} else {
+			h.log.Warnf("bluetooth: hid: %s connected %.0fs without subscribing to volume keys, cycling advertisement to nudge it",
+				addr, hidSubscribeWatchdogDelay.Seconds())
+			nudged = h.cycleAdv()
+		}
+		if !nudged {
+			return
+		}
+
+		select {
+		case <-h.stop:
+			return
+		case <-time.After(hidSubscribeWatchdogDelay):
+		}
+		if h.input.isNotifying() {
+			h.log.Infof("bluetooth: hid: %s subscribed to volume keys after nudge", addr)
+		} else if stillConnected() {
+			h.log.Warnf("bluetooth: hid: %s still not subscribed to volume keys after nudge, reporting knob as unusable for this phone", addr)
+			h.setSubDead(true)
+		}
+	}()
+}
+
+func (h *hidVolume) clearWatchdog(addr string) {
+	h.watchdogMu.Lock()
+	delete(h.watchdogAt, addr)
+	h.watchdogMu.Unlock()
+	h.setSubDead(false)
+}
+
+func (h *hidVolume) advState() string {
+	h.regMu.Lock()
+	defer h.regMu.Unlock()
+	switch {
+	case !h.appRegistered:
+		return "gatt service not registered"
+	case h.setupSuppress:
+		return "paused while pairing screen open"
+	case !h.bondGate:
+		return "waiting for first phone pairing"
+	case !h.advRegistered:
+		return "advertisement pending (bluez retry)"
+	default:
+		return "advertising"
 	}
 }
 
@@ -404,12 +726,16 @@ func (h *hidVolume) retryRegister() {
 func (h *hidVolume) available() bool {
 	h.regMu.Lock()
 	registered := h.appRegistered
+	dead := h.subDead
 	h.regMu.Unlock()
 	if !registered {
 		return false
 	}
 	if h.input.isNotifying() {
 		return true
+	}
+	if dead {
+		return false
 	}
 	return h.peerConnected != nil && h.peerConnected()
 }
@@ -423,7 +749,7 @@ func (h *hidVolume) sendSteps(steps int) bool {
 		return true
 	default:
 		h.log.Debug("bluetooth: hid: volume queue full, dropping step burst")
-		return false
+		return true
 	}
 }
 
@@ -462,18 +788,22 @@ func (h *hidVolume) sendWorker() {
 func (h *hidVolume) close() {
 	h.stopOnce.Do(func() { close(h.stop) })
 	h.regMu.Lock()
-	defer h.regMu.Unlock()
-	obj := h.conn.Object(bluezBusName, h.adapter)
-	if h.advRegistered {
-		if call := obj.Call(leAdvManagerIface+".UnregisterAdvertisement", 0, hidAdvPath); call.Err != nil {
-			h.log.WithError(call.Err).Debug("bluetooth: hid: advertisement unregister failed")
-		}
-		h.advRegistered = false
+	h.closed = true
+	if h.suppressTimer != nil {
+		h.suppressTimer.Stop()
 	}
-	if h.appRegistered {
-		if call := obj.Call(gattManagerIface+".UnregisterApplication", 0, hidAppPath); call.Err != nil {
-			h.log.WithError(call.Err).Debug("bluetooth: hid: gatt app unregister failed")
+	adv, app := h.advRegistered, h.appRegistered
+	h.advRegistered, h.appRegistered = false, false
+	h.regMu.Unlock()
+
+	if adv {
+		if err := h.bluezCall(leAdvManagerIface+".UnregisterAdvertisement", hidAdvPath); err != nil {
+			h.log.WithError(err).Debug("bluetooth: hid: advertisement unregister failed")
 		}
-		h.appRegistered = false
+	}
+	if app {
+		if err := h.bluezCall(gattManagerIface+".UnregisterApplication", hidAppPath); err != nil {
+			h.log.WithError(err).Debug("bluetooth: hid: gatt app unregister failed")
+		}
 	}
 }

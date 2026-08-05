@@ -148,30 +148,27 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 		return nil, fmt.Errorf("power on adapter: %w", err)
 	}
 
-	// BLE HID volume keys register here
-	if hv, err := newHIDVolume(log, conn, adapter, m.adapterAlias()); err != nil {
-		log.WithError(err).Warn("bluetooth: hid: volume key service unavailable")
-	} else {
-		m.hid = hv
-		hv.peerConnected = m.anyDeviceConnected
-		hv.start()
-	}
-
 	// ios volume path
 	m.iap2 = newIap2Volume(log)
 
 	m.monitorDisconnects()
-	m.monitorNetworkInterfaces()
 
-	go m.routeArbiterLoop()
-
-	// disconnect reasons let us tell a deliberate phone-side disconnect from a dropout
-	if err := m.watchMgmtDisconnects(); err != nil {
-		m.log.WithError(err).Warn("bluetooth: mgmt watcher unavailable, deliberate disconnects will look like dropouts")
-	}
-
-	if devs, err := m.GetDevices(); err == nil {
+	hasBond := false
+	var connectedPaired []string
+	for attempt := 1; ; attempt++ {
+		devs, err := m.GetDevices()
+		if err != nil {
+			if attempt < 3 {
+				time.Sleep(time.Second)
+				continue
+			}
+			m.log.WithError(err).Warn("bluetooth: startup device snapshot failed, HID advertisement stays gated until a pair/connect event")
+			break
+		}
 		for _, d := range devs {
+			if d.Paired {
+				hasBond = true
+			}
 			if !d.Connected {
 				continue
 			}
@@ -181,7 +178,8 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 			m.connectedSince[addr] = time.Now()
 			m.manualMu.Unlock()
 			m.log.Debugf("bluetooth: %s already connected at startup", addr)
-			if m.iap2 != nil && d.Paired {
+			if d.Paired {
+				connectedPaired = append(connectedPaired, addr)
 				go func() {
 					if m.waitForServiceUUID(addr, iap2ServiceUUID, 15*time.Second) {
 						m.log.Infof("bluetooth: %s advertises iAP2, establishing volume session", addr)
@@ -190,6 +188,28 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 				}()
 			}
 		}
+		break
+	}
+
+	// BLE HID volume keys register here
+	if hv, err := newHIDVolume(log, conn, adapter, m.adapterAlias()); err != nil {
+		log.WithError(err).Warn("bluetooth: hid: volume key service unavailable")
+	} else {
+		m.hid = hv
+		hv.peerConnected = m.anyDeviceConnected
+		hv.start(hasBond, m.sweepHIDWatchdogs)
+		for _, addr := range connectedPaired {
+			m.armHIDWatchdog(addr)
+		}
+	}
+
+	m.monitorNetworkInterfaces()
+
+	go m.routeArbiterLoop()
+
+	// disconnect reasons let us tell a deliberate phone-side disconnect from a dropout
+	if err := m.watchMgmtDisconnects(); err != nil {
+		m.log.WithError(err).Warn("bluetooth: mgmt watcher unavailable, deliberate disconnects will look like dropouts")
 	}
 
 	return m, nil
@@ -296,6 +316,19 @@ func (m *Manager) handleDevicePaired(devicePath, address string) {
 	m.clearAuthFailures(address)
 	m.clearManualDisconnect(address)
 
+	m.manualMu.Lock()
+	if !m.connectedNow[address] {
+		m.connectedNow[address] = true
+		m.connectedSince[address] = time.Now()
+	}
+	m.manualMu.Unlock()
+
+	// a completed bond ends the single identity setup window
+	if m.hid != nil {
+		m.hid.setBondGate(true)
+		m.armHIDWatchdog(address)
+	}
+
 	if m.emit != nil {
 		m.emit(EventPaired, DevicePairedPayload{Device: info})
 	}
@@ -326,6 +359,13 @@ func (m *Manager) handleDeviceConnected(devicePath, address string) {
 	// only chase PAN for paired devices, random discovering peripherals shouldn't trigger Connect
 	if info == nil || !info.Paired {
 		return
+	}
+
+	if m.hid != nil {
+		// a bonded phone connecting is proof a bond exists
+		m.hid.setBondGate(true)
+		// catches bonded hosts that connect but never subscribe to volume keys
+		m.armHIDWatchdog(address)
 	}
 
 	// ios controls volume over iap2
@@ -964,15 +1004,45 @@ func (m *Manager) SendPhoneVolumeSteps(steps int) bool {
 }
 
 // reports whether the HID service is registered with bluez
-func (m *Manager) HIDVolumeStatus() (registered, subscribed bool) {
+func (m *Manager) HIDVolumeStatus() (registered, subscribed, subDead bool) {
 	if m == nil || m.hid == nil {
-		return false, false
+		return false, false, false
 	}
 	h := m.hid
 	h.regMu.Lock()
 	registered = h.appRegistered && h.advRegistered
+	subDead = h.subDead
 	h.regMu.Unlock()
-	return registered, h.input.isNotifying()
+	return registered, h.input.isNotifying(), subDead
+}
+
+// explains the advertisement state for the debug screen
+func (m *Manager) HIDVolumeAdvState() string {
+	if m == nil || m.hid == nil {
+		return "unavailable"
+	}
+	return m.hid.advState()
+}
+
+// reports whether the address currently holds an ACL link
+func (m *Manager) isConnectedNow(address string) bool {
+	m.manualMu.Lock()
+	defer m.manualMu.Unlock()
+	return m.connectedNow[address]
+}
+
+// starts the bonded but not subscribed check for a connected phone
+func (m *Manager) armHIDWatchdog(address string) {
+	if m.hid == nil {
+		return
+	}
+	m.hid.armSubscribeWatchdog(address, func() bool {
+		if m.isConnectedNow(address) {
+			return true
+		}
+		info, err := m.GetDeviceInfo(address)
+		return err == nil && info.Connected
+	})
 }
 
 // releases bluez registrations
@@ -1030,6 +1100,11 @@ func (m *Manager) SetDiscoverable(enable bool) error {
 	if err := m.dbusCall(obj, "org.freedesktop.DBus.Properties.Set",
 		bluezAdapterInterface, "Pairable", dbus.MakeVariant(enable)).Err; err != nil {
 		return fmt.Errorf("set Pairable=%v: %w", enable, err)
+	}
+
+	// while the pairing screen is up the phone must only see one identity
+	if m.hid != nil {
+		m.hid.setSetupSuppress(enable)
 	}
 
 	m.log.Infof("bluetooth: discoverable=%v pairable=%v timeout=%d", enable, enable, timeout)
@@ -1152,7 +1227,51 @@ func (m *Manager) RemoveDevice(address string) error {
 	devicePath := formatDevicePath(m.adapter, address)
 	obj := m.conn.Object(bluezBusName, m.adapter)
 
-	return m.dbusCall(obj, bluezAdapterInterface+".RemoveDevice", devicePath).Err
+	if err := m.dbusCall(obj, bluezAdapterInterface+".RemoveDevice", devicePath).Err; err != nil {
+		return err
+	}
+
+	if m.hid != nil {
+		m.hid.clearWatchdog(address)
+		go m.refreshHIDBondGate()
+	}
+	return nil
+}
+
+// derives the HID advertising gate from BlueZ bond state
+func (m *Manager) refreshHIDBondGate() {
+	var devs []DeviceInfo
+	var err error
+	for attempt := 1; attempt <= 2; attempt++ {
+		if devs, err = m.GetDevices(); err == nil {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if err != nil {
+		m.log.WithError(err).Warn("bluetooth: hid: bond-gate refresh failed, leaving advertising gate unchanged")
+		return
+	}
+	for _, d := range devs {
+		if d.Paired {
+			m.hid.setBondGate(true)
+			return
+		}
+	}
+	m.hid.setBondGate(false)
+}
+
+// arms the subscription watchdog for every connected paired phone
+func (m *Manager) sweepHIDWatchdogs() {
+	devs, err := m.GetDevices()
+	if err != nil {
+		return
+	}
+	for _, d := range devs {
+		if d.Paired && d.Connected {
+			m.armHIDWatchdog(d.Address)
+		}
+	}
 }
 
 func (m *Manager) AcceptPairing() error { return m.agent.acceptPairing() }
@@ -1296,6 +1415,11 @@ func (m *Manager) connectNetworkInternal(address string, force bool) error {
 	m.clearManualDisconnect(address)
 	m.clearPanBackoffPause(address)
 	m.setPanSessionUp(address)
+
+	// tether has been up once -> setup is done, volume keys may advertise
+	if m.hid != nil {
+		m.hid.setBondGate(true)
+	}
 
 	go func() {
 		var name string
