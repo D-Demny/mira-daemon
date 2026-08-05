@@ -1020,20 +1020,26 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 
 	case ApiRequestTypeObserverStatus:
 		settingUp := false
+		var setupProgress *catalogProgress
 		if v := p.app.voice; v != nil && v.firstSyncInProgress.Load() {
 			settingUp = true
+			setupProgress = v.syncProgressSnapshot()
 		}
 		if p.state.remoteState == nil {
 			message := "no remote device is currently playing"
 			if settingUp {
 				message = "setting things up"
 			}
-			return map[string]any{
+			resp := map[string]any{
 				"active":     false,
 				"message":    message,
 				"setting_up": settingUp,
 				"devices":    p.connectDevicesOrEmpty(),
-			}, nil
+			}
+			if setupProgress != nil {
+				resp["setting_up_progress"] = setupProgress
+			}
+			return resp, nil
 		}
 
 		rs := p.state.remoteState
@@ -1046,7 +1052,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			lyricsUrl = fmt.Sprintf("/lyrics/%s", trackId)
 		}
 
-		return map[string]any{
+		resp := map[string]any{
 			"active":          true,
 			"device_id":       rs.DeviceId,
 			"device_name":     rs.DeviceName,
@@ -1079,7 +1085,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			"raw_metadata":    rs.RawMetadata,
 			"setting_up":      settingUp,
 			"devices":         p.connectDevicesOrEmpty(),
-		}, nil
+		}
+		if setupProgress != nil {
+			resp["setting_up_progress"] = setupProgress
+		}
+		return resp, nil
 
 	case ApiRequestTypeConnectDevices:
 		return map[string]any{"devices": p.connectDevicesOrEmpty()}, nil
