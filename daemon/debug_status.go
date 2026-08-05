@@ -25,6 +25,7 @@ func (app *App) DebugStatus() DebugStatusPayload {
 		DaemonUptimeSecs: int64(time.Since(app.startedAt).Seconds()),
 		ClockTime:        clockTime,
 		ClockOK:          clockOK,
+		ClockLastStep:    app.clockSteps.Last(),
 		RAMFreeMB:        free,
 		RAMTotalMB:       total,
 		DiskFreeMB:       diskFreeMB("/var"),

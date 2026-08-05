@@ -92,6 +92,7 @@ type DebugStatusPayload struct {
 	DaemonUptimeSecs int64  `json:"daemon_uptime_secs"`
 	ClockTime        string `json:"clock_time"`
 	ClockOK          bool   `json:"clock_ok"`
+	ClockLastStep    string `json:"clock_last_step,omitempty"`
 	RAMFreeMB        int    `json:"ram_free_mb"`
 	RAMTotalMB       int    `json:"ram_total_mb"`
 	DiskFreeMB       int    `json:"disk_free_mb"`

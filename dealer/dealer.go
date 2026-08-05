@@ -93,6 +93,7 @@ func (d *Dealer) connect(ctx context.Context) error {
 	}
 
 	addr := d.addr(ctx)
+	d.log.Debugf("connecting to dealer %s", addr)
 	if conn, _, err := websocket.Dial(ctx, fmt.Sprintf("wss://%s/?access_token=%s", addr, accessToken), &websocket.DialOptions{
 		HTTPClient: d.client,
 		HTTPHeader: http.Header{

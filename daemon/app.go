@@ -79,6 +79,9 @@ type App struct {
 	// daemon uptime
 	startedAt time.Time
 
+	// last observed clock jump
+	clockSteps clockStepTracker
+
 	closed bool
 }
 
@@ -240,6 +243,7 @@ func New(opts *Options) (*App, error) {
 		app.bt.SetOfflineRetry(!online)
 	}
 	startNetworkMonitor(app.log, app.server, onNetTransition)
+	app.startClockWatch()
 
 	app.startButtonFallback()
 	time.AfterFunc(3*time.Minute, func() {
