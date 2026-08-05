@@ -63,7 +63,7 @@ func (r *ApResolver) fetchUrls(ctx context.Context, types ...endpointType) error
 	if !anyExpired {
 		return nil
 	}
-	
+
 	r.log.Debugf("resolving from apresolve: %v", types)
 
 	query := url.Values{}
