@@ -87,7 +87,9 @@ type Manager struct {
 	hid *hidVolume
 
 	// iAP2 sidecar for ios volume
-	iap2 *iap2Volume
+	iap2         *iap2Volume
+	iap2WatchMu  sync.Mutex
+	iap2Watching map[string]bool
 }
 
 const (
@@ -180,12 +182,7 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 			m.log.Debugf("bluetooth: %s already connected at startup", addr)
 			if d.Paired {
 				connectedPaired = append(connectedPaired, addr)
-				go func() {
-					if m.waitForServiceUUID(addr, iap2ServiceUUID, 15*time.Second) {
-						m.log.Infof("bluetooth: %s advertises iAP2, establishing volume session", addr)
-						m.iap2.EnsureSession(addr)
-					}
-				}()
+				go m.ensureIap2Session(addr)
 			}
 		}
 		break
@@ -329,6 +326,8 @@ func (m *Manager) handleDevicePaired(devicePath, address string) {
 		m.armHIDWatchdog(address)
 	}
 
+	go m.ensureIap2Session(address)
+
 	if m.emit != nil {
 		m.emit(EventPaired, DevicePairedPayload{Device: info})
 	}
@@ -369,14 +368,7 @@ func (m *Manager) handleDeviceConnected(devicePath, address string) {
 	}
 
 	// ios controls volume over iap2
-	if m.iap2 != nil {
-		go func() {
-			if m.waitForServiceUUID(address, iap2ServiceUUID, 15*time.Second) {
-				m.log.Infof("bluetooth: %s advertises iAP2, establishing volume session", address)
-				m.iap2.EnsureSession(address)
-			}
-		}()
-	}
+	go m.ensureIap2Session(address)
 
 	// if we are already online, a newly connected device must not take over
 	m.panMu.Lock()
@@ -482,39 +474,83 @@ func (m *Manager) waitForNAPService(ctx context.Context, address string) (bool, 
 	}
 }
 
-// polls until the device service list carries the UUID, the device disconnects, or the timeout passes
-func (m *Manager) waitForServiceUUID(address, uuid string, timeout time.Duration) bool {
+// watches a connected phone for the iAP2 service and starts a volume session
+func (m *Manager) ensureIap2Session(address string) {
+	if m.iap2 == nil {
+		return
+	}
+	m.iap2WatchMu.Lock()
+	if m.iap2Watching == nil {
+		m.iap2Watching = make(map[string]bool)
+	}
+	if m.iap2Watching[address] {
+		m.iap2WatchMu.Unlock()
+		return
+	}
+	m.iap2Watching[address] = true
+	m.iap2WatchMu.Unlock()
+	defer func() {
+		m.iap2WatchMu.Lock()
+		delete(m.iap2Watching, address)
+		m.iap2WatchMu.Unlock()
+	}()
+
+	const rounds = 8
+	for i := 1; i <= rounds; i++ {
+		found, connected := m.waitForServiceUUID(address, iap2ServiceUUID, 15*time.Second)
+		if found {
+			m.log.Infof("bluetooth: %s advertises iAP2, establishing volume session", address)
+			m.iap2.EnsureSession(address)
+			return
+		}
+		if !connected {
+			m.log.Debugf("bluetooth: %s disconnected before advertising iAP2", address)
+			return
+		}
+		if i < rounds {
+			time.Sleep(30 * time.Second)
+		}
+	}
+	m.log.Infof("bluetooth: %s never advertised iAP2, no iPhone volume session for this connection", address)
+}
+
+// polls until the device service list carries the UUID, the device disconnects,
+// or the timeout passes
+func (m *Manager) waitForServiceUUID(address, uuid string, timeout time.Duration) (bool, bool) {
 	devicePath := formatDevicePath(m.adapter, address)
 	obj := m.conn.Object(bluezBusName, devicePath)
 
 	deadline := time.Now().Add(timeout)
+	errStreak := 0
 	for time.Now().Before(deadline) {
 		props := make(map[string]dbus.Variant)
 		if err := m.dbusCall(obj, "org.freedesktop.DBus.Properties.GetAll", bluezDeviceInterface).Store(&props); err != nil {
-			return false
+			errStreak++
+			if errStreak >= 5 {
+				m.log.WithError(err).Debugf("bluetooth: %s service lookup failing, giving up uuid wait", address)
+				return false, false
+			}
+			time.Sleep(time.Second)
+			continue
 		}
+		errStreak = 0
 		if v, ok := props["Connected"]; ok {
 			if connected, _ := v.Value().(bool); !connected {
-				return false
+				return false, false
 			}
 		}
 		if v, ok := props["UUIDs"]; ok {
 			if uuids, ok := v.Value().([]string); ok {
 				for _, u := range uuids {
 					if strings.EqualFold(u, uuid) {
-						return true
+						return true, true
 					}
 				}
 			}
 		}
-		if v, ok := props["ServicesResolved"]; ok {
-			if resolved, _ := v.Value().(bool); resolved {
-				return false
-			}
-		}
 		time.Sleep(time.Second)
 	}
-	return false
+	return false, true
 }
 
 // disconnects and reconnects the device once to retrigger the pan connection

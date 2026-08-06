@@ -26,14 +26,16 @@ type iap2Volume struct {
 	log  librespot.Logger
 	path string
 
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	state   string
-	lastErr string
-	addr    string
-	want    string
-	stopped bool
+	mu        sync.Mutex
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	state     string
+	lastErr   string
+	addr      string
+	want      string
+	stopped   bool
+	retries   int
+	retryBase time.Duration
 }
 
 func newIap2Volume(log librespot.Logger) *iap2Volume {
@@ -95,11 +97,38 @@ func (v *iap2Volume) pump(stdout io.Reader, cmd *exec.Cmd) {
 			v.mu.Lock()
 			v.state = ev.State
 			v.addr = ev.Addr
-			if ev.State == "connected" {
+			var retryIn time.Duration
+			var attempt int
+			switch ev.State {
+			case "connected":
 				v.lastErr = ""
+				v.retries = 0
+			case "disconnected":
+				// a failed handshake ends here
+				if v.want != "" && !v.stopped && v.retries < 4 {
+					v.retries++
+					attempt = v.retries
+					base := v.retryBase
+					if base == 0 {
+						base = 10 * time.Second
+					}
+					retryIn = time.Duration(attempt) * base
+				}
 			}
+			want := v.want
 			v.mu.Unlock()
 			v.log.Infof("bluetooth: iap2 session %s (%s)", ev.State, ev.Addr)
+			if retryIn > 0 {
+				v.log.Infof("bluetooth: iap2 retrying session to %s in %s (attempt %d)", want, retryIn, attempt)
+				time.AfterFunc(retryIn, func() {
+					v.mu.Lock()
+					stillWanted := v.want == want && !v.stopped && v.state != "connected"
+					v.mu.Unlock()
+					if stillWanted {
+						v.EnsureSession(want)
+					}
+				})
+			}
 		case "error":
 			v.mu.Lock()
 			v.lastErr = ev.Error
@@ -142,6 +171,9 @@ func (v *iap2Volume) EnsureSession(addr string) {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if v.want != addr {
+		v.retries = 0
+	}
 	v.want = addr
 	if err := v.ensureRunning(); err != nil {
 		v.log.WithError(err).Warn("bluetooth: iap2 sidecar unavailable")

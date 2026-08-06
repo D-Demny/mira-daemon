@@ -70,6 +70,66 @@ func TestIap2Volume_SessionLifecycle(t *testing.T) {
 	}
 }
 
+// first connect attempt fails the handshake, the supervisor must retry on its own and reach connected on the second try
+const stubSidecarFlaky = `#!/bin/sh
+echo '{"event":"ready"}'
+n=0
+while read line; do
+  case "$line" in
+    *disconnect*) echo '{"event":"state","state":"disconnected","addr":"AA:BB:CC:DD:EE:FF"}' ;;
+    *connect*)
+      n=$((n+1))
+      if [ "$n" -eq 1 ]; then
+        echo '{"event":"state","state":"negotiating","addr":"AA:BB:CC:DD:EE:FF"}'
+        echo '{"event":"error","error":"iPhone rejected our identification"}'
+        echo '{"event":"state","state":"disconnected","addr":"AA:BB:CC:DD:EE:FF"}'
+      else
+        echo '{"event":"state","state":"connected","addr":"AA:BB:CC:DD:EE:FF"}'
+      fi ;;
+  esac
+done
+`
+
+func TestIap2Volume_RetriesFailedHandshake(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "iap2-sidecar")
+	if err := os.WriteFile(path, []byte(stubSidecarFlaky), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	v := &iap2Volume{log: newTestManager().log, path: path, retryBase: 30 * time.Millisecond}
+	t.Cleanup(v.Close)
+
+	v.EnsureSession("AA:BB:CC:DD:EE:FF")
+	if !waitFor(t, 3*time.Second, v.Connected) {
+		t.Fatal("supervisor never retried its way to a connected session")
+	}
+	_, lastErr, _ := v.Status()
+	if lastErr != "" {
+		t.Fatalf("connected session must clear lastErr, still have %q", lastErr)
+	}
+}
+
+func TestIap2Volume_NoRetryAfterDrop(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "iap2-sidecar")
+	// every connect fails
+	if err := os.WriteFile(path, []byte(stubSidecarFlaky), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	v := &iap2Volume{log: newTestManager().log, path: path, retryBase: 20 * time.Millisecond}
+	t.Cleanup(v.Close)
+
+	v.EnsureSession("AA:BB:CC:DD:EE:FF")
+	v.DropSession("AA:BB:CC:DD:EE:FF")
+	time.Sleep(150 * time.Millisecond)
+	v.mu.Lock()
+	want := v.want
+	v.mu.Unlock()
+	if want != "" {
+		t.Fatalf("want must stay cleared after DropSession, got %q", want)
+	}
+}
+
 func TestIap2Volume_DropSessionIgnoresOtherAddr(t *testing.T) {
 	v := newStubIap2(t)
 

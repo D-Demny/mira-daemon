@@ -45,6 +45,11 @@ impl Iap2Connection {
         *self.running.lock().await
     }
 
+    /// Ask the connection task to stop
+    pub async fn shutdown(&self) {
+        *self.running.lock().await = false;
+    }
+
     pub fn send_hid_command(&self, command: HidCommand) -> Result<()> {
         self.hid_tx
             .send(command)

@@ -15,6 +15,7 @@ use crate::mfi_hw::HardwareMfiProvider;
 const CONNECT_ATTEMPTS: u32 = 3;
 const CONNECT_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(6);
 const STEP_GAP: std::time::Duration = std::time::Duration::from_millis(80);
+const IDENTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn adapter_mac() -> Result<Vec<u8>, String> {
     // BluetoothTransportComponent must carry the real adapter addres
@@ -68,6 +69,8 @@ fn emit_state(state: &str, addr: &str) {
 struct Active {
     addr: String,
     conn: Iap2Connection,
+    // set by the event pump once the iPhone accepts our identification
+    identified: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct Manager {
@@ -85,23 +88,38 @@ impl Manager {
         let mut guard = self.active.lock().await;
         if let Some(a) = guard.as_ref() {
             if a.addr == addr && a.conn.is_running().await {
-                emit_state("connected", &addr);
+                let state = if a.identified.load(std::sync::atomic::Ordering::Relaxed) {
+                    "connected"
+                } else {
+                    "negotiating"
+                };
+                emit_state(state, &addr);
                 return;
             }
         }
-        *guard = None;
+        if let Some(a) = guard.take() {
+            a.conn.shutdown().await;
+        }
 
         emit_state("connecting", &addr);
         match establish(&addr, channel).await {
             Ok(mut conn) => {
+                let identified = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let events =
                     std::mem::replace(&mut conn.events, tokio::sync::mpsc::unbounded_channel().1);
-                spawn_event_pump(events, addr.clone(), Arc::clone(&self.active));
+                spawn_event_pump(
+                    events,
+                    addr.clone(),
+                    Arc::clone(&self.active),
+                    Arc::clone(&identified),
+                );
                 *guard = Some(Active {
                     addr: addr.clone(),
                     conn,
+                    identified,
                 });
-                emit_state("connected", &addr);
+                // NOT connected yet
+                emit_state("negotiating", &addr);
             }
             Err(e) => {
                 emit(&serde_json::json!({"event": "error", "error": e}));
@@ -114,6 +132,7 @@ impl Manager {
         let mut guard = self.active.lock().await;
         if let Some(a) = guard.take() {
             info!("dropping iAP2 session to {}", a.addr);
+            a.conn.shutdown().await;
             emit_state("disconnected", &a.addr);
         }
     }
@@ -124,6 +143,10 @@ impl Manager {
             emit(&serde_json::json!({"event": "error", "error": "no session"}));
             return;
         };
+        if !a.identified.load(std::sync::atomic::Ordering::Relaxed) {
+            emit(&serde_json::json!({"event": "error", "error": "session not identified yet"}));
+            return;
+        }
         let hid = if steps > 0 {
             HidCommand::VolumeUp
         } else {
@@ -185,17 +208,73 @@ fn spawn_event_pump(
     mut events: tokio::sync::mpsc::UnboundedReceiver<iap2_rs::ConnectionEvent>,
     addr: String,
     active: Arc<Mutex<Option<Active>>>,
+    identified: Arc<std::sync::atomic::AtomicBool>,
 ) {
     tokio::spawn(async move {
-        while let Some(ev) = events.recv().await {
-            info!("iAP2 event: {:?}", ev);
-            if matches!(ev, iap2_rs::ConnectionEvent::Disconnected) {
-                let mut guard = active.lock().await;
-                if guard.as_ref().map(|a| a.addr == addr).unwrap_or(false) {
-                    *guard = None;
-                    emit_state("disconnected", &addr);
+        let deadline = tokio::time::Instant::now() + IDENTIFY_TIMEOUT;
+
+        // drops our session and reports disconnected
+        async fn teardown(
+            active: &Arc<Mutex<Option<Active>>>,
+            addr: &str,
+            ours: &Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            let mut guard = active.lock().await;
+            let is_ours = guard
+                .as_ref()
+                .map(|a| Arc::ptr_eq(&a.identified, ours))
+                .unwrap_or(false);
+            if is_ours {
+                if let Some(a) = guard.take() {
+                    a.conn.shutdown().await;
                 }
-                break;
+                emit_state("disconnected", addr);
+            }
+        }
+
+        loop {
+            let ev = if identified.load(std::sync::atomic::Ordering::Relaxed) {
+                events.recv().await
+            } else {
+                tokio::select! {
+                    ev = events.recv() => ev,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        emit(&serde_json::json!({"event": "error",
+                            "error": format!("iAP2 handshake timed out ({}s without identification)", IDENTIFY_TIMEOUT.as_secs())}));
+                        teardown(&active, &addr, &identified).await;
+                        return;
+                    }
+                }
+            };
+            let Some(ev) = ev else { return };
+            info!("iAP2 event: {:?}", ev);
+            match ev {
+                iap2_rs::ConnectionEvent::IdentificationAccepted => {
+                    // iPhones can send this more than once
+                    if !identified.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        emit_state("connected", &addr);
+                    }
+                }
+                iap2_rs::ConnectionEvent::IdentificationRejected => {
+                    emit(&serde_json::json!({"event": "error",
+                        "error": "iPhone rejected our identification"}));
+                    teardown(&active, &addr, &identified).await;
+                    return;
+                }
+                iap2_rs::ConnectionEvent::AuthenticationFailed { reason } => {
+                    emit(&serde_json::json!({"event": "error",
+                        "error": format!("MFi authentication failed: {}", reason)}));
+                    teardown(&active, &addr, &identified).await;
+                    return;
+                }
+                iap2_rs::ConnectionEvent::Error { error } => {
+                    emit(&serde_json::json!({"event": "error", "error": error}));
+                }
+                iap2_rs::ConnectionEvent::Disconnected => {
+                    teardown(&active, &addr, &identified).await;
+                    return;
+                }
+                _ => {}
             }
         }
     });
