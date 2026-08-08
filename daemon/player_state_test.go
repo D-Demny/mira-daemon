@@ -355,7 +355,7 @@ func TestNoteClusterTiming_RedeliveredSnapshotSampledOnce(t *testing.T) {
 	// fresh snapshot, sampled
 	p.noteClusterTiming(mk(base+100, base))
 	// the same snapshot redelivered at +70s and +110s: both stale, both
-	// share ts — must NOT confirm a resync
+	// share ts must NOT confirm a resync
 	p.noteClusterTiming(mk(base+70_000, base))
 	p.noteClusterTiming(mk(base+110_000, base))
 	if off, _ := p.clockEst.offset(); off != 0 {

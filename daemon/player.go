@@ -1052,10 +1052,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 				message = "setting things up"
 			}
 			resp := map[string]any{
-				"active":     false,
-				"message":    message,
-				"setting_up": settingUp,
-				"devices":    p.connectDevicesOrEmpty(),
+				"active":         false,
+				"message":        message,
+				"setting_up":     settingUp,
+				"devices":        p.connectDevicesOrEmpty(),
+				"utc_offset_min": p.app.utcOffsetMin(),
 			}
 			if setupProgress != nil {
 				resp["setting_up_progress"] = setupProgress
@@ -1106,6 +1107,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			"raw_metadata":    rs.RawMetadata,
 			"setting_up":      settingUp,
 			"devices":         p.connectDevicesOrEmpty(),
+			"utc_offset_min":  p.app.utcOffsetMin(),
 		}
 		if setupProgress != nil {
 			resp["setting_up_progress"] = setupProgress

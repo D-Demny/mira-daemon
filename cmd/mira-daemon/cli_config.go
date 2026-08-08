@@ -38,6 +38,9 @@ type cliConfig struct {
 
 	ReportURL string `koanf:"report_url"`
 
+	Checkin    bool   `koanf:"checkin"`
+	CheckinURL string `koanf:"checkin_url"`
+
 	Server struct {
 		Enabled     bool   `koanf:"enabled"`
 		Address     string `koanf:"address"`
@@ -87,6 +90,8 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 		ClientToken:  c.ClientToken,
 		ObserverMode: c.ObserverMode,
 		ReportURL:    c.ReportURL,
+		Checkin:      c.Checkin,
+		CheckinURL:   c.CheckinURL,
 		ImageSize:    c.Server.ImageSize,
 		Voice: daemon.VoiceConfig{
 			Enabled:              c.Voice.Enabled,
@@ -155,6 +160,9 @@ func loadCLIConfig(cfg *cliConfig) error {
 		"device_type": "computer",
 
 		"credentials.type": "interactive",
+
+		"checkin":     true,
+		"checkin_url": "https://mira-checkin.mira-thing.workers.dev",
 
 		"server.address":    "localhost",
 		"server.image_size": "default",

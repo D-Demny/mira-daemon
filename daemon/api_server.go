@@ -118,6 +118,9 @@ type DebugStatusPayload struct {
 	VoiceEnabled bool `json:"voice_enabled"`
 	VoiceReady   bool `json:"voice_ready"`
 
+	CheckinLastSuccess string `json:"checkin_last_success,omitempty"`
+	CheckinLastError   string `json:"checkin_last_error,omitempty"`
+
 	RecentProblems   []string `json:"recent_problems"`
 	PreviousProblems []string `json:"previous_problems"`
 }

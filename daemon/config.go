@@ -16,6 +16,9 @@ type Config struct {
 
 	ReportURL string
 
+	Checkin    bool
+	CheckinURL string
+
 	// on device voice service
 	Voice VoiceConfig
 

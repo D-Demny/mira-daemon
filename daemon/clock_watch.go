@@ -40,7 +40,7 @@ func (app *App) startClockWatch() {
 			time.Sleep(clockWatchInterval)
 			now := time.Now()
 			if step := wallStep(prev, now); step >= clockStepMin || step <= -clockStepMin {
-				app.log.Infof("clock: wall time jumped %+.0fs (NTP step or resume from sleep) — log timestamps before this line are offset by that amount", step.Seconds())
+				app.log.Infof("clock: wall time jumped %+.0fs (NTP step or resume from sleep), log timestamps before this line are offset by that amount", step.Seconds())
 				app.clockSteps.note(step, now)
 			}
 			prev = now
