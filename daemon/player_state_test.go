@@ -251,6 +251,7 @@ func TestClockOffsetEstimator(t *testing.T) {
 	}
 	e.add(-7_200_000 + 90_000)
 	e.add(-7_200_000 + 300)
+	e.add(-7_200_000 + 400)
 	if off, ok := e.offset(); !ok || off != -7_199_700 {
 		t.Errorf("offset: got %d ok=%v, want -7199700", off, ok)
 	}
@@ -296,21 +297,74 @@ func TestRemotePosition_MatchesLegacyOnSyncedClock(t *testing.T) {
 	}
 }
 
-func TestClockOffsetEstimator_FlushesOnClockJump(t *testing.T) {
+func TestClockOffsetEstimator_FlushesOnConfirmedClockJump(t *testing.T) {
 	t.Parallel()
 
 	var e clockOffsetEstimator
 	e.add(-4 * 3600 * 1000)
 	e.add(250)
+	e.add(300)
 	if off, ok := e.offset(); !ok || off != 250 {
-		t.Errorf("after forward jump: got %d ok=%v, want 250 (stale window flushed)", off, ok)
+		t.Errorf("after confirmed forward jump: got %d ok=%v, want 250", off, ok)
 	}
 
 	e2 := clockOffsetEstimator{}
 	e2.add(500)
 	e2.add(-3_600_000)
+	e2.add(-3_599_000)
 	if off, _ := e2.offset(); off != -3_600_000 {
-		t.Errorf("after backward jump: got %d, want -3600000", off)
+		t.Errorf("after confirmed backward jump: got %d, want -3600000", off)
+	}
+}
+
+func TestClockOffsetEstimator_IgnoresLoneStaleSnapshot(t *testing.T) {
+	t.Parallel()
+
+	var e clockOffsetEstimator
+	e.add(0)
+	e.add(120)
+	e.add(91_000) // stale snapshot, not a clock step
+	if off, ok := e.offset(); !ok || off != 0 {
+		t.Errorf("after lone stale sample: got %d ok=%v, want 0 (outlier parked)", off, ok)
+	}
+	e.add(80) // next fresh sample clears the pending outlier
+	if off, _ := e.offset(); off != 0 {
+		t.Errorf("after recovery: got %d, want 0", off)
+	}
+	e.add(95_000)
+	e.add(94_500) // a second agreeing outlier IS a resync
+	if off, _ := e.offset(); off != 94_500 {
+		t.Errorf("after confirmed resync: got %d, want 94500 (min of the pair)", off)
+	}
+}
+
+func TestNoteClusterTiming_RedeliveredSnapshotSampledOnce(t *testing.T) {
+	t.Parallel()
+
+	// the cloud redelivers the SAME snapshot as it ages; two redeliveries
+	// <60s apart would otherwise "agree" and fake a confirmed clock resync
+	// (the round-2 rewind). One estimator sample per snapshot timestamp.
+	p := &AppPlayer{}
+	p.clockEst.add(0)
+	p.clockEstSeeded = true
+
+	base := int64(1_785_990_000_000)
+	mk := func(recv, ts int64) *RemoteState {
+		return &RemoteState{Timestamp: ts, ReceivedAtWallMs: recv, ReceivedAt: time.Now()}
+	}
+	// fresh snapshot, sampled
+	p.noteClusterTiming(mk(base+100, base))
+	// the same snapshot redelivered at +70s and +110s: both stale, both
+	// share ts — must NOT confirm a resync
+	p.noteClusterTiming(mk(base+70_000, base))
+	p.noteClusterTiming(mk(base+110_000, base))
+	if off, _ := p.clockEst.offset(); off != 0 {
+		t.Errorf("redelivered snapshot poisoned the offset: got %d, want 0", off)
+	}
+	// a genuinely new snapshot samples normally
+	p.noteClusterTiming(mk(base+120_050, base+120_000))
+	if off, _ := p.clockEst.offset(); off != 0 {
+		t.Errorf("after fresh snapshot: got %d, want 0", off)
 	}
 }
 
