@@ -82,6 +82,9 @@ type App struct {
 	// last observed clock jump
 	clockSteps clockStepTracker
 
+	// check in service
+	checkinStatus checkinTracker
+
 	closed bool
 }
 
@@ -244,6 +247,8 @@ func New(opts *Options) (*App, error) {
 	}
 	startNetworkMonitor(app.log, app.server, onNetTransition)
 	app.startClockWatch()
+
+	app.startCheckin()
 
 	app.startButtonFallback()
 	time.AfterFunc(3*time.Minute, func() {

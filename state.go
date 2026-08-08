@@ -34,4 +34,7 @@ type AppState struct {
 
 	// Settings is the user-facing preference blob edited from the ui
 	Settings json.RawMessage `json:"settings,omitempty"`
+
+	// last offset from the check in service
+	UtcOffsetMin *int `json:"utc_offset_min,omitempty"`
 }
