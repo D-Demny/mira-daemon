@@ -321,6 +321,7 @@ func (rs *RemoteState) RemotePosition() int64 {
 
 type clockOffsetEstimator struct {
 	samples []int64
+	pending *int64
 }
 
 const clockOffsetWindow = 16
@@ -333,7 +334,25 @@ func (e *clockOffsetEstimator) add(sample int64) {
 			d = -d
 		}
 		if d > clockJumpFlushMs {
-			e.samples = e.samples[:0]
+			if e.pending != nil {
+				pd := sample - *e.pending
+				if pd < 0 {
+					pd = -pd
+				}
+				if pd <= clockJumpFlushMs {
+					e.samples = append(e.samples[:0], *e.pending)
+					e.pending = nil
+				} else {
+					*e.pending = sample
+					return
+				}
+			} else {
+				s := sample
+				e.pending = &s
+				return
+			}
+		} else {
+			e.pending = nil
 		}
 	}
 	e.samples = append(e.samples, sample)

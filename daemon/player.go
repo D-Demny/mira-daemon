@@ -60,6 +60,9 @@ type AppPlayer struct {
 	// so stale snapshots can be aged correctly without trusting wall time.
 	clockEst       clockOffsetEstimator
 	clockEstSeeded bool
+	// lastSampledClusterTs dedupes estimator samples: redelivered snapshots
+	// share a Timestamp and must not count as fresh clock evidence
+	lastSampledClusterTs int64
 
 	prefetchTimer *time.Timer
 
@@ -402,8 +405,9 @@ func (p *AppPlayer) noteClusterTiming(rs *RemoteState) {
 		p.clockEst.add(0)
 		p.clockEstSeeded = true
 	}
-	if rs.Timestamp > 0 {
+	if rs.Timestamp > 0 && rs.Timestamp != p.lastSampledClusterTs {
 		p.clockEst.add(rs.ReceivedAtWallMs - rs.Timestamp)
+		p.lastSampledClusterTs = rs.Timestamp
 	}
 	if off, ok := p.clockEst.offset(); ok {
 		rs.clockOffsetMs = off
@@ -419,6 +423,23 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 	}
 	p.noteClusterTiming(rs)
 	track := cluster.PlayerState.Track
+	if prev := p.state.remoteState; prev != nil && prev.TrackUri == rs.TrackUri {
+		delta := rs.RemotePosition() - prev.RemotePosition()
+		staleMs := rs.ReceivedAtWallMs - rs.Timestamp - rs.clockOffsetMs
+		if delta < -1500 && staleMs > 5000 {
+			// a backward jump sourced from a STALE snapshot is the rewind
+			// bug; a fresh-timestamp regression is just the user seeking back
+			p.app.log.Warnf("cluster: position regressed %dms on %q (posAsOf %d->%d ts %d->%d stale %dms playing=%v paused=%v)",
+				delta, rs.TrackUri, prev.PositionAsOfTimestamp, rs.PositionAsOfTimestamp,
+				prev.Timestamp, rs.Timestamp, staleMs, rs.IsPlaying, rs.IsPaused)
+		} else {
+			p.app.log.Debugf("cluster: apply %q pos %dms (delta %+dms posAsOf %d ts %d)",
+				rs.TrackUri, rs.RemotePosition(), delta, rs.PositionAsOfTimestamp, rs.Timestamp)
+		}
+	} else {
+		p.app.log.Debugf("cluster: apply new track %q pos %dms (posAsOf %d ts %d playing=%v)",
+			rs.TrackUri, rs.RemotePosition(), rs.PositionAsOfTimestamp, rs.Timestamp, rs.IsPlaying)
+	}
 
 	// Fill in any cached artist/album for the queue entries
 	if p.queueResolver != nil {
