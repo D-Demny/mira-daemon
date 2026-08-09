@@ -106,6 +106,12 @@ func (app *App) latestVersion() string {
 	return app.state.LatestVersion
 }
 
+func (app *App) updateMandatory() bool {
+	app.state.Lock()
+	defer app.state.Unlock()
+	return app.state.UpdateMandatory
+}
+
 func (app *App) latestHighlights() []string {
 	app.state.Lock()
 	defer app.state.Unlock()
@@ -183,6 +189,7 @@ func (app *App) doCheckin(ctx context.Context, version string) error {
 		UtcOffsetMin     *int     `json:"utc_offset_min"`
 		LatestVersion    *string  `json:"latest_version"`
 		LatestHighlights []string `json:"latest_highlights"`
+		UpdateMandatory  *bool    `json:"update_mandatory"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return fmt.Errorf("bad response: %w", err)
@@ -202,6 +209,11 @@ func (app *App) doCheckin(ctx context.Context, version string) error {
 	if len(out.LatestHighlights) > 0 &&
 		strings.Join(out.LatestHighlights, "\n") != strings.Join(app.state.LatestHighlights, "\n") {
 		app.state.LatestHighlights = out.LatestHighlights
+		changed = true
+	}
+	mandatory := out.UpdateMandatory != nil && *out.UpdateMandatory
+	if app.state.UpdateMandatory != mandatory {
+		app.state.UpdateMandatory = mandatory
 		changed = true
 	}
 	app.state.Unlock()
