@@ -422,6 +422,9 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 		return
 	}
 	p.noteClusterTiming(rs)
+	if dev, ok := cluster.Device[rs.DeviceId]; ok {
+		rs.DeviceName = p.deviceDisplayName(rs.DeviceId, dev)
+	}
 	track := cluster.PlayerState.Track
 	if prev := p.state.remoteState; prev != nil && prev.TrackUri == rs.TrackUri {
 		delta := rs.RemotePosition() - prev.RemotePosition()
@@ -531,6 +534,59 @@ type ConnectDevice struct {
 	CanTransfer    bool   `json:"can_transfer"`
 }
 
+func looksLikeDeviceId(s string) bool {
+	if len(s) < 16 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// the best human readable name a DeviceInfo offers
+func friendlyDeviceName(d *connectpb.DeviceInfo) string {
+	if alias, ok := d.DeviceAliases[d.SelectedAliasId]; ok && alias.GetDisplayName() != "" {
+		return alias.GetDisplayName()
+	}
+	var bestId uint32
+	best := ""
+	for id, alias := range d.DeviceAliases {
+		if alias.GetDisplayName() != "" && (best == "" || id < bestId) {
+			best, bestId = alias.GetDisplayName(), id
+		}
+	}
+	if best != "" {
+		return best
+	}
+	if d.Name != "" && !looksLikeDeviceId(d.Name) {
+		return d.Name
+	}
+	if s := strings.TrimSpace(d.Brand + " " + d.Model); s != "" && !looksLikeDeviceId(s) {
+		return s
+	}
+	return ""
+}
+
+// resolves a display name remembering the last good one per device id
+func (p *AppPlayer) deviceDisplayName(id string, d *connectpb.DeviceInfo) string {
+	if name := friendlyDeviceName(d); name != "" {
+		if p.state.connectDeviceNames == nil {
+			p.state.connectDeviceNames = map[string]string{}
+		}
+		p.state.connectDeviceNames[id] = name
+		return name
+	}
+	if cached := p.state.connectDeviceNames[id]; cached != "" {
+		return cached
+	}
+	return d.Name
+}
+
 // snapshots the selectable connect devices from a cluster
 func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
 	activeDeviceId := cluster.ActiveDeviceId
@@ -539,9 +595,13 @@ func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
 		if id == p.app.deviceId {
 			continue
 		}
+		// ghost/stale cluster entries aren't selectable, don't list them
+		if d.IsOffline && id != activeDeviceId {
+			continue
+		}
 		cd := ConnectDevice{
 			Id:          id,
-			Name:        d.Name,
+			Name:        p.deviceDisplayName(id, d),
 			Type:        d.DeviceType.String(),
 			Volume:      d.Volume,
 			IsActive:    id == activeDeviceId,
@@ -576,7 +636,7 @@ func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
 func connectDevicesSignature(devs []ConnectDevice) string {
 	var sb strings.Builder
 	for _, d := range devs {
-		fmt.Fprintf(&sb, "%s:%t:%t;", d.Id, d.IsActive, d.IsOffline)
+		fmt.Fprintf(&sb, "%s:%s:%t:%t;", d.Id, d.Name, d.IsActive, d.IsOffline)
 	}
 	return sb.String()
 }
