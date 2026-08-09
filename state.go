@@ -37,4 +37,8 @@ type AppState struct {
 
 	// last offset from the check in service
 	UtcOffsetMin *int `json:"utc_offset_min,omitempty"`
+
+	// newest release
+	LatestVersion    string   `json:"latest_version,omitempty"`
+	LatestHighlights []string `json:"latest_highlights,omitempty"`
 }
