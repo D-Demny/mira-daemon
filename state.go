@@ -41,4 +41,5 @@ type AppState struct {
 	// newest release
 	LatestVersion    string   `json:"latest_version,omitempty"`
 	LatestHighlights []string `json:"latest_highlights,omitempty"`
+	UpdateMandatory  bool     `json:"update_mandatory,omitempty"`
 }
