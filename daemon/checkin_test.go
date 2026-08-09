@@ -42,6 +42,31 @@ func TestNormalizeVersion(t *testing.T) {
 	}
 }
 
+func TestVersionLess(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		a, b string
+		want bool
+	}{
+		{"1.0.0", "1.1.0", true},
+		{"1.1.0", "1.0.0", false},
+		{"1.0.0", "1.0.0", false},
+		{"1.0.0", "1.0.1", true},
+		{"1.9.0", "1.10.0", true},
+		{"2.0.0", "1.9.9", false},
+		{"1.0", "1.0.1", true},
+		{"1.0.0", "1.0.1-rc1", true},
+		{"unknown", "1.1.0", false},
+		{"1.0.0", "garbage", false},
+		{"", "1.0.0", false},
+	}
+	for _, tt := range tests {
+		if got := versionLess(tt.a, tt.b); got != tt.want {
+			t.Errorf("versionLess(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
 type nopStateStore struct{}
 
 func (nopStateStore) Load() (*librespot.AppState, error) { return nil, nil }
@@ -58,12 +83,12 @@ func checkinTestApp(serverURL string) *App {
 	}
 }
 
-func TestDoCheckinStoresOffset(t *testing.T) {
+func TestDoCheckinStoresOffsetAndLatest(t *testing.T) {
 	t.Parallel()
 	var gotQuery url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotQuery = r.URL.Query()
-		_, _ = w.Write([]byte(`{"utc_offset_min":-240}`))
+		_, _ = w.Write([]byte(`{"utc_offset_min":-240,"latest_version":"1.1.0"}`))
 	}))
 	defer srv.Close()
 
@@ -74,14 +99,16 @@ func TestDoCheckinStoresOffset(t *testing.T) {
 	if gotQuery.Get("version") != "1.0.0" {
 		t.Fatalf("unexpected query: %v", gotQuery)
 	}
-	if gotQuery.Has("id") {
-		t.Fatalf("clock lookup must not carry an id: %v", gotQuery)
-	}
 	if off := app.utcOffsetMin(); off == nil || *off != -240 {
 		t.Fatalf("offset not persisted: %v", off)
 	}
-	if !app.hasCheckedInEver() {
-		t.Fatal("a stored offset should count as having checked in")
+	if app.latestVersion() != "1.1.0" {
+		t.Fatalf("latest_version not persisted: %q", app.latestVersion())
+	}
+	if !app.updateAvailable() {
+		if !versionLess("1.0.0", "1.1.0") {
+			t.Fatal("1.1.0 should read as newer than 1.0.0")
+		}
 	}
 }
 

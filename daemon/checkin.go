@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,37 @@ func normalizeVersion(v string) string {
 	return strings.TrimPrefix(strings.TrimSpace(v), "v")
 }
 
+func versionLess(a, b string) bool {
+	pa, oka := parseVersionParts(a)
+	pb, okb := parseVersionParts(b)
+	if !oka || !okb {
+		return false
+	}
+	for i := range pa {
+		if pa[i] != pb[i] {
+			return pa[i] < pb[i]
+		}
+	}
+	return false
+}
+
+func parseVersionParts(v string) ([3]int, bool) {
+	var out [3]int
+	if v == "" {
+		return out, false
+	}
+	parts := strings.SplitN(v, ".", 3)
+	for i, p := range parts {
+		p, _, _ = strings.Cut(p, "-")
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
 func (app *App) utcOffsetMin() *int {
 	app.state.Lock()
 	defer app.state.Unlock()
@@ -66,6 +98,28 @@ func (app *App) utcOffsetMin() *int {
 	}
 	v := *app.state.UtcOffsetMin
 	return &v
+}
+
+func (app *App) latestVersion() string {
+	app.state.Lock()
+	defer app.state.Unlock()
+	return app.state.LatestVersion
+}
+
+func (app *App) latestHighlights() []string {
+	app.state.Lock()
+	defer app.state.Unlock()
+	out := make([]string, len(app.state.LatestHighlights))
+	copy(out, app.state.LatestHighlights)
+	return out
+}
+
+func (app *App) updateAvailable() bool {
+	latest := app.latestVersion()
+	if latest == "" {
+		return false
+	}
+	return versionLess(normalizeVersion(firmwareVersion()), normalizeVersion(latest))
 }
 
 func (app *App) hasCheckedInEver() bool {
@@ -126,7 +180,9 @@ func (app *App) doCheckin(ctx context.Context, version string) error {
 	}
 
 	var out struct {
-		UtcOffsetMin *int `json:"utc_offset_min"`
+		UtcOffsetMin     *int     `json:"utc_offset_min"`
+		LatestVersion    *string  `json:"latest_version"`
+		LatestHighlights []string `json:"latest_highlights"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return fmt.Errorf("bad response: %w", err)
@@ -139,13 +195,22 @@ func (app *App) doCheckin(ctx context.Context, version string) error {
 	changed := app.state.UtcOffsetMin == nil || *app.state.UtcOffsetMin != *out.UtcOffsetMin
 	off := *out.UtcOffsetMin
 	app.state.UtcOffsetMin = &off
+	if out.LatestVersion != nil && *out.LatestVersion != "" && app.state.LatestVersion != *out.LatestVersion {
+		app.state.LatestVersion = *out.LatestVersion
+		changed = true
+	}
+	if len(out.LatestHighlights) > 0 &&
+		strings.Join(out.LatestHighlights, "\n") != strings.Join(app.state.LatestHighlights, "\n") {
+		app.state.LatestHighlights = out.LatestHighlights
+		changed = true
+	}
 	app.state.Unlock()
 
 	if changed {
 		if err := app.persistState(); err != nil {
 			app.log.WithError(err).Warn("checkin: failed to persist state")
 		}
-		app.log.Infof("checkin: utc_offset_min=%d", off)
+		app.log.Infof("checkin: utc_offset_min=%d latest_version=%s", off, app.latestVersion())
 	}
 	return nil
 }
