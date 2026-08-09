@@ -33,6 +33,9 @@ type State struct {
 	connectDevices []ConnectDevice
 	// connectDevSig identical per-second clusters dont re-emit events
 	connectDevSig string
+	// connectDeviceNames remembers the last good display name per device id,
+	// since later cluster updates can degrade a device's name to its raw id
+	connectDeviceNames map[string]string
 }
 
 // RemoteState holds information about the playback state of the currently active remote device.
