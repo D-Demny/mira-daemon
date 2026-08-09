@@ -22,6 +22,23 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+func parseRetryAfter(h http.Header) time.Duration {
+	const fallback = 10 * time.Second
+	v := h.Get("Retry-After")
+	if v == "" {
+		return fallback
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return fallback
+}
+
 func isRetryableHTTPStatus(status int) bool {
 	switch status {
 	case http.StatusInternalServerError,
@@ -346,7 +363,16 @@ func (c *Spclient) PutConnectState(ctx context.Context, spotConnId string, reqPr
 				return nil, fmt.Errorf("failed reading error response: %w", err)
 			}
 			c.log.Debugf("put state request failed with status %d: %s", resp.StatusCode, putError.Message)
-			return nil, fmt.Errorf("put state request failed with status %d: %s", resp.StatusCode, putError.Message)
+			reqErr := fmt.Errorf("put state request failed with status %d: %s", resp.StatusCode, putError.Message)
+
+			if resp.StatusCode == http.StatusTooManyRequests {
+				c.log.Warnf("put state rate limited, retry after %s", parseRetryAfter(resp.Header))
+				return nil, backoff.Permanent(reqErr)
+			}
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				return nil, backoff.Permanent(reqErr)
+			}
+			return nil, reqErr
 		}
 
 		c.log.Debugf("put connect state because %s", reqProto.PutStateReason)
