@@ -534,6 +534,55 @@ type ConnectDevice struct {
 	CanTransfer    bool   `json:"can_transfer"`
 }
 
+// defaultDeviceIdFromSettings reads the "default_device_id" field from the
+// UI settings blob. Returns empty string when unset or invalid.
+func defaultDeviceIdFromSettings(raw json.RawMessage) string {
+	if raw == nil {
+		return ""
+	}
+	var s struct {
+		DefaultDeviceId *string `json:"default_device_id"`
+	}
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	if s.DefaultDeviceId == nil || *s.DefaultDeviceId == "" {
+		return ""
+	}
+	return *s.DefaultDeviceId
+}
+
+// resolveTargetDevice determines the target device for player commands.
+// It returns (deviceId, deviceName, isOffline) where:
+//   - if default_device_id is set and available: returns that device
+//   - if default_device_id is set but offline: returns it with isOffline=true
+//   - if default_device_id is unset or not in list: falls back to active device
+func (p *AppPlayer) resolveTargetDevice() (deviceId, deviceName string, isOffline bool) {
+	defaultId := defaultDeviceIdFromSettings(p.app.state.Settings)
+	if defaultId == "" {
+		// no default configured — keep existing behaviour (active device)
+		rs := p.state.remoteState
+		if rs != nil && rs.DeviceId != "" {
+			return rs.DeviceId, rs.DeviceName, false
+		}
+		return "", "", false
+	}
+
+	// default is set — look it up in the connect device list
+	for _, d := range p.state.connectDevices {
+		if d.Id == defaultId {
+			return d.Id, d.Name, d.IsOffline
+		}
+	}
+
+	// default device not in current list — fall back to active device
+	rs := p.state.remoteState
+	if rs != nil && rs.DeviceId != "" {
+		return rs.DeviceId, rs.DeviceName, false
+	}
+	return "", "", false
+}
+
 func looksLikeDeviceId(s string) bool {
 	if len(s) < 16 {
 		return false
@@ -1190,37 +1239,73 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		return nil, p.sendTransfer(ctx, data.DeviceId)
 
 	case ApiRequestTypeResume:
-		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "resume"})
+		targetId, targetName, _ := p.resolveTargetDevice()
+		if targetId == "" {
+			return nil, fmt.Errorf("no target device for resume")
+		}
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "resume"})
 	case ApiRequestTypeResumeLast:
 		return nil, p.resumeLastDevice(ctx)
 	case ApiRequestTypePause:
-		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "pause"})
+		targetId, targetName, _ := p.resolveTargetDevice()
+		if targetId == "" {
+			return nil, fmt.Errorf("no target device for pause")
+		}
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "pause"})
 	case ApiRequestTypePlayPause:
 		// pick the endpoint from the last known playback state
 		endpoint := "resume"
 		if rs := p.state.remoteState; rs != nil && rs.IsPlaying && !rs.IsPaused {
 			endpoint = "pause"
 		}
-		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: endpoint})
+		targetId, targetName, _ := p.resolveTargetDevice()
+		if targetId == "" {
+			return nil, fmt.Errorf("no target device for playpause")
+		}
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: endpoint})
 	case ApiRequestTypeNext:
-		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "skip_next"})
+		targetId, targetName, _ := p.resolveTargetDevice()
+		if targetId == "" {
+			return nil, fmt.Errorf("no target device for next")
+		}
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "skip_next"})
 	case ApiRequestTypePrev:
-		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "skip_prev"})
+		targetId, targetName, _ := p.resolveTargetDevice()
+		if targetId == "" {
+			return nil, fmt.Errorf("no target device for prev")
+		}
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "skip_prev"})
 	case ApiRequestTypeSeek:
 		data, _ := req.Data.(ApiRequestDataSeek)
 		if data.Relative {
 			return nil, fmt.Errorf("relative seek not supported in observer mode")
 		}
-		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "seek_to", Value: data.Position})
+		targetId, targetName, _ := p.resolveTargetDevice()
+		if targetId == "" {
+			return nil, fmt.Errorf("no target device for seek")
+		}
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "seek_to", Value: data.Position})
 	case ApiRequestTypeSetShufflingContext:
 		val, _ := req.Data.(bool)
-		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "set_shuffling_context", Value: val})
+		targetId, targetName, _ := p.resolveTargetDevice()
+		if targetId == "" {
+			return nil, fmt.Errorf("no target device for shuffle")
+		}
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "set_shuffling_context", Value: val})
 	case ApiRequestTypeSetRepeatingContext:
 		val, _ := req.Data.(bool)
-		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "set_repeating_context", Value: val})
+		targetId, targetName, _ := p.resolveTargetDevice()
+		if targetId == "" {
+			return nil, fmt.Errorf("no target device for repeat context")
+		}
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "set_repeating_context", Value: val})
 	case ApiRequestTypeSetRepeatingTrack:
 		val, _ := req.Data.(bool)
-		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "set_repeating_track", Value: val})
+		targetId, targetName, _ := p.resolveTargetDevice()
+		if targetId == "" {
+			return nil, fmt.Errorf("no target device for repeat track")
+		}
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "set_repeating_track", Value: val})
 
 	case ApiRequestTypeGetVolume:
 		rs := p.state.remoteState
@@ -1259,10 +1344,14 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		return nil, p.sendActiveDeviceVolume(ctx, target)
 
 	case ApiRequestTypePlay:
-		// tell the active device to start a context
+		// tell the target device to start a context
 		data, _ := req.Data.(ApiRequestDataPlay)
 		if data.Uri == "" {
 			return nil, fmt.Errorf("play requires a context uri")
+		}
+		targetId, targetName, _ := p.resolveTargetDevice()
+		if targetId == "" {
+			return nil, fmt.Errorf("no target device for play")
 		}
 		cmd := connectCommand{
 			Endpoint: "play",
@@ -1291,8 +1380,8 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			shuf = fmt.Sprintf("%v", *data.Shuffle)
 		}
 		// TEMP diagnostic logging while verifying the play envelope on hardware.
-		p.app.log.Infof("play: context=%s skipTo=%q shuffle=%s -> active device", data.Uri, data.SkipToUri, shuf)
-		return nil, p.sendActiveDeviceCommand(ctx, cmd)
+		p.app.log.Infof("play: context=%s skipTo=%q shuffle=%s -> %s", data.Uri, data.SkipToUri, shuf, targetName)
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, cmd)
 
 	case ApiRequestTypeSearch:
 		data, _ := req.Data.(ApiRequestDataSearch)
