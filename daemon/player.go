@@ -583,6 +583,28 @@ func (p *AppPlayer) resolveTargetDevice() (deviceId, deviceName string, isOfflin
 	return "", "", false
 }
 
+// transferIfNeeded transfers playback to the default device if it differs
+// from the currently active device. Returns true if a transfer was performed.
+func (p *AppPlayer) transferIfNeeded(ctx context.Context) bool {
+	defaultId := defaultDeviceIdFromSettings(p.app.state.Settings)
+	if defaultId == "" {
+		return false
+	}
+	rs := p.state.remoteState
+	if rs == nil || rs.DeviceId == "" {
+		return false
+	}
+	if rs.DeviceId == defaultId {
+		return false
+	}
+	p.app.log.Infof("transfer: active=%s default=%s — transferring playback", rs.DeviceId, defaultId)
+	if err := p.sendTransfer(ctx, defaultId); err != nil {
+		p.app.log.Warnf("transfer to default device %s failed: %v", defaultId, err)
+		return false
+	}
+	return true
+}
+
 func looksLikeDeviceId(s string) bool {
 	if len(s) < 16 {
 		return false
@@ -1245,6 +1267,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "resume"})
 	case ApiRequestTypeResumeLast:
+		p.transferIfNeeded(ctx)
 		return nil, p.resumeLastDevice(ctx)
 	case ApiRequestTypePause:
 		targetId, targetName, _ := p.resolveTargetDevice()
@@ -1349,6 +1372,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if data.Uri == "" {
 			return nil, fmt.Errorf("play requires a context uri")
 		}
+		p.transferIfNeeded(ctx)
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
 			return nil, fmt.Errorf("no target device for play")
