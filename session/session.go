@@ -3,8 +3,12 @@ package session
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -31,10 +35,13 @@ type Session struct {
 	sp     *spclient.Spclient
 	dealer *dealer.Dealer
 
-	// oauthToken is the OAuth access token from the device flow.
-	// It has user scopes (playlist-read, etc.) and is used for Web API calls.
+	// oauthTokens holds the OAuth access token and refresh token.
+	// Used for Web API calls (has user scopes like playlist-read).
 	// Unlike the Login5 token (Spotify Connect only), it works with api.spotify.com.
-	oauthToken librespot.GetLogin5TokenFunc
+	oauthMu        sync.Mutex
+	oauthToken     string
+	oauthRefresh   string
+	oauthExpiresAt time.Time
 }
 
 func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error) {
@@ -99,24 +106,31 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 	case InteractiveCredentials:
 		// device flow, user authorizes via the QR URL we send to AuthURLCallback.
 		// username left empty, AP fills it via APWelcome from the token itself
-		oauthAccessToken, err := runDeviceAuthFlow(ctx, opts.Log, s.client, opts.AuthURLCallback)
+		oauthTokens, err := runDeviceAuthFlow(ctx, opts.Log, s.client, opts.AuthURLCallback)
 		if err != nil {
 			return nil, fmt.Errorf("device authorization flow failed: %w", err)
 		}
 
-		if err := s.ap.ConnectSpotifyToken(ctx, "", oauthAccessToken); err != nil {
+		if err := s.ap.ConnectSpotifyToken(ctx, "", oauthTokens.AccessToken); err != nil {
 			return nil, fmt.Errorf("failed authenticating accesspoint interactively: %w", err)
 		}
 
-		// Store OAuth token for Web API calls (has user scopes like playlist-read)
+		// Store OAuth tokens for Web API calls (has user scopes like playlist-read)
 		// instead of Login5 token (Spotify Connect only, no user scopes)
-		s.oauthToken = func(ctx context.Context, force bool) (string, error) {
-			return oauthAccessToken, nil
-		}
+		s.oauthMu.Lock()
+		s.oauthToken = oauthTokens.AccessToken
+		s.oauthRefresh = oauthTokens.RefreshToken
+		s.oauthExpiresAt = oauthTokens.ExpiresAt
+		s.oauthMu.Unlock()
 	case SpotifyTokenCredentials:
 		if err := s.ap.ConnectSpotifyToken(ctx, creds.Username, creds.Token); err != nil {
 			return nil, fmt.Errorf("failed authenticating accesspoint with username and spotify token: %w", err)
 		}
+		// creds.Token IS the OAuth token — store it for Web API calls
+		s.oauthMu.Lock()
+		s.oauthToken = creds.Token
+		s.oauthExpiresAt = time.Now().Add(30 * time.Minute)
+		s.oauthMu.Unlock()
 	case BlobCredentials:
 		if err := s.ap.ConnectBlob(ctx, creds.Username, creds.Blob); err != nil {
 			return nil, fmt.Errorf("failed authenticating accesspoint with blob: %w", err)
@@ -134,11 +148,11 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 	}
 
 	// initialize spclient
-	// Pass OAuth token for Web API calls (has user scopes)
+	// Pass OAuth token function for Web API calls (has user scopes)
 	// Login5 token is used for Spotify Connect (no user scopes)
 	if spAddr, err := s.resolver.GetSpclient(ctx); err != nil {
 		return nil, fmt.Errorf("failed getting spclient from resolver: %w", err)
-	} else if s.sp, err = spclient.NewSpclient(ctx, opts.Log, s.client, spAddr, s.login5.AccessToken(), s.oauthToken, s.deviceId, s.clientToken); err != nil {
+	} else if s.sp, err = spclient.NewSpclient(ctx, opts.Log, s.client, spAddr, s.login5.AccessToken(), s.oauthTokenFunc(), s.deviceId, s.clientToken); err != nil {
 		return nil, fmt.Errorf("failed initializing spclient: %w", err)
 	}
 
@@ -155,4 +169,65 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 func (s *Session) Close() {
 	s.dealer.Close()
 	s.ap.Close()
+}
+
+// oauthTokenFunc returns a function that provides the OAuth access token.
+// It handles token refresh using the refresh token when the access token expires.
+func (s *Session) oauthTokenFunc() librespot.GetLogin5TokenFunc {
+	return func(ctx context.Context, force bool) (string, error) {
+		s.oauthMu.Lock()
+		defer s.oauthMu.Unlock()
+
+		// Force refresh or token expired — need to refresh
+		if force || time.Now().After(s.oauthExpiresAt) {
+			if s.oauthRefresh == "" {
+				return "", fmt.Errorf("OAuth: no refresh token available")
+			}
+			if err := s.refreshOAuthToken(); err != nil {
+				return "", err
+			}
+		}
+		return s.oauthToken, nil
+	}
+}
+
+func (s *Session) refreshOAuthToken() error {
+	if s.oauthRefresh == "" {
+		return fmt.Errorf("OAuth: no refresh token available")
+	}
+
+	body := fmt.Sprintf("grant_type=refresh_token&refresh_token=%s", s.oauthRefresh)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		"https://accounts.spotify.com/api/token", strings.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed building OAuth refresh request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("OAuth refresh request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("OAuth refresh returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var tok struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tok); err != nil {
+		return fmt.Errorf("OAuth refresh decode failed: %w", err)
+	}
+
+	s.oauthToken = tok.AccessToken
+	if tok.RefreshToken != "" {
+		s.oauthRefresh = tok.RefreshToken
+	}
+	s.oauthExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	return nil
 }

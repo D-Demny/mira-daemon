@@ -94,6 +94,10 @@ func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.
 }
 
 func (c *Spclient) innerRequestWithToken(ctx context.Context, method string, reqUrl *url.URL, query url.Values, header http.Header, body []byte, getToken librespot.GetLogin5TokenFunc) (*http.Response, error) {
+	if getToken == nil {
+		return nil, fmt.Errorf("spclient: token function is nil")
+	}
+
 	if query != nil {
 		reqUrl.RawQuery = query.Encode()
 	}
@@ -176,7 +180,7 @@ func (c *Spclient) innerRequestWithToken(ctx context.Context, method string, req
 		}
 
 		return resp, nil
-	}, backoff.WithContext(backoff.NewExponentialBackOff(), ctx))
+	}, backoff.WithContext(backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 5), ctx))
 	if err != nil {
 		return nil, fmt.Errorf("spclient request failed: %w", err)
 	}
@@ -196,7 +200,13 @@ func (c *Spclient) WebApiRequest(ctx context.Context, method string, path string
 	reqURL := reqPath.JoinPath(path)
 	// Use OAuth token for Web API (has user scopes like playlist-read)
 	// instead of the Login5 token (Spotify Connect only, no user scopes)
-	return c.innerRequestWithToken(ctx, method, reqURL, query, header, body, c.oauthToken)
+	// Fall back to Login5 token if OAuth token not available (e.g., BlobCredentials)
+	tokenFunc := c.oauthToken
+	if tokenFunc == nil {
+		c.log.Warnf("spclient: oauth token not available, falling back to Login5 token for Web API")
+		tokenFunc = c.accessToken
+	}
+	return c.innerRequestWithToken(ctx, method, reqURL, query, header, body, tokenFunc)
 }
 
 func (c *Spclient) Request(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
