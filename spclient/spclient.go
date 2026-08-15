@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -181,6 +182,12 @@ func (c *Spclient) WebApiRequest(ctx context.Context, method string, path string
 	reqPath, err := url.Parse("https://api.spotify.com/")
 	if err != nil {
 		panic("invalid api base url")
+	}
+	// Spotify Web API requires /v1/ prefix
+	if path != "" && !strings.HasPrefix(path, "/") {
+		path = "v1/" + path
+	} else if path != "" && strings.HasPrefix(path, "/") {
+		path = "v1" + path
 	}
 	reqURL := reqPath.JoinPath(path)
 	return c.innerRequest(ctx, method, reqURL, query, header, body)
