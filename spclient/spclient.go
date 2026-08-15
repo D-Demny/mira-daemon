@@ -141,6 +141,10 @@ func (c *Spclient) innerRequestWithToken(ctx context.Context, method string, req
 			// nothing we can do.
 			return nil, backoff.Permanent(fmt.Errorf("failed obtaining spclient access token: %w", err))
 		}
+		if accessToken == "" {
+			c.log.Errorf("spclient: getToken returned empty token, aborting request")
+			return nil, backoff.Permanent(fmt.Errorf("getToken returned empty token"))
+		}
 
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 
@@ -206,6 +210,7 @@ func (c *Spclient) WebApiRequest(ctx context.Context, method string, path string
 		c.log.Warnf("spclient: oauth token not available, falling back to Login5 token for Web API")
 		tokenFunc = c.accessToken
 	}
+	c.log.Debugf("spclient: WebApiRequest %s %s", method, reqURL.String())
 	return c.innerRequestWithToken(ctx, method, reqURL, query, header, body, tokenFunc)
 }
 
