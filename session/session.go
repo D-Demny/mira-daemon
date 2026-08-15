@@ -173,15 +173,20 @@ func (s *Session) Close() {
 
 // oauthTokenFunc returns a function that provides the OAuth access token.
 // It handles token refresh using the refresh token when the access token expires.
+// If no refresh token is available (old credentials), it returns the stored token
+// without attempting refresh — the token may be stale but won't cause a crash.
 func (s *Session) oauthTokenFunc() librespot.GetLogin5TokenFunc {
 	return func(ctx context.Context, force bool) (string, error) {
 		s.oauthMu.Lock()
 		defer s.oauthMu.Unlock()
 
-		// Force refresh or token expired — need to refresh
+		// Force refresh requested or token expired
 		if force || time.Now().After(s.oauthExpiresAt) {
+			// No refresh token available (old credentials format) —
+			// return the stored token as-is. Spotify may reject it, but
+			// we won't crash with an unhandled error.
 			if s.oauthRefresh == "" {
-				return "", fmt.Errorf("OAuth: no refresh token available")
+				return s.oauthToken, nil
 			}
 			if err := s.refreshOAuthToken(); err != nil {
 				return "", err
