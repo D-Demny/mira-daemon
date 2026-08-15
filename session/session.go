@@ -195,7 +195,7 @@ func (s *Session) oauthTokenFunc() librespot.GetLogin5TokenFunc {
 				return s.oauthToken, nil
 			}
 			if err := s.refreshOAuthToken(); err != nil {
-				return "", err
+				return s.oauthToken, nil
 			}
 		}
 		return s.oauthToken, nil
