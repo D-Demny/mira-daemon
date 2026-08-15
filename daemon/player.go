@@ -1119,8 +1119,10 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 
 	case ApiRequestTypeWebApi:
 		data := req.Data.(ApiRequestDataWebApi)
+		p.app.log.Debugf("web-api: %s %s", data.Method, data.Path)
 		resp, err := p.sess.WebApi(ctx, data.Method, data.Path, data.Query, nil, nil)
 		if err != nil {
+			p.app.log.Errorf("web-api: %s %s failed: %v", data.Method, data.Path, err)
 			return nil, fmt.Errorf("failed to send web api request: %w", err)
 		}
 		defer func() { _ = resp.Body.Close() }()
@@ -1143,13 +1145,16 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			if err != nil {
 				return nil, fmt.Errorf("failed to read response body: %w", err)
 			}
+			p.app.log.Debugf("web-api: %s %s returned non-JSON (%d bytes)", data.Method, data.Path, len(respBody))
 			return respBody, nil
 		}
 
 		var respJson any
 		if err = json.NewDecoder(resp.Body).Decode(&respJson); err != nil {
+			p.app.log.Errorf("web-api: %s %s decode error: %v", data.Method, data.Path, err)
 			return nil, fmt.Errorf("failed to decode response body: %w", err)
 		}
+		p.app.log.Debugf("web-api: %s %s success (status %d)", data.Method, data.Path, resp.StatusCode)
 		return respJson, nil
 
 	case ApiRequestTypeStatus:

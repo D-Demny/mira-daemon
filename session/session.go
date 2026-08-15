@@ -28,6 +28,8 @@ type Session struct {
 
 	client *http.Client
 
+	log librespot.Logger
+
 	resolver *apresolve.ApResolver
 	login5   *login5.Login5
 
@@ -37,7 +39,7 @@ type Session struct {
 
 	// oauthTokens holds the OAuth access token and refresh token.
 	// Used for Web API calls (has user scopes like playlist-read).
-	// Unlike the Login5 token (Spotify Connect only), it works with api.spotify.com.
+	// Unlike the Login5 token (Spotify Connect only, no user scopes), it works with api.spotify.com.
 	oauthMu        sync.Mutex
 	oauthToken     string
 	oauthRefresh   string
@@ -61,6 +63,7 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 		deviceType: opts.DeviceType,
 		deviceId:   opts.DeviceId,
 		client:     opts.Client,
+		log:        opts.Log,
 	}
 
 	if s.client == nil {
@@ -122,6 +125,9 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 		s.oauthRefresh = oauthTokens.RefreshToken
 		s.oauthExpiresAt = oauthTokens.ExpiresAt
 		s.oauthMu.Unlock()
+		opts.Log.Infof("OAuth: device flow complete (access_token=%d chars, refresh_token=%d chars, expires_in=%ds)",
+			len(oauthTokens.AccessToken), len(oauthTokens.RefreshToken),
+			int(time.Until(oauthTokens.ExpiresAt).Seconds()))
 	case SpotifyTokenCredentials:
 		if err := s.ap.ConnectSpotifyToken(ctx, creds.Username, creds.Token); err != nil {
 			return nil, fmt.Errorf("failed authenticating accesspoint with username and spotify token: %w", err)
@@ -179,24 +185,33 @@ func (s *Session) Close() {
 
 // oauthTokenFunc returns a function that provides the OAuth access token.
 // It handles token refresh using the refresh token when the access token expires.
-// If no refresh token is available (old credentials), it returns the stored token
-// without attempting refresh — the token may be stale but won't cause a crash.
 func (s *Session) oauthTokenFunc() librespot.GetLogin5TokenFunc {
 	return func(ctx context.Context, force bool) (string, error) {
 		s.oauthMu.Lock()
-		defer s.oauthMu.Unlock()
+		remaining := time.Until(s.oauthExpiresAt)
+		hasRefresh := s.oauthRefresh != ""
+		s.oauthMu.Unlock()
 
-		// Force refresh requested or token expired
 		if force || time.Now().After(s.oauthExpiresAt) {
-			// No refresh token available (old credentials format) —
-			// return the stored token as-is. Spotify may reject it, but
-			// we won't crash with an unhandled error.
+			s.log.Infof("OAuth: token %s (refresh token available: %v)", 
+				func() string { if force { return "force refresh" } else { return "expired" } }(), hasRefresh)
+			
 			if s.oauthRefresh == "" {
-				return s.oauthToken, nil
+				if s.oauthToken != "" {
+					s.log.Warnf("OAuth: no refresh token, using stale token (expires in %v)", remaining)
+					return s.oauthToken, nil
+				}
+				return "", fmt.Errorf("OAuth: no refresh token and no valid access token available, re-authentication required")
 			}
 			if err := s.refreshOAuthToken(); err != nil {
-				return s.oauthToken, nil
+				s.log.Errorf("OAuth: refresh failed: %v", err)
+				if s.oauthToken != "" {
+					s.log.Warnf("OAuth: falling back to stale token (expires in %v)", remaining)
+					return s.oauthToken, nil
+				}
+				return "", fmt.Errorf("OAuth: refresh failed and no stale token available: %w", err)
 			}
+			return s.oauthToken, nil
 		}
 		return s.oauthToken, nil
 	}
@@ -215,6 +230,7 @@ func (s *Session) refreshOAuthToken() error {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
+	s.log.Infof("OAuth: refreshing access token")
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("OAuth refresh request failed: %w", err)
@@ -223,6 +239,7 @@ func (s *Session) refreshOAuthToken() error {
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
+		s.log.Errorf("OAuth: refresh returned status %d: %s", resp.StatusCode, string(bodyBytes))
 		return fmt.Errorf("OAuth refresh returned status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
@@ -240,5 +257,6 @@ func (s *Session) refreshOAuthToken() error {
 		s.oauthRefresh = tok.RefreshToken
 	}
 	s.oauthExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	s.log.Infof("OAuth: token refreshed successfully (expires in %ds)", tok.ExpiresIn)
 	return nil
 }
