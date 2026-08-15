@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/ap"
 	"github.com/devgianlu/go-librespot/apresolve"
 	"github.com/devgianlu/go-librespot/dealer"
@@ -29,6 +30,11 @@ type Session struct {
 	ap     *ap.Accesspoint
 	sp     *spclient.Spclient
 	dealer *dealer.Dealer
+
+	// oauthToken is the OAuth access token from the device flow.
+	// It has user scopes (playlist-read, etc.) and is used for Web API calls.
+	// Unlike the Login5 token (Spotify Connect only), it works with api.spotify.com.
+	oauthToken librespot.GetLogin5TokenFunc
 }
 
 func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error) {
@@ -93,13 +99,19 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 	case InteractiveCredentials:
 		// device flow, user authorizes via the QR URL we send to AuthURLCallback.
 		// username left empty, AP fills it via APWelcome from the token itself
-		accessToken, err := runDeviceAuthFlow(ctx, opts.Log, s.client, opts.AuthURLCallback)
+		oauthAccessToken, err := runDeviceAuthFlow(ctx, opts.Log, s.client, opts.AuthURLCallback)
 		if err != nil {
 			return nil, fmt.Errorf("device authorization flow failed: %w", err)
 		}
 
-		if err := s.ap.ConnectSpotifyToken(ctx, "", accessToken); err != nil {
+		if err := s.ap.ConnectSpotifyToken(ctx, "", oauthAccessToken); err != nil {
 			return nil, fmt.Errorf("failed authenticating accesspoint interactively: %w", err)
+		}
+
+		// Store OAuth token for Web API calls (has user scopes like playlist-read)
+		// instead of Login5 token (Spotify Connect only, no user scopes)
+		s.oauthToken = func(ctx context.Context, force bool) (string, error) {
+			return oauthAccessToken, nil
 		}
 	case SpotifyTokenCredentials:
 		if err := s.ap.ConnectSpotifyToken(ctx, creds.Username, creds.Token); err != nil {
@@ -122,9 +134,11 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 	}
 
 	// initialize spclient
+	// Pass OAuth token for Web API calls (has user scopes)
+	// Login5 token is used for Spotify Connect (no user scopes)
 	if spAddr, err := s.resolver.GetSpclient(ctx); err != nil {
 		return nil, fmt.Errorf("failed getting spclient from resolver: %w", err)
-	} else if s.sp, err = spclient.NewSpclient(ctx, opts.Log, s.client, spAddr, s.login5.AccessToken(), s.deviceId, s.clientToken); err != nil {
+	} else if s.sp, err = spclient.NewSpclient(ctx, opts.Log, s.client, spAddr, s.login5.AccessToken(), s.oauthToken, s.deviceId, s.clientToken); err != nil {
 		return nil, fmt.Errorf("failed initializing spclient: %w", err)
 	}
 

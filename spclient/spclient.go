@@ -63,6 +63,7 @@ type Spclient struct {
 	deviceId    string
 
 	accessToken librespot.GetLogin5TokenFunc
+	oauthToken  librespot.GetLogin5TokenFunc
 
 	// WebPlayer client-token for the Pathfinder gateway, minted + cached
 	// separately from the native client-token above.
@@ -71,7 +72,7 @@ type Spclient struct {
 	webClientTokenMu  sync.Mutex
 }
 
-func NewSpclient(ctx context.Context, log librespot.Logger, client *http.Client, addr librespot.GetAddressFunc, accessToken librespot.GetLogin5TokenFunc, deviceId, clientToken string) (*Spclient, error) {
+func NewSpclient(ctx context.Context, log librespot.Logger, client *http.Client, addr librespot.GetAddressFunc, accessToken librespot.GetLogin5TokenFunc, oauthToken librespot.GetLogin5TokenFunc, deviceId, clientToken string) (*Spclient, error) {
 	baseUrl, err := url.Parse(fmt.Sprintf("https://%s/", addr(ctx)))
 	if err != nil {
 		return nil, fmt.Errorf("invalid spclient base url: %w", err)
@@ -84,10 +85,15 @@ func NewSpclient(ctx context.Context, log librespot.Logger, client *http.Client,
 		clientToken: clientToken,
 		deviceId:    deviceId,
 		accessToken: accessToken,
+		oauthToken:  oauthToken,
 	}, nil
 }
 
 func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.URL, query url.Values, header http.Header, body []byte) (*http.Response, error) {
+	return c.innerRequestWithToken(ctx, method, reqUrl, query, header, body, c.accessToken)
+}
+
+func (c *Spclient) innerRequestWithToken(ctx context.Context, method string, reqUrl *url.URL, query url.Values, header http.Header, body []byte, getToken librespot.GetLogin5TokenFunc) (*http.Response, error) {
 	if query != nil {
 		reqUrl.RawQuery = query.Encode()
 	}
@@ -125,7 +131,7 @@ func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.
 			req.Body, _ = req.GetBody()
 		}
 
-		accessToken, err := c.accessToken(ctx, forceNewToken)
+		accessToken, err := getToken(ctx, forceNewToken)
 		if err != nil {
 			// Fail with a permanent error if we can't get a new token. The caller should have already retried, there's
 			// nothing we can do.
@@ -188,7 +194,9 @@ func (c *Spclient) WebApiRequest(ctx context.Context, method string, path string
 		path = "v1/" + path
 	}
 	reqURL := reqPath.JoinPath(path)
-	return c.innerRequest(ctx, method, reqURL, query, header, body)
+	// Use OAuth token for Web API (has user scopes like playlist-read)
+	// instead of the Login5 token (Spotify Connect only, no user scopes)
+	return c.innerRequestWithToken(ctx, method, reqURL, query, header, body, c.oauthToken)
 }
 
 func (c *Spclient) Request(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
