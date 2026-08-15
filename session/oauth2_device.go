@@ -45,19 +45,26 @@ type deviceTokenResponse struct {
 
 var errDeviceTokenPollTransient = errors.New("transient device token poll failure")
 
+// oauthTokens holds the OAuth access token, refresh token, and expiration time
+type oauthTokens struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresAt    time.Time
+}
+
 // runDeviceAuthFlow blocks until user authorizes / code expires / ctx cancel.
 // urlCallback fires once with the verification URI so the caller can render
-// a QR code while polling. returns just the access token, username comes back
-// from the AP via APWelcome
+// a QR code while polling. returns the oauthTokens (access + refresh), username
+// comes back from the AP via APWelcome
 func runDeviceAuthFlow(
 	ctx context.Context,
 	log librespot.Logger,
 	client *http.Client,
 	urlCallback func(url string),
-) (string, error) {
+) (*oauthTokens, error) {
 	auth, err := requestDeviceCode(ctx, client)
 	if err != nil {
-		return "", fmt.Errorf("requesting device code: %w", err)
+		return nil, fmt.Errorf("requesting device code: %w", err)
 	}
 
 	log.Infof("open %s on your phone to authorize this device", auth.VerificationURIComplete)
@@ -78,12 +85,12 @@ func runDeviceAuthFlow(
 	for {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return nil, ctx.Err()
 		case <-time.After(interval):
 		}
 
 		if time.Now().After(deadline) {
-			return "", fmt.Errorf("device code expired before user authorized")
+			return nil, fmt.Errorf("device code expired before user authorized")
 		}
 
 		tok, err := pollDeviceToken(ctx, client, auth.DeviceCode)
@@ -92,13 +99,17 @@ func runDeviceAuthFlow(
 				log.WithError(err).Warn("device auth token poll failed transiently; keeping current QR code")
 				continue
 			}
-			return "", err
+			return nil, err
 		}
 		if tok == nil {
 			continue
 		}
 
-		return tok.AccessToken, nil
+		return &oauthTokens{
+			AccessToken:  tok.AccessToken,
+			RefreshToken: tok.RefreshToken,
+			ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second),
+		}, nil
 	}
 }
 
