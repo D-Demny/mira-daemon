@@ -150,9 +150,15 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 	// initialize spclient
 	// Pass OAuth token function for Web API calls (has user scopes)
 	// Login5 token is used for Spotify Connect (no user scopes)
+	// Only use OAuth token if we have one (InteractiveCredentials or SpotifyTokenCredentials)
+	// StoredCredentials and BlobCredentials fall back to Login5 token
+	var oauthFunc librespot.GetLogin5TokenFunc
+	if s.oauthToken != "" {
+		oauthFunc = s.oauthTokenFunc()
+	}
 	if spAddr, err := s.resolver.GetSpclient(ctx); err != nil {
 		return nil, fmt.Errorf("failed getting spclient from resolver: %w", err)
-	} else if s.sp, err = spclient.NewSpclient(ctx, opts.Log, s.client, spAddr, s.login5.AccessToken(), s.oauthTokenFunc(), s.deviceId, s.clientToken); err != nil {
+	} else if s.sp, err = spclient.NewSpclient(ctx, opts.Log, s.client, spAddr, s.login5.AccessToken(), oauthFunc, s.deviceId, s.clientToken); err != nil {
 		return nil, fmt.Errorf("failed initializing spclient: %w", err)
 	}
 
