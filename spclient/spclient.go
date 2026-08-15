@@ -45,7 +45,8 @@ func isRetryableHTTPStatus(status int) bool {
 	case http.StatusInternalServerError,
 		http.StatusBadGateway,
 		http.StatusServiceUnavailable,
-		http.StatusGatewayTimeout:
+		http.StatusGatewayTimeout,
+		http.StatusTooManyRequests:
 		return true
 	default:
 		return false
@@ -159,14 +160,13 @@ func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.
 		if isRetryableHTTPStatus(resp.StatusCode) {
 			status := resp.StatusCode
 			_ = resp.Body.Close()
+			retryAfter := parseRetryAfter(resp.Header)
 			c.log.Debugf(
-				"spclient request returned transient status %d, retrying...",
-				status,
+				"spclient request returned transient status %d, retrying in %s...",
+				status, retryAfter,
 			)
 			return nil, fmt.Errorf(
-				"spclient request returned transient status %d",
-				status,
-			)
+				"spclient request returned transient status %d", status)
 		}
 
 		return resp, nil
@@ -183,11 +183,9 @@ func (c *Spclient) WebApiRequest(ctx context.Context, method string, path string
 	if err != nil {
 		panic("invalid api base url")
 	}
-	// Spotify Web API requires /v1/ prefix
-	if path != "" && !strings.HasPrefix(path, "/") {
+	// Spotify Web API requires /v1/ prefix — only add if not already present
+	if path != "" && !strings.HasPrefix(path, "v1/") && path != "v1" {
 		path = "v1/" + path
-	} else if path != "" && strings.HasPrefix(path, "/") {
-		path = "v1" + path
 	}
 	reqURL := reqPath.JoinPath(path)
 	return c.innerRequest(ctx, method, reqURL, query, header, body)
