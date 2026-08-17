@@ -15,6 +15,15 @@ type BluetoothKnownDevice struct {
 	LastConnected time.Time `json:"last_connected,omitempty"`
 }
 
+// OAuthState persists the OAuth token pair used for Web API calls so the
+// refresh token survives daemon restarts (StoredCredentials restarts would
+// otherwise lose it and the Web API falls back to the Login5 token).
+type OAuthState struct {
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	ExpiresAt    int64  `json:"expires_at,omitempty"` // unix seconds
+}
+
 type AppState struct {
 	sync.Mutex
 
@@ -34,6 +43,9 @@ type AppState struct {
 
 	// Settings is the user-facing preference blob edited from the ui
 	Settings json.RawMessage `json:"settings,omitempty"`
+
+	// OAuth holds the persisted Web API OAuth tokens (see OAuthState)
+	OAuth OAuthState `json:"oauth,omitempty"`
 
 	// last offset from the check in service
 	UtcOffsetMin *int `json:"utc_offset_min,omitempty"`

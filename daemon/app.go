@@ -360,6 +360,17 @@ func (app *App) persistState() error {
 	return nil
 }
 
+// onOAuthTokenChanged persists the Web API OAuth token pair so it survives
+// daemon restarts (the StoredCredentials path restores it from app state)
+func (app *App) onOAuthTokenChanged(oauth *librespot.OAuthState) {
+	app.state.Lock()
+	app.state.OAuth = *oauth
+	app.state.Unlock()
+	if err := app.persistState(); err != nil {
+		app.log.WithError(err).Warn("failed to persist OAuth tokens")
+	}
+}
+
 // GetSettings returns a copy of the persisted frontend settings or nil
 func (app *App) GetSettings() []byte {
 	app.state.Lock()
@@ -689,6 +700,8 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 		Client:      app.client,
 		AppState:    app.state,
 		Credentials: creds,
+		PersistedOAuth:    &app.state.OAuth,
+		OAuthTokenChanged: app.onOAuthTokenChanged,
 		AuthURLCallback: func(url string) {
 			app.SetAuthState(true, url)
 		},
