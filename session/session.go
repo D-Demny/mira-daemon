@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,11 @@ type Session struct {
 	oauthToken     string
 	oauthRefresh   string
 	oauthExpiresAt time.Time
+
+	// tokenEndpoint is where OAuth token refreshes go, overridable in tests
+	tokenEndpoint string
+	// oauthChanged persists the token pair after device flow + every refresh
+	oauthChanged func(*librespot.OAuthState)
 }
 
 func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error) {
@@ -64,6 +70,9 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 		deviceId:   opts.DeviceId,
 		client:     opts.Client,
 		log:        opts.Log,
+		// token refreshes go to the same endpoint the device flow polls
+		tokenEndpoint: deviceTokenURL,
+		oauthChanged:  opts.OAuthTokenChanged,
 	}
 
 	if s.client == nil {
@@ -106,6 +115,19 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 		if err := s.ap.ConnectStored(ctx, creds.Username, creds.Data); err != nil {
 			return nil, fmt.Errorf("failed authenticating accesspoint with stored credentials: %w", err)
 		}
+		// restore persisted Web API OAuth tokens so api.spotify.com keeps
+		// working across daemon restarts without a new QR login
+		if opts.PersistedOAuth != nil && opts.PersistedOAuth.RefreshToken != "" {
+			s.oauthMu.Lock()
+			s.oauthToken = opts.PersistedOAuth.AccessToken
+			s.oauthRefresh = opts.PersistedOAuth.RefreshToken
+			if opts.PersistedOAuth.ExpiresAt > 0 {
+				s.oauthExpiresAt = time.Unix(opts.PersistedOAuth.ExpiresAt, 0)
+			}
+			s.oauthMu.Unlock()
+			opts.Log.Infof("OAuth: restored persisted tokens (access_token=%d chars, refresh_token=%d chars, expires in %s)",
+				len(s.oauthToken), len(s.oauthRefresh), time.Until(s.oauthExpiresAt).Round(time.Second))
+		}
 	case InteractiveCredentials:
 		// device flow, user authorizes via the QR URL we send to AuthURLCallback.
 		// username left empty, AP fills it via APWelcome from the token itself
@@ -128,6 +150,7 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 		opts.Log.Infof("OAuth: device flow complete (access_token=%d chars, refresh_token=%d chars, expires_in=%ds)",
 			len(oauthTokens.AccessToken), len(oauthTokens.RefreshToken),
 			int(time.Until(oauthTokens.ExpiresAt).Seconds()))
+		s.emitOAuthChanged()
 	case SpotifyTokenCredentials:
 		if err := s.ap.ConnectSpotifyToken(ctx, creds.Username, creds.Token); err != nil {
 			return nil, fmt.Errorf("failed authenticating accesspoint with username and spotify token: %w", err)
@@ -156,10 +179,10 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 	// initialize spclient
 	// Pass OAuth token function for Web API calls (has user scopes)
 	// Login5 token is used for Spotify Connect (no user scopes)
-	// Only use OAuth token if we have one (InteractiveCredentials or SpotifyTokenCredentials)
-	// StoredCredentials and BlobCredentials fall back to Login5 token
+	// Use OAuth token function when we have an access token or a persisted
+	// refresh token (the access token gets refreshed on first use)
 	var oauthFunc librespot.GetLogin5TokenFunc
-	if s.oauthToken != "" {
+	if s.oauthToken != "" || s.oauthRefresh != "" {
 		oauthFunc = s.oauthTokenFunc()
 	}
 	if spAddr, err := s.resolver.GetSpclient(ctx); err != nil {
@@ -187,44 +210,60 @@ func (s *Session) Close() {
 // It handles token refresh using the refresh token when the access token expires.
 func (s *Session) oauthTokenFunc() librespot.GetLogin5TokenFunc {
 	return func(ctx context.Context, force bool) (string, error) {
+		// snapshot the token state under the lock, never hold it across the
+		// network refresh (the persist callback it triggers takes other locks)
 		s.oauthMu.Lock()
-		remaining := time.Until(s.oauthExpiresAt)
+		token := s.oauthToken
 		hasRefresh := s.oauthRefresh != ""
+		expiresAt := s.oauthExpiresAt
 		s.oauthMu.Unlock()
 
-		if force || time.Now().After(s.oauthExpiresAt) {
-			s.log.Infof("OAuth: token %s (refresh token available: %v)", 
-				func() string { if force { return "force refresh" } else { return "expired" } }(), hasRefresh)
-			
-			if s.oauthRefresh == "" {
-				if s.oauthToken != "" {
-					s.log.Warnf("OAuth: no refresh token, using stale token (expires in %v)", remaining)
-					return s.oauthToken, nil
-				}
-				return "", fmt.Errorf("OAuth: no refresh token and no valid access token available, re-authentication required")
-			}
-			if err := s.refreshOAuthToken(); err != nil {
-				s.log.Errorf("OAuth: refresh failed: %v", err)
-				if s.oauthToken != "" {
-					s.log.Warnf("OAuth: falling back to stale token (expires in %v)", remaining)
-					return s.oauthToken, nil
-				}
-				return "", fmt.Errorf("OAuth: refresh failed and no stale token available: %w", err)
-			}
-			return s.oauthToken, nil
+		if !force && time.Now().Before(expiresAt) {
+			return token, nil
 		}
-		return s.oauthToken, nil
+
+		remaining := time.Until(expiresAt)
+		s.log.Infof("OAuth: token %s (refresh token available: %v)",
+			func() string { if force { return "force refresh" } else { return "expired" } }(), hasRefresh)
+
+		if !hasRefresh {
+			if token != "" {
+				s.log.Warnf("OAuth: no refresh token, using stale token (expires in %v)", remaining)
+				return token, nil
+			}
+			return "", fmt.Errorf("OAuth: no refresh token and no valid access token available, re-authentication required")
+		}
+		if err := s.refreshOAuthToken(); err != nil {
+			s.log.Errorf("OAuth: refresh failed: %v", err)
+			if token != "" {
+				s.log.Warnf("OAuth: falling back to stale token (expires in %v)", remaining)
+				return token, nil
+			}
+			return "", fmt.Errorf("OAuth: refresh failed and no stale token available: %w", err)
+		}
+		s.oauthMu.Lock()
+		token = s.oauthToken
+		s.oauthMu.Unlock()
+		return token, nil
 	}
 }
 
 func (s *Session) refreshOAuthToken() error {
-	if s.oauthRefresh == "" {
+	s.oauthMu.Lock()
+	refreshToken := s.oauthRefresh
+	s.oauthMu.Unlock()
+	if refreshToken == "" {
 		return fmt.Errorf("OAuth: no refresh token available")
 	}
 
-	body := fmt.Sprintf("grant_type=refresh_token&refresh_token=%s", s.oauthRefresh)
+	body := url.Values{
+		"grant_type": {"refresh_token"},
+		// Spotify answers 400 invalid_client when client_id is missing
+		"client_id":     {librespot.ClientIdHex},
+		"refresh_token": {refreshToken},
+	}.Encode()
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
-		"https://accounts.spotify.com/api/token", strings.NewReader(body))
+		s.tokenEndpoint, strings.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("failed building OAuth refresh request: %w", err)
 	}
@@ -252,11 +291,31 @@ func (s *Session) refreshOAuthToken() error {
 		return fmt.Errorf("OAuth refresh decode failed: %w", err)
 	}
 
+	s.oauthMu.Lock()
 	s.oauthToken = tok.AccessToken
 	if tok.RefreshToken != "" {
 		s.oauthRefresh = tok.RefreshToken
 	}
 	s.oauthExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	s.oauthMu.Unlock()
 	s.log.Infof("OAuth: token refreshed successfully (expires in %ds)", tok.ExpiresIn)
+	s.emitOAuthChanged()
 	return nil
+}
+
+// emitOAuthChanged hands a snapshot of the current token pair to the
+// persistence callback (nil-safe). It fires after the device flow completes
+// and after every successful refresh so the pair can be written to app state.
+func (s *Session) emitOAuthChanged() {
+	if s.oauthChanged == nil {
+		return
+	}
+	s.oauthMu.Lock()
+	state := &librespot.OAuthState{
+		AccessToken:  s.oauthToken,
+		RefreshToken: s.oauthRefresh,
+		ExpiresAt:    s.oauthExpiresAt.Unix(),
+	}
+	s.oauthMu.Unlock()
+	s.oauthChanged(state)
 }

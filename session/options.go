@@ -29,8 +29,16 @@ type Options struct {
 	// AppState is the app state to use.
 	AppState *librespot.AppState
 
+	// PersistedOAuth restores the Web API OAuth tokens from app state on
+	// restart (StoredCredentials path). nil or empty refresh token = no restore.
+	PersistedOAuth *librespot.OAuthState
+
 	// fired with the device-flow verification URL when auth blocks for the user
 	AuthURLCallback func(url string)
+
+	// fired after the device flow completes and after every successful token
+	// refresh so the caller can persist the tokens
+	OAuthTokenChanged func(*librespot.OAuthState)
 }
 
 // InteractiveCredentials picks the OAuth2 device flow (RFC 8628), no fields needed
