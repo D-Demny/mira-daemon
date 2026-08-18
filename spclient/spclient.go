@@ -299,10 +299,11 @@ func (c *Spclient) webPlayerClientToken(ctx context.Context) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Origin", "https://open.spotify.com")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed requesting web client token: %w", err)
+		return "", fmt.Errorf("failed requesting clienttoken: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {

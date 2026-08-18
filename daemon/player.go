@@ -77,6 +77,11 @@ type AppPlayer struct {
 	metaResolvedCh       chan resolvedTrackMeta
 	metaResolveInFlight  string
 	metaResolveFailedUri string
+
+	// in-memory cache of playlist track counts (uri -> entry), for the
+	// locally-served /web-api/me/playlists endpoint
+	playlistCountMu    sync.Mutex
+	playlistCountCache map[string]playlistCountEntry
 }
 
 type resolvedTrackMeta struct {
@@ -1156,6 +1161,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		p.app.log.Debugf("web-api: %s %s success (status %d)", data.Method, data.Path, resp.StatusCode)
 		return respJson, nil
+
+	case ApiRequestTypeWebApiLocal:
+		data := req.Data.(ApiRequestDataWebApi)
+		p.app.log.Debugf("web-api (local): %s %s", data.Method, data.Path)
+		return p.handleWebApiLocal(ctx, data)
 
 	case ApiRequestTypeStatus:
 		resp := &ApiResponseStatus{

@@ -185,6 +185,7 @@ type ApiRequestType string
 const (
 	ApiRequestTypeRoot                ApiRequestType = "root"
 	ApiRequestTypeWebApi              ApiRequestType = "web_api"
+	ApiRequestTypeWebApiLocal         ApiRequestType = "web_api_local"
 	ApiRequestTypeStatus              ApiRequestType = "status"
 	ApiRequestTypeResume              ApiRequestType = "resume"
 	ApiRequestTypePause               ApiRequestType = "pause"
@@ -759,11 +760,16 @@ func (s *ConcreteApiServer) serve() {
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeRoot}, w)
 	})
 	m.Handle("/web-api/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/web-api/")
+		typ := ApiRequestTypeWebApi
+		if r.Method == http.MethodGet && isLocalWebApiPath(path) {
+			typ = ApiRequestTypeWebApiLocal
+		}
 		s.handleRequest(ApiRequest{
-			Type: ApiRequestTypeWebApi,
+			Type: typ,
 			Data: ApiRequestDataWebApi{
 				Method: r.Method,
-				Path:   strings.TrimPrefix(r.URL.Path, "/web-api/"),
+				Path:   path,
 				Query:  r.URL.Query(),
 			},
 		}, w)
