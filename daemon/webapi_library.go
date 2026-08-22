@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"sort"
 	"strconv"
@@ -77,22 +78,313 @@ func isLocalWebApiPath(path string) bool {
 	case "me/playlists", "me/player/recently-played":
 		return true
 	default:
-		return false
+		return playlistTracksPath(path) != ""
 	}
+}
+
+// playlistTracksPath returns the playlist id for playlists/<id>/tracks paths
+// and "" for anything else.
+func playlistTracksPath(path string) string {
+	if !strings.HasPrefix(path, "playlists/") || !strings.HasSuffix(path, "/tracks") {
+		return ""
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(path, "playlists/"), "/tracks")
+	if id == "" || strings.Contains(id, "/") {
+		return ""
+	}
+	return id
 }
 
 // handleWebApiLocal routes the locally-served Web API paths.
 func (p *AppPlayer) handleWebApiLocal(ctx context.Context, d ApiRequestDataWebApi) (any, error) {
-	switch d.Path {
-	case "me/playlists":
+	switch {
+	case d.Path == "me/playlists":
 		return p.webApiPlaylists(ctx, d.Query)
-	case "me/player/recently-played":
-		// The current web-player Pathfinder build exposes no play-history
-		// query, so this returns an empty list for now.
-		return map[string]any{"items": []any{}, "next": nil}, nil
+	case d.Path == "me/player/recently-played":
+		return p.webApiRecentlyPlayed(ctx, d.Query)
 	default:
+		if id := playlistTracksPath(d.Path); id != "" {
+			return p.webApiPlaylistTracks(ctx, id, d.Query)
+		}
 		return nil, ErrNotFound
 	}
+}
+
+// webApiRecentlyPlayed serves GET me/player/recently-played from the web
+// player's "Recents" list (spotify:list:recents:page), mapped to the Web API
+// response shape. Only track entries are kept, like the public endpoint.
+func (p *AppPlayer) webApiRecentlyPlayed(ctx context.Context, q url.Values) (any, error) {
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	body := p.pfBody("recents", map[string]any{
+		"uris":   []string{"spotify:list:recents:page"},
+		"offset": 0,
+		"limit":  limit,
+	})
+	data, err := p.pathfinderQueryEx(ctx, body, false)
+	if err != nil {
+		p.app.log.Warnf("web-api: me/player/recently-played: %v", err)
+		return nil, err
+	}
+	items, err := mapRecentlyPlayedPage(data)
+	if err != nil {
+		p.app.log.Warnf("web-api: me/player/recently-played: bad pathfinder payload: %v", err)
+		return nil, err
+	}
+	return map[string]any{
+		"items":   items,
+		"next":    nil,
+		"cursors": map[string]any{},
+		"limit":   limit,
+		"href":    "https://api.spotify.com/v1/me/player/recently-played",
+	}, nil
+}
+
+// webApiPlaylistTracks serves GET playlists/<id>/tracks from the fetchPlaylist
+// Pathfinder query (the same persisted query the voice catalog pages with),
+// mapped to the Web API response shape.
+func (p *AppPlayer) webApiPlaylistTracks(ctx context.Context, playlistID string, q url.Values) (any, error) {
+	limit, offset := parseWebApiPaging(q)
+	body := p.pfBody("fetchPlaylist", map[string]any{
+		"uri":                       "spotify:playlist:" + playlistID,
+		"offset":                    offset,
+		"limit":                     limit,
+		"enableWatchFeedEntrypoint": false,
+	})
+	data, err := p.pathfinderQueryEx(ctx, body, false)
+	if err != nil {
+		p.app.log.Warnf("web-api: playlists/%s/tracks: %v", playlistID, err)
+		return nil, err
+	}
+	items, total, err := mapPlaylistTracksPage(data)
+	if err != nil {
+		p.app.log.Warnf("web-api: playlists/%s/tracks: bad pathfinder payload: %v", playlistID, err)
+		return nil, err
+	}
+	next := any(nil)
+	if offset+limit < total {
+		next = fmt.Sprintf("https://api.spotify.com/v1/playlists/%s/tracks?limit=%d&offset=%d",
+			playlistID, limit, offset+limit)
+	}
+	return map[string]any{
+		"href":   fmt.Sprintf("https://api.spotify.com/v1/playlists/%s/tracks", playlistID),
+		"items":  items,
+		"limit":  limit,
+		"offset": offset,
+		"next":   next,
+		"total":  total,
+	}, nil
+}
+
+// the "Recents" list payload: data.lists[] of the generic web-player List
+// type; every entry carries the entity traits of the played item
+type recentsPayload struct {
+	Data struct {
+		Lists []struct {
+			Typename string `json:"__typename"`
+			Items    struct {
+				TotalCount int `json:"totalCount"`
+				Items      []struct {
+					AddedAt string `json:"addedAt"`
+					Entity  struct {
+						URI  string `json:"_uri"`
+						Data struct {
+							IdentityTrait struct {
+								Name         string `json:"name"`
+								Contributors []struct {
+									URI  string `json:"uri"`
+									Name string `json:"name"`
+								} `json:"contributors"`
+								ContentHierarchyParent *struct {
+									URI           string `json:"uri"`
+									IdentityTrait struct {
+										Name string `json:"name"`
+									} `json:"identityTrait"`
+								} `json:"contentHierarchyParent"`
+							} `json:"identityTrait"`
+							VisualIdentityTrait struct {
+								Images any `json:"images"` // {sources:[...]} or a bare array
+							} `json:"visualIdentityTrait"`
+						} `json:"data"`
+					} `json:"entity"`
+				} `json:"items"`
+			} `json:"items"`
+		} `json:"lists"`
+	} `json:"data"`
+}
+
+func mapRecentlyPlayedPage(data []byte) ([]any, error) {
+	var r recentsPayload
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, err
+	}
+	out := make([]any, 0, len(r.Data.Lists))
+	for _, list := range r.Data.Lists {
+		if list.Typename != "List" {
+			continue
+		}
+		for _, it := range list.Items.Items {
+			uri := it.Entity.URI
+			if !strings.HasPrefix(uri, "spotify:track:") {
+				continue
+			}
+			id := strings.TrimPrefix(uri, "spotify:track:")
+			ident := it.Entity.Data.IdentityTrait
+			album := map[string]any{"name": "", "images": []any{}}
+			if parent := ident.ContentHierarchyParent; parent != nil {
+				album["name"] = parent.IdentityTrait.Name
+			}
+			if imgs := webApiImagesFromAny(it.Entity.Data.VisualIdentityTrait.Images); imgs != nil {
+				album["images"] = imgs
+			}
+			out = append(out, map[string]any{
+				"track": map[string]any{
+					"id":      id,
+					"name":    ident.Name,
+					"uri":     uri,
+					"artists": webApiArtistsFromContributors(ident.Contributors),
+					"album":   album,
+				},
+				"played_at": it.AddedAt,
+			})
+		}
+	}
+	return out, nil
+}
+
+// the fetchPlaylist content payload (playlistV2.content)
+type playlistTracksPayload struct {
+	Data struct {
+		PlaylistV2 struct {
+			Content struct {
+				TotalCount int `json:"totalCount"`
+				Items      []struct {
+					ItemV2 struct {
+						URI  string `json:"_uri"`
+						Data struct {
+							Name    string `json:"name"`
+							URI     string `json:"uri"`
+							Artists struct {
+								Items []struct {
+									Profile struct {
+										Name string `json:"name"`
+									} `json:"profile"`
+								} `json:"items"`
+							} `json:"artists"`
+							Album      any `json:"album"` // may be absent in the payload
+							DurationMs int `json:"durationMs"`
+						} `json:"data"`
+					} `json:"itemV2"`
+				} `json:"items"`
+			} `json:"content"`
+		} `json:"playlistV2"`
+	} `json:"data"`
+}
+
+func mapPlaylistTracksPage(data []byte) ([]any, int, error) {
+	var r playlistTracksPayload
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, 0, err
+	}
+	c := r.Data.PlaylistV2.Content
+	out := make([]any, 0, len(c.Items))
+	for _, it := range c.Items {
+		d := it.ItemV2.Data
+		if d.Name == "" {
+			continue
+		}
+		uri := d.URI
+		if uri == "" {
+			uri = it.ItemV2.URI
+		}
+		if uri == "" {
+			continue
+		}
+		id := uri[strings.LastIndex(uri, ":")+1:]
+		artists := make([]any, 0, len(d.Artists.Items))
+		for _, a := range d.Artists.Items {
+			if a.Profile.Name == "" {
+				continue
+			}
+			artists = append(artists, map[string]any{"name": a.Profile.Name})
+		}
+		album := map[string]any{"name": "", "images": []any{}}
+		if b, err := json.Marshal(d.Album); err == nil {
+			var obj struct {
+				Name   string `json:"name"`
+				Images any    `json:"images"`
+			}
+			if json.Unmarshal(b, &obj) == nil && (obj.Name != "" || obj.Images != nil) {
+				album["name"] = obj.Name
+				if imgs := webApiImagesFromAny(obj.Images); imgs != nil {
+					album["images"] = imgs
+				}
+			}
+		}
+		track := map[string]any{
+			"id":      id,
+			"name":    d.Name,
+			"uri":     uri,
+			"artists": artists,
+			"album":   album,
+		}
+		if d.DurationMs > 0 {
+			track["duration_ms"] = d.DurationMs
+		}
+		out = append(out, map[string]any{
+			"is_local": false,
+			"track":    track,
+		})
+	}
+	return out, c.TotalCount, nil
+}
+
+// webApiImagesFromAny normalizes the image payloads the web-player queries
+// ship ({sources:[{url,width,height}]} or a bare array) to webApiImage.
+func webApiImagesFromAny(v any) []webApiImage {
+	if v == nil {
+		return nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var wrapped struct {
+		Sources []webApiImage `json:"sources"`
+	}
+	if err := json.Unmarshal(b, &wrapped); err == nil && len(wrapped.Sources) > 0 {
+		return wrapped.Sources
+	}
+	var bare []webApiImage
+	if err := json.Unmarshal(b, &bare); err == nil && len(bare) > 0 {
+		return bare
+	}
+	return nil
+}
+
+// webApiArtistsFromContributors maps the recents identityTrait contributors
+// to the Web API artist objects.
+func webApiArtistsFromContributors(cs []struct {
+	URI  string `json:"uri"`
+	Name string `json:"name"`
+}) []any {
+	out := make([]any, 0, len(cs))
+	for _, c := range cs {
+		if c.Name == "" {
+			continue
+		}
+		a := map[string]any{"name": c.Name}
+		if c.URI != "" {
+			a["uri"] = c.URI
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // webApiPlaylists serves GET me/playlists from the libraryV3 Pathfinder query,

@@ -895,6 +895,8 @@ const (
 	pfAddToLibraryHash         = "7c5a69420e2bfae3da5cc4e14cbc8bb3f6090f80afc00ffc179177f19be3f33d"
 	pfApplyCurationsHash       = "05b739a3a73091c213385233b9d3ed8a857c2ca29d2eebadb3d04ed12e288697"
 	pfAreEntitiesInLibraryHash = "134337999233cc6fdd6b1e6dbf94841409f04a946c5c7b744b09ba0dfe5a85ed"
+	// play history of the current user (web player "Recents" list)
+	pfRecentsHash = "698be5892a3cc95331deebeff463d05dfdd5febf5254bea30b895b5a93dfb584"
 )
 
 // returns the current hash for an operation

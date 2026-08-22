@@ -12,6 +12,7 @@ var opHashDefaults = map[string]string{
 	"areEntitiesInLibrary": pfAreEntitiesInLibraryHash,
 	"addToLibrary":         pfAddToLibraryHash,
 	"applyCurations":       pfApplyCurationsHash,
+	"recents":              pfRecentsHash,
 }
 
 // hashStore holds the live pathfinder hashes that are scraped
