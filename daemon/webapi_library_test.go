@@ -21,6 +21,9 @@ func TestIsLocalWebApiPath(t *testing.T) {
 		{"me", false},
 		{"me/top", false},
 		{"playlists/abc", false},
+		{"playlists/abc123/tracks", true},
+		{"playlists/abc123/tracks?limit=50", false},
+		{"playlists//tracks", false},
 		{"", false},
 		{"me/playlists/extra", false},
 	}
@@ -190,23 +193,287 @@ func TestParsePlaylistCount(t *testing.T) {
 	}
 }
 
-func TestHandleWebApiLocal_RecentlyPlayed(t *testing.T) {
+func TestPlaylistTracksPath(t *testing.T) {
 	t.Parallel()
-	p := &AppPlayer{}
-	data, err := p.handleWebApiLocal(context.Background(), ApiRequestDataWebApi{
-		Method: "GET",
-		Path:   "me/player/recently-played",
-	})
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"playlists/abc123/tracks", "abc123"},
+		{"playlists/abc123", ""},
+		{"playlists/", ""},
+		{"playlists//tracks", ""},
+		{"playlists/a/b/tracks", ""},
+		{"playlists/abc123/tracks/", ""},
+		{"playlists/abc123/tracks/extra", ""},
+		{"tracks", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := playlistTracksPath(c.path); got != c.want {
+			t.Errorf("playlistTracksPath(%q) = %q, want %q", c.path, got, c.want)
+		}
+	}
+}
+
+const recentsFixture = `{
+  "data": {
+    "lists": [
+      {
+        "__typename": "List",
+        "items": {
+          "totalCount": 2,
+          "items": [
+            {
+              "addedAt": "2026-08-21T10:00:00Z",
+              "entity": {
+                "_uri": "spotify:track:111111111111111111111111111",
+                "data": {
+                  "identityTrait": {
+                    "name": "Bohemian Rhapsody",
+                    "contributors": [
+                      {"uri": "spotify:artist:222222", "name": "Queen"},
+                      {"uri": "spotify:artist:333333", "name": ""}
+                    ],
+                    "contentHierarchyParent": {
+                      "uri": "spotify:album:444444",
+                      "identityTrait": {"name": "A Night at the Opera"}
+                    }
+                  },
+                  "visualIdentityTrait": {
+                    "images": {
+                      "sources": [
+                        {"url": "https://i.scdn.com/640.jpg", "width": 640, "height": 640},
+                        {"url": "https://i.scdn.com/60.jpg", "width": 60, "height": 60}
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "addedAt": "2026-08-21T09:00:00Z",
+              "entity": {
+                "_uri": "spotify:episode:555555",
+                "data": {
+                  "identityTrait": {"name": "Some Episode", "contributors": []},
+                  "visualIdentityTrait": {"images": null}
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "__typename": "NotAList",
+        "items": {"totalCount": 0, "items": []}
+      }
+    ]
+  }
+}`
+
+func TestMapRecentlyPlayedPage(t *testing.T) {
+	t.Parallel()
+	items, err := mapRecentlyPlayedPage([]byte(recentsFixture))
 	if err != nil {
-		t.Fatalf("handleWebApiLocal: %v", err)
+		t.Fatalf("mapRecentlyPlayedPage: %v", err)
 	}
-	m, ok := data.(map[string]any)
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1 (episode and non-List skipped)", len(items))
+	}
+	entry, ok := items[0].(map[string]any)
 	if !ok {
-		t.Fatalf("data type = %T, want map", data)
+		t.Fatalf("items[0] type = %T, want map", items[0])
 	}
-	items, ok := m["items"].([]any)
-	if !ok || len(items) != 0 {
-		t.Errorf("items = %#v, want empty list", m["items"])
+	if entry["played_at"] != "2026-08-21T10:00:00Z" {
+		t.Errorf("played_at = %v", entry["played_at"])
+	}
+	tr, ok := entry["track"].(map[string]any)
+	if !ok {
+		t.Fatalf("track type = %T, want map", entry["track"])
+	}
+	if tr["id"] != "111111111111111111111111111" || tr["name"] != "Bohemian Rhapsody" || tr["uri"] != "spotify:track:111111111111111111111111111" {
+		t.Errorf("track identity = %+v", tr)
+	}
+	artists, _ := tr["artists"].([]any)
+	if len(artists) != 1 {
+		t.Errorf("artists = %+v, want exactly one named contributor", artists)
+	} else if artists[0].(map[string]any)["name"] != "Queen" {
+		t.Errorf("artists[0] = %+v", artists[0])
+	}
+	album, _ := tr["album"].(map[string]any)
+	if album["name"] != "A Night at the Opera" {
+		t.Errorf("album.name = %v", album["name"])
+	}
+	imgs, _ := album["images"].([]webApiImage)
+	if len(imgs) != 2 || imgs[0].Width != 640 || imgs[1].Width != 60 {
+		t.Errorf("album.images = %+v", album["images"])
+	}
+}
+
+func TestMapRecentlyPlayedPage_BadJSON(t *testing.T) {
+	t.Parallel()
+	if _, err := mapRecentlyPlayedPage([]byte("not json")); err == nil {
+		t.Error("expected error for non-JSON payload")
+	}
+}
+
+func TestMapRecentlyPlayedPage_Empty(t *testing.T) {
+	t.Parallel()
+	items, err := mapRecentlyPlayedPage([]byte(`{"data":{"lists":[]}}`))
+	if err != nil || len(items) != 0 {
+		t.Errorf("items = %#v (err %v), want empty slice", items, err)
+	}
+}
+
+const playlistTracksFixture = `{
+  "data": {
+    "playlistV2": {
+      "content": {
+        "totalCount": 3,
+        "items": [
+          {
+            "itemV2": {
+              "_uri": "spotify:track:aaaa",
+              "data": {
+                "name": "Track A",
+                "uri": "spotify:track:aaaa",
+                "artists": {"items": [{"profile": {"name": "Artist A"}}]},
+                "album": {
+                  "name": "Album A",
+                  "images": [{"url": "https://i.scdn.com/a.jpg", "width": 640, "height": 640}]
+                },
+                "durationMs": 210000
+              }
+            }
+          },
+          {
+            "itemV2": {
+              "_uri": "spotify:track:bbbb",
+              "data": {"name": "", "uri": "spotify:track:bbbb"}
+            }
+          },
+          {
+            "itemV2": {
+              "_uri": "spotify:track:cccc",
+              "data": {
+                "name": "Track C",
+                "uri": "",
+                "artists": {"items": []},
+                "album": {"name": "", "images": {"sources": []}}
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}`
+
+func TestMapPlaylistTracksPage(t *testing.T) {
+	t.Parallel()
+	items, total, err := mapPlaylistTracksPage([]byte(playlistTracksFixture))
+	if err != nil {
+		t.Fatalf("mapPlaylistTracksPage: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("total = %d, want 3", total)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2 (empty-name item skipped)", len(items))
+	}
+
+	a, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("items[0] type = %T, want map", items[0])
+	}
+	if a["is_local"] != false {
+		t.Errorf("is_local = %v, want false", a["is_local"])
+	}
+	ta, _ := a["track"].(map[string]any)
+	if ta["id"] != "aaaa" || ta["name"] != "Track A" || ta["uri"] != "spotify:track:aaaa" {
+		t.Errorf("track A = %+v", ta)
+	}
+	if ta["duration_ms"] != 210000 {
+		t.Errorf("duration_ms = %v, want 210000", ta["duration_ms"])
+	}
+	artists, _ := ta["artists"].([]any)
+	if len(artists) != 1 || artists[0].(map[string]any)["name"] != "Artist A" {
+		t.Errorf("artists = %+v", artists)
+	}
+	albumA, _ := ta["album"].(map[string]any)
+	imgsA, _ := albumA["images"].([]webApiImage)
+	if albumA["name"] != "Album A" || len(imgsA) != 1 || imgsA[0].Width != 640 {
+		t.Errorf("album A = %+v", albumA)
+	}
+
+	c, ok := items[1].(map[string]any)
+	if !ok {
+		t.Fatalf("items[1] type = %T, want map", items[1])
+	}
+	tc, _ := c["track"].(map[string]any)
+	if tc["id"] != "cccc" || tc["name"] != "Track C" || tc["uri"] != "spotify:track:cccc" {
+		t.Errorf("track C = %+v, want uri/id fallback to _uri", tc)
+	}
+	if _, has := tc["duration_ms"]; has {
+		t.Errorf("duration_ms = %v, want absent", tc["duration_ms"])
+	}
+	artistsC, _ := tc["artists"].([]any)
+	if len(artistsC) != 0 {
+		t.Errorf("artists C = %+v, want empty", artistsC)
+	}
+}
+
+func TestMapPlaylistTracksPage_BadJSON(t *testing.T) {
+	t.Parallel()
+	if _, _, err := mapPlaylistTracksPage([]byte("not json")); err == nil {
+		t.Error("expected error for non-JSON payload")
+	}
+}
+
+func TestWebApiImagesFromAny(t *testing.T) {
+	t.Parallel()
+	wrapped := map[string]any{
+		"sources": []any{
+			map[string]any{"url": "https://x/1.jpg", "width": 640, "height": 640},
+		},
+	}
+	if imgs := webApiImagesFromAny(wrapped); len(imgs) != 1 || imgs[0].URL != "https://x/1.jpg" || imgs[0].Width != 640 {
+		t.Errorf("wrapped = %+v", imgs)
+	}
+	bare := []any{
+		map[string]any{"url": "https://x/2.jpg", "width": 300, "height": 300},
+	}
+	if imgs := webApiImagesFromAny(bare); len(imgs) != 1 || imgs[0].URL != "https://x/2.jpg" {
+		t.Errorf("bare = %+v", imgs)
+	}
+	if imgs := webApiImagesFromAny(nil); imgs != nil {
+		t.Errorf("nil = %+v, want nil", imgs)
+	}
+	if imgs := webApiImagesFromAny("garbage"); imgs != nil {
+		t.Errorf("garbage = %+v, want nil", imgs)
+	}
+}
+
+func TestWebApiArtistsFromContributors(t *testing.T) {
+	t.Parallel()
+	type contribs = []struct {
+		URI  string `json:"uri"`
+		Name string `json:"name"`
+	}
+	out := webApiArtistsFromContributors(contribs{
+		{URI: "spotify:artist:1", Name: "A"},
+		{URI: "", Name: "B"},
+		{URI: "spotify:artist:3", Name: ""},
+	})
+	if len(out) != 2 {
+		t.Fatalf("artists = %+v, want 2 (empty name skipped)", out)
+	}
+	if out[0].(map[string]any)["name"] != "A" || out[0].(map[string]any)["uri"] != "spotify:artist:1" {
+		t.Errorf("artists[0] = %+v", out[0])
+	}
+	if _, has := out[1].(map[string]any)["uri"]; has {
+		t.Errorf("artists[1] = %+v, want no uri for empty input uri", out[1])
 	}
 }
 

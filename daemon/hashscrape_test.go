@@ -113,6 +113,7 @@ func TestScrapeViaHTTPTest(t *testing.T) {
 		"areEntitiesInLibrary": hx("5"),
 		"addToLibrary":         hx("6"),
 		"applyCurations":       hx("7"),
+		"recents":              hx("8"),
 	}
 
 	var fix struct{ home, main, search, profile []byte }
@@ -142,6 +143,7 @@ func TestScrapeViaHTTPTest(t *testing.T) {
 		`d=new T.l("areEntitiesInLibrary","query","` + want["areEntitiesInLibrary"] + `",null);` +
 		`e=new T.l("addToLibrary","mutation","` + want["addToLibrary"] + `",null);` +
 		`f=new T.l("applyCurations","mutation","` + want["applyCurations"] + `",null);` +
+		`r=new T.l("recents","query","` + want["recents"] + `",null);` +
 		`u=(({4406:"xpui-routes-search",7969:"xpui-routes-profile"})[x]||x)+"."+({4406:"aaaaaaaa",7969:"bbbbbbbb"})[x]+".js"`
 	fix.home = []byte(`<html><script src="` + base + `web-player.deadbeef.js"></script></html>`)
 	fix.main = []byte(mainBody)
