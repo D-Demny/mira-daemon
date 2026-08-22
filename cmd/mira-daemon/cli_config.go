@@ -80,6 +80,11 @@ type cliConfig struct {
 			AccessToken string `koanf:"access_token"`
 		} `koanf:"spotify_token"`
 	} `koanf:"credentials"`
+
+	HomeAssistant struct {
+		URL   string `koanf:"url"`
+		Token string `koanf:"token"`
+	} `koanf:"homeassistant"`
 }
 
 func (c *cliConfig) toDaemonConfig() *daemon.Config {
@@ -117,6 +122,8 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 	dc.Credentials.Type = c.Credentials.Type
 	dc.Credentials.SpotifyToken.Username = c.Credentials.SpotifyToken.Username
 	dc.Credentials.SpotifyToken.AccessToken = c.Credentials.SpotifyToken.AccessToken
+	dc.HomeAssistant.URL = c.HomeAssistant.URL
+	dc.HomeAssistant.Token = c.HomeAssistant.Token
 	return dc
 }
 

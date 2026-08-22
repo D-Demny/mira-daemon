@@ -23,6 +23,16 @@ type Config struct {
 	Voice VoiceConfig
 
 	Credentials CredentialsConfig
+
+	// Home Assistant REST API proxy target (epic 9): the browser cannot
+	// reach HA cross-origin (no CORS for the UI origin), so the UI calls
+	// /ha-api/... on the daemon API server instead. Empty URL = proxy off.
+	HomeAssistant HomeAssistantConfig
+}
+
+type HomeAssistantConfig struct {
+	URL   string
+	Token string
 }
 
 // configures the on device voice service

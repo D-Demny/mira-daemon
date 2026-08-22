@@ -67,6 +67,9 @@ type ApiServer interface {
 	// /voice/* uses this, nil = 503
 	SetVoiceHandler(h VoiceHandler)
 
+	// /ha-api/* uses this; empty URL disables the proxy (503)
+	SetHomeAssistantConfig(cfg HomeAssistantConfig)
+
 	Submit(ctx context.Context, t ApiRequestType, data any) (any, error)
 }
 
@@ -169,6 +172,11 @@ type ConcreteApiServer struct {
 
 	voiceMu sync.RWMutex
 	voiceFn VoiceHandler
+
+	haMu       sync.RWMutex
+	haCfg      HomeAssistantConfig
+	haClientMu sync.Mutex
+	haClient   *http.Client
 }
 
 var (
@@ -565,6 +573,8 @@ func (s *StubApiServer) SetSettingsHandler(_ SettingsHandler) {}
 
 func (s *StubApiServer) SetBluetoothHandler(_ BluetoothHandler) {}
 
+func (s *StubApiServer) SetHomeAssistantConfig(_ HomeAssistantConfig) {}
+
 func (s *ConcreteApiServer) SetAuthHandler(fn AuthStatusFunc) {
 	s.authMu.Lock()
 	s.authFn = fn
@@ -657,6 +667,82 @@ func (s *ConcreteApiServer) getSettingsHandler() SettingsHandler {
 	s.setMu.RLock()
 	defer s.setMu.RUnlock()
 	return s.setFn
+}
+
+const (
+	haApiPrefix   = "/ha-api/"
+	haProxyTimeout = 8 * time.Second
+)
+
+func (s *ConcreteApiServer) SetHomeAssistantConfig(cfg HomeAssistantConfig) {
+	s.haMu.Lock()
+	s.haCfg = cfg
+	s.haMu.Unlock()
+}
+
+func (s *ConcreteApiServer) getHomeAssistantConfig() HomeAssistantConfig {
+	s.haMu.RLock()
+	defer s.haMu.RUnlock()
+	return s.haCfg
+}
+
+func (s *ConcreteApiServer) homeAssistantClient() *http.Client {
+	s.haClientMu.Lock()
+	defer s.haClientMu.Unlock()
+	if s.haClient == nil {
+		s.haClient = &http.Client{Timeout: haProxyTimeout}
+	}
+	return s.haClient
+}
+
+// The browser cannot reach Home Assistant cross-origin (HA only answers
+// CORS for its own origin), so the UI calls /ha-api/<path> on this server
+// and the daemon forwards to the configured HA instance with the token.
+func (s *ConcreteApiServer) handleHaApiProxy(w http.ResponseWriter, r *http.Request) {
+	cfg := s.getHomeAssistantConfig()
+	if cfg.URL == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"home assistant proxy not configured"}`))
+		return
+	}
+
+	// /ha-api/states/x -> <cfg.URL>/api/states/x (HA REST root)
+	target := strings.TrimSuffix(cfg.URL, "/") + "/api/" + strings.TrimPrefix(r.URL.Path, haApiPrefix)
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+
+	var body io.Reader
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		body = r.Body
+	}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, body)
+	if err != nil {
+		s.log.WithError(err).Errorf("ha-api: building request for %s", target)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	}
+
+	resp, err := s.homeAssistantClient().Do(req)
+	if err != nil {
+		s.log.Warnf("ha-api: %s %s failed: %v", r.Method, target, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"home assistant unreachable"}`))
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, io.LimitReader(resp.Body, 4<<20))
 }
 
 // ambientLuxPath is the tmd2772 ambient-light reading (lux) exposed by the
@@ -774,6 +860,7 @@ func (s *ConcreteApiServer) serve() {
 			},
 		}, w)
 	}))
+	m.Handle("/ha-api/", http.HandlerFunc(s.handleHaApiProxy))
 	m.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
