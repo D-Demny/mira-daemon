@@ -393,6 +393,82 @@ func TestPlayerPlayPause_POSTDispatchesPlayPauseRequest(t *testing.T) {
 	}
 }
 
+func TestPlayerPlay_DecodesOffsetFromBody(t *testing.T) {
+	t.Parallel()
+
+	srv, base := newTestApiServer(t)
+	srv.SetPlayerReady(true)
+	captured := drainOne(t, srv, nil, nil)
+
+	body := strings.NewReader(`{"uri":"spotify:playlist:abc","offset":{"position":3}}`)
+	resp, err := testClient.Post(base+"/player/play", "application/json", body)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d want 200", resp.StatusCode)
+	}
+	req := <-captured
+	if got, want := req.Type, ApiRequestTypePlay; got != want {
+		t.Fatalf("Type: got %q want %q", got, want)
+	}
+	data, ok := req.Data.(ApiRequestDataPlay)
+	if !ok {
+		t.Fatalf("Data type: got %T want ApiRequestDataPlay", req.Data)
+	}
+	if data.Uri != "spotify:playlist:abc" {
+		t.Errorf("Uri: got %q want %q", data.Uri, "spotify:playlist:abc")
+	}
+	if data.Offset == nil {
+		t.Fatal("Offset: got nil want non-nil")
+	}
+	if data.Offset.Position != 3 {
+		t.Errorf("Offset.Position: got %d want 3", data.Offset.Position)
+	}
+	if data.Offset.Uri != "" {
+		t.Errorf("Offset.Uri: got %q want empty", data.Offset.Uri)
+	}
+}
+
+func TestPlayerPlay_OffsetMarshalsToConnectOptions(t *testing.T) {
+	t.Parallel()
+
+	// the play command's options envelope must serialize the offset with the
+	// web-player wire field names (uri / position)
+	cmd := connectCommand{
+		Endpoint: "play",
+		Context:  &connectContext{Uri: "spotify:playlist:abc", Url: "context://spotify:playlist:abc"},
+		Options: &connectOptions{
+			License: "tft",
+			Offset:  &connectOffset{Position: 3},
+		},
+	}
+	b, err := json.Marshal(cmd)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(b, &envelope); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	opts, _ := envelope["options"].(map[string]any)
+	if opts == nil {
+		t.Fatal("options missing from envelope")
+	}
+	offset, _ := opts["offset"].(map[string]any)
+	if offset == nil {
+		t.Fatal("offset missing from options")
+	}
+	if offset["position"] != float64(3) {
+		t.Errorf("offset.position: got %v want 3", offset["position"])
+	}
+	if _, has := offset["uri"]; has {
+		t.Errorf("offset.uri should be omitted when empty")
+	}
+}
+
 func TestPlayerSeek_DecodesAbsolutePositionFromBody(t *testing.T) {
 	t.Parallel()
 
