@@ -225,7 +225,7 @@ const recentsFixture = `{
           "totalCount": 2,
           "items": [
             {
-              "addedAt": "2026-08-21T10:00:00Z",
+              "addedAt": {"timestamp": 1787306400000, "isoString": "2026-08-21T10:00:00Z"},
               "entity": {
                 "_uri": "spotify:track:111111111111111111111111111",
                 "data": {
@@ -252,7 +252,7 @@ const recentsFixture = `{
               }
             },
             {
-              "addedAt": "2026-08-21T09:00:00Z",
+              "addedAt": {"timestamp": 1787302800000, "isoString": "2026-08-21T09:00:00Z"},
               "entity": {
                 "_uri": "spotify:episode:555555",
                 "data": {
@@ -323,6 +323,25 @@ func TestMapRecentlyPlayedPage_Empty(t *testing.T) {
 	items, err := mapRecentlyPlayedPage([]byte(`{"data":{"lists":[]}}`))
 	if err != nil || len(items) != 0 {
 		t.Errorf("items = %#v (err %v), want empty slice", items, err)
+	}
+}
+
+func TestRecentsPlayedAt(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   recentsAddedAt
+		want string
+	}{
+		{"isoString wins", recentsAddedAt{Timestamp: 1787306400000, IsoString: "2026-08-21T10:00:00Z"}, "2026-08-21T10:00:00Z"},
+		{"ms timestamp", recentsAddedAt{Timestamp: 1787306400000}, "2026-08-21T10:00:00Z"},
+		{"bare seconds", recentsAddedAt{Timestamp: 1787306400}, "2026-08-21T10:00:00Z"},
+		{"empty", recentsAddedAt{}, ""},
+	}
+	for _, c := range cases {
+		if got := recentsPlayedAt(c.in); got != c.want {
+			t.Errorf("recentsPlayedAt(%+v) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 

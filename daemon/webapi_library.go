@@ -190,7 +190,7 @@ type recentsPayload struct {
 			Items    struct {
 				TotalCount int `json:"totalCount"`
 				Items      []struct {
-					AddedAt string `json:"addedAt"`
+					AddedAt recentsAddedAt `json:"addedAt"`
 					Entity  struct {
 						URI  string `json:"_uri"`
 						Data struct {
@@ -216,6 +216,30 @@ type recentsPayload struct {
 			} `json:"items"`
 		} `json:"lists"`
 	} `json:"data"`
+}
+
+// the addedAt field of a recents list item: the web player ships it as an
+// object ({timestamp (epoch ms), isoString}); older bundles sent a bare string
+type recentsAddedAt struct {
+	Timestamp float64 `json:"timestamp"`
+	IsoString string  `json:"isoString"`
+}
+
+// recentsPlayedAt converts the addedAt object into the ISO-8601 played_at
+// string the Web API returns (falls back to the raw timestamp when isoString
+// is absent)
+func recentsPlayedAt(a recentsAddedAt) string {
+	if a.IsoString != "" {
+		return a.IsoString
+	}
+	if a.Timestamp > 0 {
+		ms := a.Timestamp
+		if ms < 1e12 { // bare seconds instead of milliseconds
+			ms *= 1000
+		}
+		return time.UnixMilli(int64(ms)).UTC().Format(time.RFC3339)
+	}
+	return ""
 }
 
 func mapRecentlyPlayedPage(data []byte) ([]any, error) {
@@ -250,7 +274,7 @@ func mapRecentlyPlayedPage(data []byte) ([]any, error) {
 					"artists": webApiArtistsFromContributors(ident.Contributors),
 					"album":   album,
 				},
-				"played_at": it.AddedAt,
+				"played_at": recentsPlayedAt(it.AddedAt),
 			})
 		}
 	}
