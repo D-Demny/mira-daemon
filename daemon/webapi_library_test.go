@@ -391,7 +391,7 @@ const playlistTracksFixture = `{
 
 func TestMapPlaylistTracksPage(t *testing.T) {
 	t.Parallel()
-	items, total, err := mapPlaylistTracksPage([]byte(playlistTracksFixture))
+	items, total, err := mapPlaylistTracksPage([]byte(playlistTracksFixture), 0)
 	if err != nil {
 		t.Fatalf("mapPlaylistTracksPage: %v", err)
 	}
@@ -412,6 +412,9 @@ func TestMapPlaylistTracksPage(t *testing.T) {
 	ta, _ := a["track"].(map[string]any)
 	if ta["id"] != "aaaa" || ta["name"] != "Track A" || ta["uri"] != "spotify:track:aaaa" {
 		t.Errorf("track A = %+v", ta)
+	}
+	if ta["position"] != 0 {
+		t.Errorf("track A position = %v, want 0", ta["position"])
 	}
 	if ta["duration_ms"] != 210000 {
 		t.Errorf("duration_ms = %v, want 210000", ta["duration_ms"])
@@ -434,6 +437,11 @@ func TestMapPlaylistTracksPage(t *testing.T) {
 	if tc["id"] != "cccc" || tc["name"] != "Track C" || tc["uri"] != "spotify:track:cccc" {
 		t.Errorf("track C = %+v, want uri/id fallback to _uri", tc)
 	}
+	// the empty-name item at index 1 is skipped but still occupies a playlist slot,
+	// so Track C (payload index 2) reports absolute position 2
+	if tc["position"] != 2 {
+		t.Errorf("track C position = %v, want 2 (skipped slot still counted)", tc["position"])
+	}
 	if _, has := tc["duration_ms"]; has {
 		t.Errorf("duration_ms = %v, want absent", tc["duration_ms"])
 	}
@@ -443,9 +451,28 @@ func TestMapPlaylistTracksPage(t *testing.T) {
 	}
 }
 
+func TestMapPlaylistTracksPage_BaseOffset(t *testing.T) {
+	t.Parallel()
+	items, _, err := mapPlaylistTracksPage([]byte(playlistTracksFixture), 50)
+	if err != nil {
+		t.Fatalf("mapPlaylistTracksPage: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2", len(items))
+	}
+	ta, _ := items[0].(map[string]any)["track"].(map[string]any)
+	tc, _ := items[1].(map[string]any)["track"].(map[string]any)
+	if ta["position"] != 50 {
+		t.Errorf("track A position = %v, want 50", ta["position"])
+	}
+	if tc["position"] != 52 {
+		t.Errorf("track C position = %v, want 52", tc["position"])
+	}
+}
+
 func TestMapPlaylistTracksPage_BadJSON(t *testing.T) {
 	t.Parallel()
-	if _, _, err := mapPlaylistTracksPage([]byte("not json")); err == nil {
+	if _, _, err := mapPlaylistTracksPage([]byte("not json"), 0); err == nil {
 		t.Error("expected error for non-JSON payload")
 	}
 }

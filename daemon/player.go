@@ -1415,13 +1415,20 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if data.SkipToUri != "" {
 			cmd.Options.SkipTo = connectSkipTo{TrackUri: data.SkipToUri}
 		}
+		if data.Offset != nil {
+			cmd.Options.Offset = &connectOffset{Uri: data.Offset.Uri, Position: data.Offset.Position}
+		}
 		shuf := "inherit"
 		if data.Shuffle != nil {
 			cmd.Options.PlayerOptionsOverride.ShufflingContext = data.Shuffle
 			shuf = fmt.Sprintf("%v", *data.Shuffle)
 		}
 		// TEMP diagnostic logging while verifying the play envelope on hardware.
-		p.app.log.Infof("play: context=%s skipTo=%q shuffle=%s -> %s", data.Uri, data.SkipToUri, shuf, targetName)
+		offsetStr := ""
+		if data.Offset != nil {
+			offsetStr = fmt.Sprintf(" offset={uri:%q pos:%d}", data.Offset.Uri, data.Offset.Position)
+		}
+		p.app.log.Infof("play: context=%s skipTo=%q shuffle=%s%s -> %s", data.Uri, data.SkipToUri, shuf, offsetStr, targetName)
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, cmd)
 
 	case ApiRequestTypeSearch:
@@ -1496,7 +1503,15 @@ type connectContext struct {
 type connectOptions struct {
 	License               string                       `json:"license,omitempty"`
 	SkipTo                connectSkipTo                `json:"skip_to"`
+	Offset                *connectOffset               `json:"offset,omitempty"`
 	PlayerOptionsOverride connectPlayerOptionsOverride `json:"player_options_override"`
+}
+
+// connectOffset is the play command's start position inside the context
+// (absolute index and/or the track uri to resolve within the context)
+type connectOffset struct {
+	Uri      string `json:"uri,omitempty"`
+	Position int    `json:"position,omitempty"`
 }
 
 type connectPlayerOptionsOverride struct {

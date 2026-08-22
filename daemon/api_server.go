@@ -308,11 +308,19 @@ type ApiRequestDataLyrics struct {
 	Richsync   bool
 }
 
+// ApiRequestPlayOffset is the start position within the play context: either
+// an absolute index (position) or a specific track uri (first occurrence)
+type ApiRequestPlayOffset struct {
+	Uri      string `json:"uri,omitempty"`
+	Position int    `json:"position,omitempty"`
+}
+
 type ApiRequestDataPlay struct {
-	Uri       string `json:"uri"`
-	SkipToUri string `json:"skip_to_uri"`
-	Paused    bool   `json:"paused"`
-	Shuffle   *bool  `json:"shuffle,omitempty"`
+	Uri       string             `json:"uri"`
+	SkipToUri string             `json:"skip_to_uri"`
+	Paused    bool               `json:"paused"`
+	Shuffle   *bool              `json:"shuffle,omitempty"`
+	Offset    *ApiRequestPlayOffset `json:"offset,omitempty"`
 }
 
 type ApiRequestDataTransfer struct {

@@ -161,9 +161,9 @@ func (p *AppPlayer) webApiPlaylistTracks(ctx context.Context, playlistID string,
 		p.app.log.Warnf("web-api: playlists/%s/tracks: %v", playlistID, err)
 		return nil, err
 	}
-	items, total, err := mapPlaylistTracksPage(data)
+	items, total, err := mapPlaylistTracksPage(data, offset)
 	if err != nil {
-		p.app.log.Warnf("web-api: playlists/%s/tracks: bad pathfinder payload: %v", playlistID, err)
+		p.app.log.Warnf("web-api: playlists/%s/tracks: bad pathfinder payload: %v", err)
 		return nil, err
 	}
 	next := any(nil)
@@ -310,14 +310,16 @@ type playlistTracksPayload struct {
 	} `json:"data"`
 }
 
-func mapPlaylistTracksPage(data []byte) ([]any, int, error) {
+// baseOffset is the page offset (first track's absolute playlist position), so
+// each item can report its absolute position for context playback offsets
+func mapPlaylistTracksPage(data []byte, baseOffset int) ([]any, int, error) {
 	var r playlistTracksPayload
 	if err := json.Unmarshal(data, &r); err != nil {
 		return nil, 0, err
 	}
 	c := r.Data.PlaylistV2.Content
 	out := make([]any, 0, len(c.Items))
-	for _, it := range c.Items {
+	for i, it := range c.Items {
 		d := it.ItemV2.Data
 		if d.Name == "" {
 			continue
@@ -351,11 +353,12 @@ func mapPlaylistTracksPage(data []byte) ([]any, int, error) {
 			}
 		}
 		track := map[string]any{
-			"id":      id,
-			"name":    d.Name,
-			"uri":     uri,
-			"artists": artists,
-			"album":   album,
+			"id":       id,
+			"name":     d.Name,
+			"uri":      uri,
+			"artists":  artists,
+			"album":    album,
+			"position": baseOffset + i,
 		}
 		if d.DurationMs > 0 {
 			track["duration_ms"] = d.DurationMs
