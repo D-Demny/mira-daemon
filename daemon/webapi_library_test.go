@@ -778,6 +778,58 @@ func TestMapPfTrackItems_ItemV2Shape(t *testing.T) {
 	}
 }
 
+// the live fetchPlaylist payload ships empty album objects for its tracks
+// ("album":{"images":[],"name":""}); the cover must then come from the track's
+// own visualIdentityTrait (bug23).
+const playlistTracksAlbumFallbackFixture = `{
+  "data": {
+    "playlistV2": {
+      "content": {
+        "totalCount": 1,
+        "items": [
+          {
+            "itemV2": {
+              "_uri": "spotify:track:llp-1",
+              "data": {
+                "name": "In The End",
+                "uri": "spotify:track:llp-1",
+                "artists": {"items": [{"profile": {"name": "Linkin Park"}}]},
+                "album": {"name": "", "images": []},
+                "visualIdentityTrait": {
+                  "images": [{"url": "https://i.scdn.com/hybrid.jpg", "width": 300, "height": 300}]
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}`
+
+func TestMapPlaylistTracksPage_AlbumFallback(t *testing.T) {
+	t.Parallel()
+	items, _, err := mapPlaylistTracksPage([]byte(playlistTracksAlbumFallbackFixture), 0)
+	if err != nil {
+		t.Fatalf("mapPlaylistTracksPage: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
+	}
+	tm, _ := items[0].(map[string]any)["track"].(map[string]any)
+	if tm["name"] != "In The End" || tm["uri"] != "spotify:track:llp-1" {
+		t.Errorf("track = %+v", tm)
+	}
+	album, _ := tm["album"].(map[string]any)
+	if album["name"] != "" {
+		t.Errorf("album name = %v, want empty", album["name"])
+	}
+	imgs, _ := album["images"].([]webApiImage)
+	if len(imgs) != 1 || imgs[0].URL != "https://i.scdn.com/hybrid.jpg" {
+		t.Errorf("album images = %+v, want the track's own cover (bug23)", imgs)
+	}
+}
+
 func TestWebApiImagesFromAny(t *testing.T) {
 	t.Parallel()
 	wrapped := map[string]any{
