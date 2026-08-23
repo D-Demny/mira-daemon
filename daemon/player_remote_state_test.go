@@ -285,7 +285,7 @@ func TestClusterToRemoteState_QueueTracksProjectedViaProjectQueue(t *testing.T) 
 
 	// prev/next tracks wired through projectQueue with QueueLimit cap
 	c := baseCluster()
-	c.PlayerState.NextTracks = make([]*connectpb.ProvidedTrack, 30)
+	c.PlayerState.NextTracks = make([]*connectpb.ProvidedTrack, QueueLimit+50)
 	for i := range c.PlayerState.NextTracks {
 		c.PlayerState.NextTracks[i] = &connectpb.ProvidedTrack{
 			Uri: "spotify:track:next",
@@ -293,8 +293,8 @@ func TestClusterToRemoteState_QueueTracksProjectedViaProjectQueue(t *testing.T) 
 	}
 
 	rs := clusterToRemoteState(c)
-	if len(rs.NextTracks) > QueueLimit {
-		t.Errorf("NextTracks: got %d entries, must be capped at QueueLimit (%d)",
+	if len(rs.NextTracks) != QueueLimit {
+		t.Errorf("NextTracks: got %d entries, want exactly the QueueLimit (%d) cap",
 			len(rs.NextTracks), QueueLimit)
 	}
 	// PrevTracks is empty in baseCluster, should round-trip as nil/empty.

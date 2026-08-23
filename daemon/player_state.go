@@ -106,7 +106,8 @@ type RemoteState struct {
 	DisallowSkipNext bool
 	DisallowSeek     bool
 
-	// surrounding queue capped at QueueLimit per direction, for art/lyrics prefetch
+	// surrounding queue capped at QueueLimit per direction; the upcoming queue
+	// feeds the 'Läuft gerade' cards in full (bug26) plus art/lyrics prefetch
 	PrevTracks []QueueTrack
 	NextTracks []QueueTrack
 
@@ -124,8 +125,10 @@ type QueueTrack struct {
 	ImageUrl string `json:"image_url"`
 }
 
-// max entries per direction, UI only prefetches a handful
-const QueueLimit = 10
+// max entries per direction. Generous on purpose: the full upcoming queue
+// feeds the 'Läuft gerade' pane (bug26) and only a handful is prefetched; the
+// cap remains a payload guard against pathological queue sizes.
+const QueueLimit = 100
 
 // projects ProvidedTracks to QueueTracks, skips entries with no URI
 func projectQueue(tracks []*connectpb.ProvidedTrack, limit int) []QueueTrack {
