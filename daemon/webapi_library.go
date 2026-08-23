@@ -496,94 +496,27 @@ func mapRecentlyPlayedPage(data []byte) ([]any, error) {
 	return out, nil
 }
 
-// the fetchPlaylist content payload (playlistV2.content)
-type playlistTracksPayload struct {
-	Data struct {
-		PlaylistV2 struct {
-			Content struct {
-				TotalCount int `json:"totalCount"`
-				Items      []struct {
-					ItemV2 struct {
-						URI  string `json:"_uri"`
-						Data struct {
-							Name    string `json:"name"`
-							URI     string `json:"uri"`
-							Artists struct {
-								Items []struct {
-									Profile struct {
-										Name string `json:"name"`
-									} `json:"profile"`
-								} `json:"items"`
-							} `json:"artists"`
-							Album      any `json:"album"` // may be absent in the payload
-							DurationMs int `json:"durationMs"`
-						} `json:"data"`
-					} `json:"itemV2"`
-				} `json:"items"`
-			} `json:"content"`
-		} `json:"playlistV2"`
-	} `json:"data"`
-}
-
-// baseOffset is the page offset (first track's absolute playlist position), so
-// each item can report its absolute position for context playback offsets
+// mapPlaylistTracksPage maps one page of a fetchPlaylist payload
+// (playlistV2.content) to the Web API response shape. Items are parsed
+// leniently via mapPfTrackItems (bug23): when the payload ships no album data
+// for a track, the track's own cover (visualIdentityTrait) provides the
+// artwork, so playlist track cards never render a bare black box.
 func mapPlaylistTracksPage(data []byte, baseOffset int) ([]any, int, error) {
-	var r playlistTracksPayload
+	var r struct {
+		Data struct {
+			PlaylistV2 struct {
+				Content struct {
+					TotalCount int   `json:"totalCount"`
+					Items      []any `json:"items"`
+				} `json:"content"`
+			} `json:"playlistV2"`
+		} `json:"data"`
+	}
 	if err := json.Unmarshal(data, &r); err != nil {
 		return nil, 0, err
 	}
 	c := r.Data.PlaylistV2.Content
-	out := make([]any, 0, len(c.Items))
-	for i, it := range c.Items {
-		d := it.ItemV2.Data
-		if d.Name == "" {
-			continue
-		}
-		uri := d.URI
-		if uri == "" {
-			uri = it.ItemV2.URI
-		}
-		if uri == "" {
-			continue
-		}
-		id := uri[strings.LastIndex(uri, ":")+1:]
-		artists := make([]any, 0, len(d.Artists.Items))
-		for _, a := range d.Artists.Items {
-			if a.Profile.Name == "" {
-				continue
-			}
-			artists = append(artists, map[string]any{"name": a.Profile.Name})
-		}
-		album := map[string]any{"name": "", "images": []any{}}
-		if b, err := json.Marshal(d.Album); err == nil {
-			var obj struct {
-				Name   string `json:"name"`
-				Images any    `json:"images"`
-			}
-			if json.Unmarshal(b, &obj) == nil && (obj.Name != "" || obj.Images != nil) {
-				album["name"] = obj.Name
-				if imgs := webApiImagesFromAny(obj.Images); imgs != nil {
-					album["images"] = imgs
-				}
-			}
-		}
-		track := map[string]any{
-			"id":       id,
-			"name":     d.Name,
-			"uri":      uri,
-			"artists":  artists,
-			"album":    album,
-			"position": baseOffset + i,
-		}
-		if d.DurationMs > 0 {
-			track["duration_ms"] = d.DurationMs
-		}
-		out = append(out, map[string]any{
-			"is_local": false,
-			"track":    track,
-		})
-	}
-	return out, c.TotalCount, nil
+	return mapPfTrackItems(c.Items, baseOffset), c.TotalCount, nil
 }
 
 // mapSavedTracksPage maps a fetchLibraryTracks payload (data.me.library.tracks)
