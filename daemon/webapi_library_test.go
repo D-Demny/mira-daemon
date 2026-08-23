@@ -18,7 +18,9 @@ func TestIsLocalWebApiPath(t *testing.T) {
 	}{
 		{"me/playlists", true},
 		{"me/player/recently-played", true},
+		{"me/tracks", true},
 		{"me", false},
+		{"me/tracks/extra", false},
 		{"me/top", false},
 		{"playlists/abc", false},
 		{"playlists/abc123/tracks", true},
@@ -628,6 +630,154 @@ func TestMapPlaylistTracksPage_BadJSON(t *testing.T) {
 	}
 }
 
+// the fetchLibraryTracks payload (me.library.tracks): items[].track wrappers
+// with profile-nested artists; one item ships no album data at all (the
+// fallback then reads the track's own cover), one carries an inline album.
+const savedTracksFixture = `{
+  "data": {
+    "me": {
+      "library": {
+        "tracks": {
+          "totalCount": 3,
+          "items": [
+            {
+              "track": {
+                "_uri": "spotify:track:liked-1",
+                "data": {
+                  "name": "Faded",
+                  "uri": "spotify:track:liked-1",
+                  "artists": {"items": [{"profile": {"name": "Alan Walker"}}]},
+                  "album": {"name": "", "images": []},
+                  "visualIdentityTrait": {
+                    "images": [{"url": "https://i.scdn.com/faded.jpg", "width": 300, "height": 300}]
+                  },
+                  "durationMs": 221000
+                }
+              }
+            },
+            {
+              "track": {
+                "_uri": "spotify:track:liked-2",
+                "data": {
+                  "name": "Another One Bites the Dust",
+                  "uri": "spotify:track:liked-2",
+                  "artists": {"items": [{"profile": {"name": "Queen"}}]},
+                  "album": {
+                    "name": "News of the World",
+                    "images": [{"url": "https://i.scdn.com/ntw.jpg", "width": 640, "height": 640}]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}`
+
+func TestMapSavedTracksPage(t *testing.T) {
+	t.Parallel()
+	items, total, err := mapSavedTracksPage([]byte(savedTracksFixture), 0)
+	if err != nil {
+		t.Fatalf("mapSavedTracksPage: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("total = %d, want 3", total)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2", len(items))
+	}
+
+	first, _ := items[0].(map[string]any)
+	tf, _ := first["track"].(map[string]any)
+	if tf["id"] != "liked-1" || tf["name"] != "Faded" || tf["uri"] != "spotify:track:liked-1" {
+		t.Errorf("track 1 = %+v", tf)
+	}
+	if tf["position"] != 0 {
+		t.Errorf("track 1 position = %v, want 0", tf["position"])
+	}
+	if tf["duration_ms"] != 221000 {
+		t.Errorf("duration_ms = %v, want 221000", tf["duration_ms"])
+	}
+	artists, _ := tf["artists"].([]any)
+	if len(artists) != 1 || artists[0].(map[string]any)["name"] != "Alan Walker" {
+		t.Errorf("artists = %+v", artists)
+	}
+	// empty album data: the track's own cover art is used instead (bug22/23)
+	album, _ := tf["album"].(map[string]any)
+	if album["name"] != "" {
+		t.Errorf("album name = %v, want empty", album["name"])
+	}
+	imgs, _ := album["images"].([]webApiImage)
+	if len(imgs) != 1 || imgs[0].URL != "https://i.scdn.com/faded.jpg" {
+		t.Errorf("album images = %+v, want the track cover", imgs)
+	}
+
+	second, _ := items[1].(map[string]any)
+	ts, _ := second["track"].(map[string]any)
+	if ts["position"] != 1 {
+		t.Errorf("track 2 position = %v, want 1", ts["position"])
+	}
+	albumS, _ := ts["album"].(map[string]any)
+	if albumS["name"] != "News of the World" {
+		t.Errorf("album name = %v, want News of the World", albumS["name"])
+	}
+}
+
+func TestMapSavedTracksPage_BaseOffset(t *testing.T) {
+	t.Parallel()
+	items, _, err := mapSavedTracksPage([]byte(savedTracksFixture), 50)
+	if err != nil {
+		t.Fatalf("mapSavedTracksPage: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2", len(items))
+	}
+	tf, _ := items[0].(map[string]any)["track"].(map[string]any)
+	ts, _ := items[1].(map[string]any)["track"].(map[string]any)
+	if tf["position"] != 50 || ts["position"] != 51 {
+		t.Errorf("positions = %v, %v, want 50, 51", tf["position"], ts["position"])
+	}
+}
+
+func TestMapSavedTracksPage_BadJSON(t *testing.T) {
+	t.Parallel()
+	if _, _, err := mapSavedTracksPage([]byte("not json"), 0); err == nil {
+		t.Error("expected error for non-JSON payload")
+	}
+}
+
+// the shared lenient mapper must also handle the playlist itemV2 shape
+// (mapPlaylistTracksPage keeps its strict struct; this pins the wrapper
+// detection used by the new code path)
+func TestMapPfTrackItems_ItemV2Shape(t *testing.T) {
+	t.Parallel()
+	raw := []any{
+		map[string]any{
+			"itemV2": map[string]any{
+				"_uri": "spotify:track:cccc",
+				"data": map[string]any{
+					"name":    "Track C",
+					"uri":     "",
+					"artists": map[string]any{"items": []any{}},
+				},
+			},
+		},
+	}
+	items := mapPfTrackItems(raw, 10)
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
+	}
+	tm, _ := items[0].(map[string]any)["track"].(map[string]any)
+	if tm["id"] != "cccc" || tm["uri"] != "spotify:track:cccc" {
+		t.Errorf("track = %+v, want uri fallback to _uri", tm)
+	}
+	if tm["position"] != 10 {
+		t.Errorf("position = %v, want 10", tm["position"])
+	}
+}
+
 func TestWebApiImagesFromAny(t *testing.T) {
 	t.Parallel()
 	wrapped := map[string]any{
@@ -778,6 +928,7 @@ func TestWebApiLocalDispatch(t *testing.T) {
 	}{
 		{"playlists local", http.MethodGet, "/web-api/me/playlists?limit=5&offset=10", ApiRequestTypeWebApiLocal, "me/playlists"},
 		{"recently played local", http.MethodGet, "/web-api/me/player/recently-played?limit=20", ApiRequestTypeWebApiLocal, "me/player/recently-played"},
+		{"saved tracks local", http.MethodGet, "/web-api/me/tracks?limit=50&offset=0", ApiRequestTypeWebApiLocal, "me/tracks"},
 		{"other path proxied", http.MethodGet, "/web-api/me/top?limit=1", ApiRequestTypeWebApi, "me/top"},
 		{"non-GET proxied", http.MethodPost, "/web-api/me/playlists", ApiRequestTypeWebApi, "me/playlists"},
 	}

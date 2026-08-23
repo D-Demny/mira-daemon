@@ -75,7 +75,7 @@ type webApiPlaylistsResponse struct {
 // instead of being proxied to the (rate-limited) public Web API.
 func isLocalWebApiPath(path string) bool {
 	switch path {
-	case "me/playlists", "me/player/recently-played":
+	case "me/playlists", "me/player/recently-played", "me/tracks":
 		return true
 	default:
 		return playlistTracksPath(path) != ""
@@ -102,6 +102,8 @@ func (p *AppPlayer) handleWebApiLocal(ctx context.Context, d ApiRequestDataWebAp
 		return p.webApiPlaylists(ctx, d.Query)
 	case d.Path == "me/player/recently-played":
 		return p.webApiRecentlyPlayed(ctx, d.Query)
+	case d.Path == "me/tracks":
+		return p.webApiSavedTracks(ctx, d.Query)
 	default:
 		if id := playlistTracksPath(d.Path); id != "" {
 			return p.webApiPlaylistTracks(ctx, id, d.Query)
@@ -144,6 +146,39 @@ func (p *AppPlayer) webApiRecentlyPlayed(ctx context.Context, q url.Values) (any
 		"cursors": map[string]any{},
 		"limit":   limit,
 		"href":    "https://api.spotify.com/v1/me/player/recently-played",
+	}, nil
+}
+
+// webApiSavedTracks serves GET me/tracks (Liked Songs) from the
+// fetchLibraryTracks Pathfinder query (the same persisted query the voice
+// catalog pages with), mapped to the Web API response shape (bug22).
+func (p *AppPlayer) webApiSavedTracks(ctx context.Context, q url.Values) (any, error) {
+	limit, offset := parseWebApiPaging(q)
+	body := p.pfBody("fetchLibraryTracks", map[string]any{
+		"offset": offset,
+		"limit":  limit,
+	})
+	data, err := p.pathfinderQueryEx(ctx, body, false)
+	if err != nil {
+		p.app.log.Warnf("web-api: me/tracks: %v", err)
+		return nil, err
+	}
+	items, total, err := mapSavedTracksPage(data, offset)
+	if err != nil {
+		p.app.log.Warnf("web-api: me/tracks: bad pathfinder payload: %v", err)
+		return nil, err
+	}
+	next := any(nil)
+	if offset+limit < total {
+		next = fmt.Sprintf("https://api.spotify.com/v1/me/tracks?limit=%d&offset=%d", limit, offset+limit)
+	}
+	return map[string]any{
+		"href":   "https://api.spotify.com/v1/me/tracks",
+		"items":  items,
+		"limit":  limit,
+		"offset": offset,
+		"next":   next,
+		"total":  total,
 	}, nil
 }
 
@@ -549,6 +584,112 @@ func mapPlaylistTracksPage(data []byte, baseOffset int) ([]any, int, error) {
 		})
 	}
 	return out, c.TotalCount, nil
+}
+
+// mapSavedTracksPage maps a fetchLibraryTracks payload (data.me.library.tracks)
+// to the Web API me/tracks item shape (bug22: the Liked Songs sub-menu).
+func mapSavedTracksPage(data []byte, baseOffset int) ([]any, int, error) {
+	var r struct {
+		Data struct {
+			Me struct {
+				Library struct {
+					Tracks struct {
+						TotalCount int `json:"totalCount"`
+						Items      []any `json:"items"`
+					} `json:"tracks"`
+				} `json:"library"`
+			} `json:"me"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, 0, err
+	}
+	t := r.Data.Me.Library.Tracks
+	return mapPfTrackItems(t.Items, baseOffset), t.TotalCount, nil
+}
+
+// mapPfTrackItems maps one page of raw pathfinder track items to the Web API
+// playlist-track item shape ({is_local, track}). The item serialization
+// rotates between queries (the library pages ship items[].track, the playlist
+// pages items[].itemV2), so the fields are extracted leniently (same pattern
+// as the recents mapper, bug19).
+func mapPfTrackItems(rawItems []any, baseOffset int) []any {
+	out := make([]any, 0, len(rawItems))
+	for i, raw := range rawItems {
+		em := asMap(raw)
+		if em == nil {
+			continue
+		}
+		tm := em
+		if w := firstTrackWrapper(em); w != nil {
+			tm = w
+		}
+		dm := asMap(tm["data"])
+		if dm == nil {
+			dm = tm
+		}
+		name := firstString(dm, "name")
+		if name == "" {
+			continue
+		}
+		uri := firstString(dm, "uri")
+		if uri == "" {
+			uri = firstString(tm, "_uri", "uri")
+		}
+		if uri == "" {
+			continue
+		}
+		id := uri[strings.LastIndex(uri, ":")+1:]
+		track := map[string]any{
+			"id":       id,
+			"name":     name,
+			"uri":      uri,
+			"artists":  webApiArtistsFromAny(dm["artists"]),
+			"album":    webApiTrackAlbum(dm),
+			"position": baseOffset + i,
+		}
+		if dur := asFloat(dm["durationMs"]); dur > 0 {
+			track["duration_ms"] = int(dur)
+		}
+		out = append(out, map[string]any{
+			"is_local": false,
+			"track":    track,
+		})
+	}
+	return out
+}
+
+// firstTrackWrapper returns the nested track entity wrapper of a raw page
+// item (items[].track for the library, items[].itemV2 for playlists) or nil
+// when the item is the track entity itself.
+func firstTrackWrapper(em map[string]any) map[string]any {
+	for _, key := range []string{"track", "itemV2"} {
+		if m := asMap(em[key]); m != nil {
+			return m
+		}
+	}
+	return nil
+}
+
+// webApiTrackAlbum extracts the album name + images of a track item from the
+// known pathfinder shapes: the item's album ref (inline {name,images} or an
+// entity wrapper) or, when the payload ships no album data at all, the
+// track's own cover art (visualIdentityTrait.images) — the same artwork.
+func webApiTrackAlbum(itemData map[string]any) map[string]any {
+	album := map[string]any{"name": "", "images": []any{}}
+	id := pfIdentityFromAny(itemData["album"])
+	if id.Name != "" {
+		album["name"] = id.Name
+	}
+	if len(id.Images) > 0 {
+		album["images"] = id.Images
+	}
+	if len(asSlice(album["images"])) == 0 {
+		if imgs := webApiImagesFromAny(asMap(itemData["visualIdentityTrait"])["images"]); imgs != nil {
+			album["images"] = imgs
+		}
+	}
+	return album
 }
 
 // webApiArtistsFromAny maps the recents/track identityTrait contributors
