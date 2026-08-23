@@ -113,6 +113,8 @@ func (p *AppPlayer) handleWebApiLocal(ctx context.Context, d ApiRequestDataWebAp
 // webApiRecentlyPlayed serves GET me/player/recently-played from the web
 // player's "Recents" list (spotify:list:recents:page), mapped to the Web API
 // response shape. Only track entries are kept, like the public endpoint.
+// Each item carries the context the track was played from (album/playlist)
+// as context_uri when it is a playable context (bug19).
 func (p *AppPlayer) webApiRecentlyPlayed(ctx context.Context, q url.Values) (any, error) {
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	if limit <= 0 {
@@ -143,6 +145,146 @@ func (p *AppPlayer) webApiRecentlyPlayed(ctx context.Context, q url.Values) (any
 		"limit":   limit,
 		"href":    "https://api.spotify.com/v1/me/player/recently-played",
 	}, nil
+}
+
+// playableContextPrefixes are the entity types a connect play call accepts as
+// a context uri (bug19: recents cards replay the context the track came from)
+var playableContextPrefixes = []string{
+	"spotify:album:",
+	"spotify:playlist:",
+	"spotify:collection:tracks",
+	"spotify:artist:",
+}
+
+func isPlayableContextURI(uri string) bool {
+	for _, pfx := range playableContextPrefixes {
+		if strings.HasPrefix(uri, pfx) {
+			return true
+		}
+	}
+	return false
+}
+
+// ── lenient pathfinder identity helpers ────────────────────────────────────
+// The web-player payloads rotate their serialization (e.g. contributors went
+// from a flat array to an {items:[...]} object, album refs from inline
+// {name,images} to entity wrappers). The mappers below therefore navigate
+// with type assertions and accept every shape we have seen, in order.
+
+func asMap(v any) map[string]any {
+	m, _ := v.(map[string]any)
+	return m
+}
+
+func asSlice(v any) []any {
+	s, _ := v.([]any)
+	return s
+}
+
+func asStr(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func asFloat(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case json.Number:
+		f, _ := n.Float64()
+		return f
+	}
+	return 0
+}
+
+// firstString returns the first non-empty string value among the given keys.
+func firstString(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if s := asStr(m[k]); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// identityCandidates collects the candidate objects that may carry the
+// identity fields of an entity: the object itself, its data wrapper, and the
+// identityTrait objects (at both nesting levels).
+func identityCandidates(v any) []map[string]any {
+	m := asMap(v)
+	if m == nil {
+		return nil
+	}
+	out := []map[string]any{m}
+	if d := asMap(m["data"]); d != nil {
+		out = append(out, d)
+	}
+	if t := asMap(m["identityTrait"]); t != nil {
+		out = append(out, t)
+	}
+	if t := asMap(asMap(m["data"])["identityTrait"]); t != nil {
+		out = append(out, t)
+	}
+	return out
+}
+
+// pfIdentity is the merged result of extracting name/uri/images from an
+// entity-shaped value, whichever of the known shapes it uses.
+type pfIdentity struct {
+	Name   string
+	URI    string
+	Images []webApiImage
+}
+
+func pfIdentityFromAny(v any) pfIdentity {
+	var out pfIdentity
+	for _, c := range identityCandidates(v) {
+		if out.Name == "" {
+			out.Name = firstString(c, "name")
+		}
+		if out.URI == "" {
+			out.URI = firstString(c, "uri", "_uri")
+		}
+		if len(out.Images) == 0 {
+			if imgs := webApiImagesFromAny(c["images"]); imgs != nil {
+				out.Images = imgs
+			} else if imgs := webApiImagesFromAny(asMap(c["visualIdentityTrait"])["images"]); imgs != nil {
+				out.Images = imgs
+			}
+		}
+	}
+	return out
+}
+
+// webApiImagesFromAny normalizes the image payloads the web-player queries
+// ship ({sources:[{url,width,height}]} or a bare array) to webApiImage.
+func webApiImagesFromAny(v any) []webApiImage {
+	if v == nil {
+		return nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var wrapped struct {
+		Sources []webApiImage `json:"sources"`
+	}
+	if err := json.Unmarshal(b, &wrapped); err == nil && len(wrapped.Sources) > 0 {
+		return wrapped.Sources
+	}
+	var items struct {
+		Items []webApiImage `json:"items"`
+	}
+	if err := json.Unmarshal(b, &items); err == nil && len(items.Items) > 0 {
+		return items.Items
+	}
+	var bare []webApiImage
+	if err := json.Unmarshal(b, &bare); err == nil && len(bare) > 0 {
+		return bare
+	}
+	return nil
 }
 
 // webApiPlaylistTracks serves GET playlists/<id>/tracks from the fetchPlaylist
@@ -182,47 +324,83 @@ func (p *AppPlayer) webApiPlaylistTracks(ctx context.Context, playlistID string,
 }
 
 // the "Recents" list payload: data.lists[] of the generic web-player List
-// type; every entry carries the entity traits of the played item
+// type; every entry carries the entity traits of the played item. The item
+// bodies are kept as raw JSON (any) because the web-player serialization of
+// the trait fields rotates (bug19: contributors changed shape and broke the
+// strict parser with a 500).
 type recentsPayload struct {
 	Data struct {
-		Lists []struct {
-			Typename string `json:"__typename"`
-			Items    struct {
-				TotalCount int `json:"totalCount"`
-				Items      []struct {
-					AddedAt recentsAddedAt `json:"addedAt"`
-					Entity  struct {
-						URI  string `json:"_uri"`
-						Data struct {
-							IdentityTrait struct {
-								Name         string `json:"name"`
-								Contributors []struct {
-									URI  string `json:"uri"`
-									Name string `json:"name"`
-								} `json:"contributors"`
-								ContentHierarchyParent *struct {
-									URI           string `json:"uri"`
-									IdentityTrait struct {
-										Name string `json:"name"`
-									} `json:"identityTrait"`
-								} `json:"contentHierarchyParent"`
-							} `json:"identityTrait"`
-							VisualIdentityTrait struct {
-								Images any `json:"images"` // {sources:[...]} or a bare array
-							} `json:"visualIdentityTrait"`
-						} `json:"data"`
-					} `json:"entity"`
-				} `json:"items"`
-			} `json:"items"`
-		} `json:"lists"`
+		Lists []any `json:"lists"`
 	} `json:"data"`
+}
+
+// recentsItem is one recents list entry, parsed leniently
+type recentsItem struct {
+	added   recentsAddedAt
+	uri     string
+	name    string
+	artists []any
+	images  []webApiImage
+	// the context the track was played from (album/playlist/...), when known
+	contextURI  string
+	albumName   string
+}
+
+// parseRecentsItem extracts the identity fields from one raw list entry.
+// It returns ok=false for entries that are not tracks (e.g. episodes).
+func parseRecentsItem(raw any) (recentsItem, bool) {
+	em := asMap(raw)
+	if em == nil {
+		return recentsItem{}, false
+	}
+	var it recentsItem
+	if am := asMap(em["addedAt"]); am != nil {
+		it.added = recentsAddedAt{Timestamp: asFloat(am["timestamp"]), IsoString: asStr(am["isoString"])}
+	}
+	ent := asMap(em["entity"])
+	dm := asMap(ent["data"])
+	it.uri = firstString(ent, "_uri", "uri")
+	if it.uri == "" {
+		it.uri = firstString(dm, "uri", "_uri")
+	}
+	if !strings.HasPrefix(it.uri, "spotify:track:") {
+		return recentsItem{}, false
+	}
+	idTrait := asMap(dm["identityTrait"])
+	it.name = firstString(idTrait, "name")
+	if it.name == "" {
+		it.name = firstString(dm, "name")
+	}
+	it.artists = webApiArtistsFromAny(idTrait["contributors"])
+	if imgs := webApiImagesFromAny(asMap(dm["visualIdentityTrait"])["images"]); imgs != nil {
+		it.images = imgs
+	}
+	if parent := asMap(idTrait["contentHierarchyParent"]); parent != nil {
+		parentURI := firstString(parent, "uri", "_uri")
+		parentName := firstString(asMap(parent["identityTrait"]), "name")
+		if parentName == "" {
+			parentName = firstString(parent, "name")
+		}
+		if parentName == "" {
+			parentName = firstString(asMap(asMap(parent["data"])["identityTrait"]), "name")
+		}
+		// only the album parent names the album; other parents (playlists,
+		// collections) are the playback context instead
+		if strings.HasPrefix(parentURI, "spotify:album:") {
+			it.albumName = parentName
+		}
+		if isPlayableContextURI(parentURI) {
+			it.contextURI = parentURI
+		}
+	}
+	return it, true
 }
 
 // the addedAt field of a recents list item: the web player ships it as an
 // object ({timestamp (epoch ms), isoString}); older bundles sent a bare string
 type recentsAddedAt struct {
-	Timestamp float64 `json:"timestamp"`
-	IsoString string  `json:"isoString"`
+	Timestamp float64
+	IsoString string
 }
 
 // recentsPlayedAt converts the addedAt object into the ISO-8601 played_at
@@ -248,34 +426,36 @@ func mapRecentlyPlayedPage(data []byte) ([]any, error) {
 		return nil, err
 	}
 	out := make([]any, 0, len(r.Data.Lists))
-	for _, list := range r.Data.Lists {
-		if list.Typename != "List" {
+	for _, listRaw := range r.Data.Lists {
+		list := asMap(listRaw)
+		if list == nil || asStr(list["__typename"]) != "List" {
 			continue
 		}
-		for _, it := range list.Items.Items {
-			uri := it.Entity.URI
-			if !strings.HasPrefix(uri, "spotify:track:") {
+		entries := asSlice(asMap(list["items"])["items"])
+		for _, raw := range entries {
+			it, ok := parseRecentsItem(raw)
+			if !ok {
 				continue
 			}
-			id := strings.TrimPrefix(uri, "spotify:track:")
-			ident := it.Entity.Data.IdentityTrait
-			album := map[string]any{"name": "", "images": []any{}}
-			if parent := ident.ContentHierarchyParent; parent != nil {
-				album["name"] = parent.IdentityTrait.Name
+			id := strings.TrimPrefix(it.uri, "spotify:track:")
+			album := map[string]any{"name": it.albumName, "images": []any{}}
+			if len(it.images) > 0 {
+				album["images"] = it.images
 			}
-			if imgs := webApiImagesFromAny(it.Entity.Data.VisualIdentityTrait.Images); imgs != nil {
-				album["images"] = imgs
-			}
-			out = append(out, map[string]any{
+			entry := map[string]any{
 				"track": map[string]any{
 					"id":      id,
-					"name":    ident.Name,
-					"uri":     uri,
-					"artists": webApiArtistsFromContributors(ident.Contributors),
+					"name":    it.name,
+					"uri":     it.uri,
+					"artists": it.artists,
 					"album":   album,
 				},
-				"played_at": recentsPlayedAt(it.AddedAt),
-			})
+				"played_at": recentsPlayedAt(it.added),
+			}
+			if it.contextURI != "" {
+				entry["context_uri"] = it.contextURI
+			}
+			out = append(out, entry)
 		}
 	}
 	return out, nil
@@ -371,43 +551,41 @@ func mapPlaylistTracksPage(data []byte, baseOffset int) ([]any, int, error) {
 	return out, c.TotalCount, nil
 }
 
-// webApiImagesFromAny normalizes the image payloads the web-player queries
-// ship ({sources:[{url,width,height}]} or a bare array) to webApiImage.
-func webApiImagesFromAny(v any) []webApiImage {
-	if v == nil {
-		return nil
+// webApiArtistsFromAny maps the recents/track identityTrait contributors
+// (bug19: shipped as a flat array of {uri,name} in older bundles and as an
+// {items:[...]} object with profile-nested names in newer ones) to the Web
+// API artist objects.
+func webApiArtistsFromAny(v any) []any {
+	entries := asSlice(v)
+	if entries == nil {
+		if items := asSlice(asMap(v)["items"]); items != nil {
+			entries = items
+		}
 	}
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil
-	}
-	var wrapped struct {
-		Sources []webApiImage `json:"sources"`
-	}
-	if err := json.Unmarshal(b, &wrapped); err == nil && len(wrapped.Sources) > 0 {
-		return wrapped.Sources
-	}
-	var bare []webApiImage
-	if err := json.Unmarshal(b, &bare); err == nil && len(bare) > 0 {
-		return bare
-	}
-	return nil
-}
-
-// webApiArtistsFromContributors maps the recents identityTrait contributors
-// to the Web API artist objects.
-func webApiArtistsFromContributors(cs []struct {
-	URI  string `json:"uri"`
-	Name string `json:"name"`
-}) []any {
-	out := make([]any, 0, len(cs))
-	for _, c := range cs {
-		if c.Name == "" {
+	out := make([]any, 0, len(entries))
+	for _, e := range entries {
+		em := asMap(e)
+		if em == nil {
 			continue
 		}
-		a := map[string]any{"name": c.Name}
-		if c.URI != "" {
-			a["uri"] = c.URI
+		name := firstString(em, "name")
+		if name == "" {
+			name = firstString(asMap(em["profile"]), "name")
+		}
+		if name == "" {
+			name = firstString(asMap(em["identityTrait"]), "name")
+		}
+		if name == "" {
+			name = firstString(asMap(asMap(em["data"])["identityTrait"]), "name")
+		}
+		if name == "" {
+			continue
+		}
+		a := map[string]any{"name": name}
+		if uri := firstString(em, "uri", "_uri"); uri != "" {
+			a["uri"] = uri
+		} else if uri := firstString(asMap(em["profile"]), "uri", "_uri"); uri != "" {
+			a["uri"] = uri
 		}
 		out = append(out, a)
 	}

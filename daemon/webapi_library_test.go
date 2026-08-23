@@ -311,6 +311,157 @@ func TestMapRecentlyPlayedPage(t *testing.T) {
 	}
 }
 
+// bug19: the newer web-player bundle ships contributors as an {items:[...]}
+// object with profile-nested names, a playlist (not album) as the hierarchy
+// parent, and a bare-string addedAt variant
+const recentsFixtureV2 = `{
+  "data": {
+    "lists": [
+      {
+        "__typename": "List",
+        "items": {
+          "totalCount": 3,
+          "items": [
+            {
+              "addedAt": {"timestamp": 1787306400000, "isoString": "2026-08-21T10:00:00Z"},
+              "entity": {
+                "_uri": "spotify:track:abc123",
+                "data": {
+                  "identityTrait": {
+                    "name": "Numb",
+                    "contributors": {
+                      "totalCount": 1,
+                      "items": [
+                        {"uri": "spotify:artist:lp", "profile": {"name": "Linkin Park"}}
+                      ]
+                    },
+                    "contentHierarchyParent": {
+                      "uri": "spotify:playlist:pl1",
+                      "identityTrait": {"name": "Linkin Park"}
+                    }
+                  },
+                  "visualIdentityTrait": {
+                    "images": {
+                      "sources": [{"url": "https://i.scdn.com/a.jpg", "width": 640, "height": 640}]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "addedAt": "2026-08-21T09:00:00Z",
+              "entity": {
+                "_uri": "spotify:track:def456",
+                "data": {
+                  "identityTrait": {
+                    "name": "In the End",
+                    "contributors": [{"name": "Linkin Park"}],
+                    "contentHierarchyParent": {
+                      "uri": "spotify:album:al1",
+                      "identityTrait": {"name": "Meteora"}
+                    }
+                  },
+                  "visualIdentityTrait": {
+                    "images": [{"url": "https://i.scdn.com/b.jpg", "width": 300, "height": 300}]
+                  }
+                }
+              }
+            },
+            {
+              "addedAt": {"isoString": "2026-08-21T08:00:00Z"},
+              "entity": {
+                "_uri": "spotify:track:ghi789",
+                "data": {
+                  "identityTrait": {
+                    "name": "One Step Closer",
+                    "contributors": [],
+                    "contentHierarchyParent": {
+                      "uri": "spotify:artist-playlist:xyz",
+                      "identityTrait": {"name": "LP Mix"}
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}`
+
+func TestMapRecentlyPlayedPage_NewShapes(t *testing.T) {
+	t.Parallel()
+	items, err := mapRecentlyPlayedPage([]byte(recentsFixtureV2))
+	if err != nil {
+		t.Fatalf("mapRecentlyPlayedPage: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("items = %d, want 3", len(items))
+	}
+
+	// playlist parent: context_uri set, album stays unnamed
+	entry0 := items[0].(map[string]any)
+	if entry0["context_uri"] != "spotify:playlist:pl1" {
+		t.Errorf("context_uri = %v, want spotify:playlist:pl1", entry0["context_uri"])
+	}
+	tr0 := entry0["track"].(map[string]any)
+	artists0 := tr0["artists"].([]any)
+	if len(artists0) != 1 || artists0[0].(map[string]any)["name"] != "Linkin Park" {
+		t.Errorf("artists = %+v", artists0)
+	}
+	album0 := tr0["album"].(map[string]any)
+	if album0["name"] != "" {
+		t.Errorf("album.name = %v, want empty for a playlist parent", album0["name"])
+	}
+	if imgs := album0["images"].([]webApiImage); len(imgs) != 1 || imgs[0].Width != 640 {
+		t.Errorf("album.images = %+v", album0["images"])
+	}
+
+	// album parent: names the album AND is the context
+	entry1 := items[1].(map[string]any)
+	if entry1["context_uri"] != "spotify:album:al1" {
+		t.Errorf("context_uri = %v, want spotify:album:al1", entry1["context_uri"])
+	}
+	album1 := entry1["track"].(map[string]any)["album"].(map[string]any)
+	if album1["name"] != "Meteora" {
+		t.Errorf("album.name = %v, want Meteora", album1["name"])
+	}
+	if entry1["played_at"] != "" {
+		t.Errorf("played_at = %v, want empty for the bare-string addedAt variant", entry1["played_at"])
+	}
+
+	// non-playable parent: no context_uri at all
+	entry2 := items[2].(map[string]any)
+	if _, has := entry2["context_uri"]; has {
+		t.Errorf("entry2 = %+v, want no context_uri for an artist-playlist parent", entry2)
+	}
+	if entry2["track"].(map[string]any)["name"] != "One Step Closer" {
+		t.Errorf("entry2 track = %+v", entry2["track"])
+	}
+}
+
+func TestIsPlayableContextURI(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		uri  string
+		want bool
+	}{
+		{"spotify:album:1", true},
+		{"spotify:playlist:2", true},
+		{"spotify:collection:tracks", true},
+		{"spotify:artist:3", true},
+		{"spotify:artist-playlist:4", false},
+		{"spotify:track:5", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isPlayableContextURI(c.uri); got != c.want {
+			t.Errorf("isPlayableContextURI(%q) = %v, want %v", c.uri, got, c.want)
+		}
+	}
+}
+
 func TestMapRecentlyPlayedPage_BadJSON(t *testing.T) {
 	t.Parallel()
 	if _, err := mapRecentlyPlayedPage([]byte("not json")); err == nil {
@@ -501,17 +652,15 @@ func TestWebApiImagesFromAny(t *testing.T) {
 	}
 }
 
-func TestWebApiArtistsFromContributors(t *testing.T) {
+func TestWebApiArtistsFromAny(t *testing.T) {
 	t.Parallel()
-	type contribs = []struct {
-		URI  string `json:"uri"`
-		Name string `json:"name"`
+	// older bundle shape: a flat array of {uri, name}
+	flat := []any{
+		map[string]any{"uri": "spotify:artist:1", "name": "A"},
+		map[string]any{"name": "B"},
+		map[string]any{"uri": "spotify:artist:3", "name": ""},
 	}
-	out := webApiArtistsFromContributors(contribs{
-		{URI: "spotify:artist:1", Name: "A"},
-		{URI: "", Name: "B"},
-		{URI: "spotify:artist:3", Name: ""},
-	})
+	out := webApiArtistsFromAny(flat)
 	if len(out) != 2 {
 		t.Fatalf("artists = %+v, want 2 (empty name skipped)", out)
 	}
@@ -520,6 +669,31 @@ func TestWebApiArtistsFromContributors(t *testing.T) {
 	}
 	if _, has := out[1].(map[string]any)["uri"]; has {
 		t.Errorf("artists[1] = %+v, want no uri for empty input uri", out[1])
+	}
+
+	// newer bundle shape (bug19): an {items:[...]} object with profile-nested names
+	obj := map[string]any{
+		"totalCount": 2,
+		"items": []any{
+			map[string]any{"uri": "spotify:artist:9", "profile": map[string]any{"name": "C", "uri": "spotify:artist:9"}},
+			map[string]any{"_uri": "spotify:artist:10", "data": map[string]any{
+				"identityTrait": map[string]any{"name": "D"},
+			}},
+		},
+	}
+	out2 := webApiArtistsFromAny(obj)
+	if len(out2) != 2 {
+		t.Fatalf("artists (object shape) = %+v, want 2", out2)
+	}
+	if out2[0].(map[string]any)["name"] != "C" || out2[0].(map[string]any)["uri"] != "spotify:artist:9" {
+		t.Errorf("artists[0] = %+v", out2[0])
+	}
+	if out2[1].(map[string]any)["name"] != "D" || out2[1].(map[string]any)["uri"] != "spotify:artist:10" {
+		t.Errorf("artists[1] = %+v", out2[1])
+	}
+
+	if out3 := webApiArtistsFromAny(nil); len(out3) != 0 {
+		t.Errorf("artists(nil) = %+v, want empty", out3)
 	}
 }
 
