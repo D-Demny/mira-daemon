@@ -469,6 +469,51 @@ func TestPlayerPlay_OffsetMarshalsToConnectOptions(t *testing.T) {
 	}
 }
 
+func TestPlayerPlayCommand_OffsetUriBecomesSkipTo(t *testing.T) {
+	t.Parallel()
+
+	// bug29: connect receivers (go-librespot, Spotify web player) ignore
+	// options.offset and only start a context at options.skip_to.track_uri,
+	// so a play offset carrying a track uri must be mirrored into skip_to
+	data := ApiRequestDataPlay{
+		Uri:    "spotify:playlist:abc",
+		Offset: &ApiRequestPlayOffset{Uri: "spotify:track:xyz", Position: 2},
+	}
+	cmd := buildPlayCommand(data)
+
+	if got := cmd.Options.SkipTo.TrackUri; got != "spotify:track:xyz" {
+		t.Errorf("options.skip_to.track_uri: got %q want %q", got, "spotify:track:xyz")
+	}
+	if cmd.Options.Offset == nil {
+		t.Fatal("options.offset: got nil want non-nil")
+	}
+	if got := cmd.Options.Offset.Position; got != 2 {
+		t.Errorf("options.offset.position: got %d want 2", got)
+	}
+	if got := cmd.Options.Offset.Uri; got != "spotify:track:xyz" {
+		t.Errorf("options.offset.uri: got %q want %q", got, "spotify:track:xyz")
+	}
+
+	// an explicit skip_to_uri still wins over the offset mirror
+	dataExplicit := ApiRequestDataPlay{
+		Uri:       "spotify:playlist:abc",
+		SkipToUri: "spotify:track:explicit",
+		Offset:    &ApiRequestPlayOffset{Uri: "spotify:track:xyz", Position: 2},
+	}
+	if got := buildPlayCommand(dataExplicit).Options.SkipTo.TrackUri; got != "spotify:track:explicit" {
+		t.Errorf("explicit skip_to_uri not honored: got %q", got)
+	}
+
+	// an offset without a track uri (position-only) must not fabricate a skip_to
+	dataPosOnly := ApiRequestDataPlay{
+		Uri:    "spotify:playlist:abc",
+		Offset: &ApiRequestPlayOffset{Position: 5},
+	}
+	if got := buildPlayCommand(dataPosOnly).Options.SkipTo.TrackUri; got != "" {
+		t.Errorf("skip_to.track_uri without offset uri: got %q want empty", got)
+	}
+}
+
 func TestPlayerSeek_DecodesAbsolutePositionFromBody(t *testing.T) {
 	t.Parallel()
 
