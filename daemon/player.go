@@ -1394,33 +1394,9 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if targetId == "" {
 			return nil, fmt.Errorf("no target device for play")
 		}
-		cmd := connectCommand{
-			Endpoint: "play",
-			Context: &connectContext{
-				Uri: data.Uri,
-				Url: "context://" + data.Uri,
-			},
-			Options: &connectOptions{License: "tft"},
-			PlayOrigin: &connectOrigin{
-				FeatureIdentifier:  "your_library",
-				FeatureVersion:     "go-librespot",
-				ReferrerIdentifier: "your_library",
-			},
-			LoggingParams: &connectLogging{
-				PageInstanceIds: []string{},
-				InteractionIds:  []string{},
-				CommandId:       randomCommandId(),
-			},
-		}
-		if data.SkipToUri != "" {
-			cmd.Options.SkipTo = connectSkipTo{TrackUri: data.SkipToUri}
-		}
-		if data.Offset != nil {
-			cmd.Options.Offset = &connectOffset{Uri: data.Offset.Uri, Position: data.Offset.Position}
-		}
+		cmd := buildPlayCommand(data)
 		shuf := "inherit"
 		if data.Shuffle != nil {
-			cmd.Options.PlayerOptionsOverride.ShufflingContext = data.Shuffle
 			shuf = fmt.Sprintf("%v", *data.Shuffle)
 		}
 		// TEMP diagnostic logging while verifying the play envelope on hardware.
@@ -1545,6 +1521,46 @@ func randomCommandId() string {
 
 type connectCommandEnvelope struct {
 	Command connectCommand `json:"command"`
+}
+
+// buildPlayCommand assembles the connect play command envelope for starting a
+// context. Pure function of the request data so the wire contract stays
+// unit-testable without a live cluster.
+func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
+	cmd := connectCommand{
+		Endpoint: "play",
+		Context: &connectContext{
+			Uri: data.Uri,
+			Url: "context://" + data.Uri,
+		},
+		Options: &connectOptions{License: "tft"},
+		PlayOrigin: &connectOrigin{
+			FeatureIdentifier:  "your_library",
+			FeatureVersion:     "go-librespot",
+			ReferrerIdentifier: "your_library",
+		},
+		LoggingParams: &connectLogging{
+			PageInstanceIds: []string{},
+			InteractionIds:  []string{},
+			CommandId:       randomCommandId(),
+		},
+	}
+	if data.SkipToUri != "" {
+		cmd.Options.SkipTo = connectSkipTo{TrackUri: data.SkipToUri}
+	} else if data.Offset != nil && data.Offset.Uri != "" {
+		// bug29: connect receivers (go-librespot, Spotify web player) ignore
+		// `options.offset` and only honor `options.skip_to.track_uri` to start
+		// a context at a given track. Mirror the offset's track uri into
+		// skip_to so the playlist actually starts at the requested track.
+		cmd.Options.SkipTo = connectSkipTo{TrackUri: data.Offset.Uri}
+	}
+	if data.Offset != nil {
+		cmd.Options.Offset = &connectOffset{Uri: data.Offset.Uri, Position: data.Offset.Position}
+	}
+	if data.Shuffle != nil {
+		cmd.Options.PlayerOptionsOverride.ShufflingContext = data.Shuffle
+	}
+	return cmd
 }
 
 // sendActiveDeviceCommand sends to the active device in the user's cluster
