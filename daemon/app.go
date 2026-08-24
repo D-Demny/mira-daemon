@@ -689,6 +689,10 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 		playbackReadyCh: make(chan struct{}),
 		queueResolvedCh: make(chan struct{}, 1),
 		clusterCh:       make(chan *connectpb.Cluster, 1),
+		// bug32: full-queue expansion from the active context's track list
+		queueExpandCache:    make(map[string]queueExpandCacheEntry),
+		queueExpandInFlight: make(map[string]struct{}),
+		queueExpandedCh:     make(chan queueExpandResult, 1),
 	}
 
 	appPlayer.prefetchTimer = time.NewTimer(math.MaxInt64)

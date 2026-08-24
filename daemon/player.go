@@ -73,6 +73,16 @@ type AppPlayer struct {
 	queueResolver   *queueResolver
 	queueResolvedCh chan struct{}
 
+	// bug32: the Connect cluster payload only carries a short preview of the
+	// upcoming queue; these back expandQueue, which derives the full queue
+	// from the active context's track list (validated against the preview)
+	queueExpandMu       sync.Mutex
+	queueExpandCache    map[string]queueExpandCacheEntry
+	queueExpandInFlight map[string]struct{}
+	queueExpandedCh     chan queueExpandResult
+	// swappable in tests (nil = the real (*AppPlayer).queueExpandPage)
+	queueExpandPageFn func(ctx context.Context, contextUri string, offset, limit int) ([]any, int, error)
+
 	// async artist/album resolution
 	metaResolvedCh       chan resolvedTrackMeta
 	metaResolveInFlight  string
@@ -426,6 +436,10 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 	if rs == nil {
 		return
 	}
+	// bug32: the Connect cluster payload only carries a short preview of the
+	// upcoming queue; expand it from the active context's track list when the
+	// queue is derivable (non-shuffle playlist / Liked Songs)
+	p.expandQueue(rs)
 	p.noteClusterTiming(rs)
 	if dev, ok := cluster.Device[rs.DeviceId]; ok {
 		rs.DeviceName = p.deviceDisplayName(rs.DeviceId, dev)
@@ -1907,6 +1921,27 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 					Type: ApiEventTypeObserverStateChanged,
 					Data: &updated,
 				})
+			}
+		case res := <-p.queueExpandedCh:
+			// bug32: a background fetch of the active context's track list
+			// landed — the cache now holds it, so re-derive the full upcoming
+			// queue for the current remote state (expandQueue hits the cache
+			// path; no new fetch) and re-emit so the UI picks it up without
+			// waiting for the next cluster push
+			p.app.log.Debugf("queue expand: result for %s received (%d tracks)", res.contextUri, res.total)
+			if rs := p.state.remoteState; rs != nil {
+				before := len(rs.NextTracks)
+				p.expandQueue(rs)
+				if len(rs.NextTracks) != before {
+					updated := *rs
+					updated.NextTracks = append([]QueueTrack(nil), rs.NextTracks...)
+					updated.Position = updated.RemotePosition()
+					p.state.remoteState = &updated
+					p.app.server.Emit(&ApiEvent{
+						Type: ApiEventTypeObserverStateChanged,
+						Data: &updated,
+					})
+				}
 			}
 		}
 	}
