@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1080,5 +1081,979 @@ func TestWebApiPlaylistsResponse_JSONShape(t *testing.T) {
 	}
 	if len(ui.Items) != 1 || ui.Items[0].ID != "1" || ui.Items[0].Owner.DisplayName != "o" || ui.Total != 1 {
 		t.Errorf("round-trip = %+v", ui)
+	}
+}
+
+// ── bug33: 2026 web-player image payload rotation ───────────────────────────
+// The 2026 rotation ships recents artwork as ImageV2
+// (visualIdentityTrait.squareCoverImage.image.data.sources with
+// maxWidth/maxHeight instead of width/height) and album refs as
+// albumOfTrack {name,uri,coverArt:{sources}} instead of an inline album. The
+// fixtures below are trimmed captures of the live payloads served by the
+// device (Build #82 era); the old normaliser only understood
+// [{url,width,height}] and {sources|items:[...]}, so it dropped every cover
+// and the UI rendered grey placeholders.
+
+const recentsRotated2026Fixture = `{
+  "data": {
+    "lists": [
+      {
+        "__typename": "List",
+        "formatListAttributes": [
+          {
+            "key": "revision_hash",
+            "value": "0000000000000000ae5181bdee9ddd0a86b9d9fce566bc8e"
+          },
+          {
+            "key": "filters",
+            "value": "CgYIARICAQI="
+          }
+        ],
+        "items": {
+          "items": [
+            {
+              "addedAt": {
+                "day": 24,
+                "month": 8,
+                "year": 2026
+              },
+              "entity": {
+                "__typename": "EntityResponseWrapper",
+                "_uri": "spotify:album:5AOu8nTJSHWiIDxPvcIDRF",
+                "data": {
+                  "__typename": "Entity",
+                  "consumptionExperienceTrait": {
+                    "__typename": "ConsumptionExperienceTrait",
+                    "contentRatings": [
+                      "CONTENT_RATING_EXPLICIT"
+                    ],
+                    "duration": {
+                      "nanoSeconds": 0,
+                      "seconds": 3305
+                    }
+                  },
+                  "entityTypeTrait": {
+                    "__typename": "EntityTypeTrait",
+                    "type": "ENTITY_TYPE_ALBUM"
+                  },
+                  "identityTrait": {
+                    "__typename": "IdentityTrait",
+                    "contentHierarchyParent": null,
+                    "contributors": {
+                      "items": [
+                        {
+                          "name": "System Of A Down",
+                          "uri": "spotify:artist:5eAWCfyUhZtHHtBdNk56l1"
+                        }
+                      ],
+                      "totalCount": 1
+                    },
+                    "description": "",
+                    "name": "Toxicity",
+                    "type": "Album"
+                  },
+                  "typedEntity": {
+                    "__typename": "AlbumResponseWrapper"
+                  },
+                  "uri": "spotify:album:5AOu8nTJSHWiIDxPvcIDRF",
+                  "visualIdentityTrait": {
+                    "__typename": "VisualIdentityTrait",
+                    "squareCoverImage": {
+                      "image": {
+                        "data": {
+                          "__typename": "ImageV2",
+                          "sources": [
+                            {
+                              "imageFormat": "WEBP",
+                              "maxHeight": 640,
+                              "maxWidth": 640,
+                              "url": "https://image-cdn-ak.spotifycdn.com/image/ab67616d000075a028afd76e21eed9788506c40e"
+                            },
+                            {
+                              "imageFormat": "WEBP",
+                              "maxHeight": 64,
+                              "maxWidth": 64,
+                              "url": "https://image-cdn-ak.spotifycdn.com/image/ab67616d000090d528afd76e21eed9788506c40e"
+                            },
+                            {
+                              "imageFormat": "WEBP",
+                              "maxHeight": 300,
+                              "maxWidth": 300,
+                              "url": "https://image-cdn-ak.spotifycdn.com/image/ab67616d0000ab8728afd76e21eed9788506c40e"
+                            }
+                          ]
+                        }
+                      },
+                      "originalInstances": [
+                        {
+                          "flatFile": {
+                            "cdnUrl": "https://i.scdn.co/image/ab67616d0000485128afd76e21eed9788506c40e"
+                          },
+                          "size": "IMAGE_SIZE_SMALL"
+                        },
+                        {
+                          "flatFile": {
+                            "cdnUrl": "https://i.scdn.co/image/ab67616d00001e0228afd76e21eed9788506c40e"
+                          },
+                          "size": "IMAGE_SIZE_DEFAULT"
+                        },
+                        {
+                          "flatFile": {
+                            "cdnUrl": "https://i.scdn.co/image/ab67616d0000b27328afd76e21eed9788506c40e"
+                          },
+                          "size": "IMAGE_SIZE_LARGE"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "formatListAttributes": [
+                {
+                  "key": "group_id_0",
+                  "value": ""
+                },
+                {
+                  "key": "children_group_id",
+                  "value": "1"
+                },
+                {
+                  "key": "group_metadata",
+                  "value": "CAEiCQoFbXVzaWMQAQ=="
+                },
+                {
+                  "key": "recent_type_played",
+                  "value": ""
+                },
+                {
+                  "key": "content_type_music",
+                  "value": ""
+                }
+              ]
+            },
+            {
+              "addedAt": {
+                "day": 24,
+                "month": 8,
+                "year": 2026
+              },
+              "entity": {
+                "__typename": "EntityResponseWrapper",
+                "_uri": "spotify:track:4M9Fud77ZcrWt1vYDKIFwD",
+                "data": {
+                  "__typename": "Entity",
+                  "consumptionExperienceTrait": {
+                    "__typename": "ConsumptionExperienceTrait",
+                    "contentRatings": [],
+                    "duration": {
+                      "nanoSeconds": 0,
+                      "seconds": 176
+                    }
+                  },
+                  "entityTypeTrait": {
+                    "__typename": "EntityTypeTrait",
+                    "type": "ENTITY_TYPE_TRACK"
+                  },
+                  "identityTrait": {
+                    "__typename": "IdentityTrait",
+                    "contentHierarchyParent": {
+                      "__typename": "Entity",
+                      "identityTrait": {
+                        "__typename": "IdentityTrait",
+                        "name": "Toxicity"
+                      },
+                      "uri": "spotify:album:5AOu8nTJSHWiIDxPvcIDRF"
+                    },
+                    "contributors": {
+                      "items": [
+                        {
+                          "name": "System Of A Down",
+                          "uri": "spotify:artist:5eAWCfyUhZtHHtBdNk56l1"
+                        }
+                      ],
+                      "totalCount": 1
+                    },
+                    "description": "",
+                    "name": "ATWA",
+                    "type": "Song"
+                  },
+                  "typedEntity": {
+                    "__typename": "TrackResponseWrapper"
+                  },
+                  "uri": "spotify:track:4M9Fud77ZcrWt1vYDKIFwD",
+                  "visualIdentityTrait": {
+                    "__typename": "VisualIdentityTrait",
+                    "squareCoverImage": {
+                      "image": {
+                        "data": {
+                          "__typename": "ImageV2",
+                          "sources": [
+                            {
+                              "imageFormat": "WEBP",
+                              "maxHeight": 640,
+                              "maxWidth": 640,
+                              "url": "https://image-cdn-ak.spotifycdn.com/image/ab67616d000075a028afd76e21eed9788506c40e"
+                            },
+                            {
+                              "imageFormat": "WEBP",
+                              "maxHeight": 64,
+                              "maxWidth": 64,
+                              "url": "https://image-cdn-ak.spotifycdn.com/image/ab67616d000090d528afd76e21eed9788506c40e"
+                            },
+                            {
+                              "imageFormat": "WEBP",
+                              "maxHeight": 300,
+                              "maxWidth": 300,
+                              "url": "https://image-cdn-ak.spotifycdn.com/image/ab67616d0000ab8728afd76e21eed9788506c40e"
+                            }
+                          ]
+                        }
+                      },
+                      "originalInstances": [
+                        {
+                          "flatFile": {
+                            "cdnUrl": "https://i.scdn.co/image/ab67616d0000485128afd76e21eed9788506c40e"
+                          },
+                          "size": "IMAGE_SIZE_SMALL"
+                        },
+                        {
+                          "flatFile": {
+                            "cdnUrl": "https://i.scdn.co/image/ab67616d00001e0228afd76e21eed9788506c40e"
+                          },
+                          "size": "IMAGE_SIZE_DEFAULT"
+                        },
+                        {
+                          "flatFile": {
+                            "cdnUrl": "https://i.scdn.co/image/ab67616d0000b27328afd76e21eed9788506c40e"
+                          },
+                          "size": "IMAGE_SIZE_LARGE"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "formatListAttributes": [
+                {
+                  "key": "group_id_1",
+                  "value": ""
+                },
+                {
+                  "key": "recent_type_played",
+                  "value": ""
+                },
+                {
+                  "key": "content_type_music",
+                  "value": ""
+                }
+              ]
+            }
+          ],
+          "pagingInfo": {
+            "limit": 5,
+            "nextOffset": 5,
+            "offset": 0
+          },
+          "totalCount": 3152
+        },
+        "name": "Recents",
+        "uri": "spotify:list:recents:page"
+      }
+    ]
+  }
+}`
+
+func TestMapRecentlyPlayedPage_RotatedImageV2(t *testing.T) {
+	t.Parallel()
+	items, err := mapRecentlyPlayedPage([]byte(recentsRotated2026Fixture))
+	if err != nil {
+		t.Fatalf("mapRecentlyPlayedPage: %v", err)
+	}
+	// the 2026 list interleaves an album section entry before the first
+	// track; only the spotify:track entry survives
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1 (album section entry skipped)", len(items))
+	}
+	entry, _ := items[0].(map[string]any)
+	tr, _ := entry["track"].(map[string]any)
+	if tr["name"] != "ATWA" || tr["uri"] != "spotify:track:4M9Fud77ZcrWt1vYDKIFwD" {
+		t.Errorf("track = %+v", tr)
+	}
+	album, _ := tr["album"].(map[string]any)
+	if album["name"] != "Toxicity" {
+		t.Errorf("album.name = %v, want Toxicity", album["name"])
+	}
+	imgs, _ := album["images"].([]webApiImage)
+	if len(imgs) != 3 {
+		t.Fatalf("album.images = %+v, want 3 (ImageV2 sources)", imgs)
+	}
+	// sorted largest first, sizes from maxWidth/maxHeight
+	if imgs[0].Width != 640 || imgs[1].Width != 300 || imgs[2].Width != 64 {
+		t.Errorf("image order = %+v, want 640/300/64", imgs)
+	}
+	if !strings.HasPrefix(imgs[0].URL, "https://") {
+		t.Errorf("first url = %q, want an https url", imgs[0].URL)
+	}
+}
+
+const playlistTracksRotated2026Fixture = `{
+  "data": {
+    "playlistV2": {
+      "__typename": "Playlist",
+      "content": {
+        "__typename": "PlaylistItemsPage",
+        "items": [
+          {
+            "addedAt": {
+              "isoString": "2026-05-21T08:22:05Z"
+            },
+            "addedBy": {
+              "data": {
+                "__typename": "User",
+                "avatar": null,
+                "name": "Daniel D",
+                "uri": "spotify:user:1121858487",
+                "username": "1121858487"
+              }
+            },
+            "attributes": [],
+            "itemV2": {
+              "__typename": "TrackResponseWrapper",
+              "data": {
+                "__typename": "Track",
+                "albumOfTrack": {
+                  "artists": {
+                    "items": [
+                      {
+                        "profile": {
+                          "name": "Linkin Park"
+                        },
+                        "uri": "spotify:artist:6XyY86QOPPrYVGvF9ch6wz"
+                      }
+                    ]
+                  },
+                  "coverArt": {
+                    "sources": [
+                      {
+                        "height": 300,
+                        "url": "https://i.scdn.co/image/ab67616d00001e0259211e56a493ac4509457bab",
+                        "width": 300
+                      },
+                      {
+                        "height": 64,
+                        "url": "https://i.scdn.co/image/ab67616d0000485159211e56a493ac4509457bab",
+                        "width": 64
+                      },
+                      {
+                        "height": 640,
+                        "url": "https://i.scdn.co/image/ab67616d0000b27359211e56a493ac4509457bab",
+                        "width": 640
+                      }
+                    ]
+                  },
+                  "name": "A Thousand Suns",
+                  "uri": "spotify:album:5uvXx5ZQswNRFCdHR521YZ"
+                },
+                "artists": {
+                  "items": [
+                    {
+                      "profile": {
+                        "name": "Linkin Park"
+                      },
+                      "uri": "spotify:artist:6XyY86QOPPrYVGvF9ch6wz"
+                    }
+                  ]
+                },
+                "associationsV3": {
+                  "audioAssociations": {
+                    "__typename": "TrackAudioAssociationPage",
+                    "items": []
+                  },
+                  "videoAssociations": {
+                    "totalCount": 0
+                  }
+                },
+                "contentRating": {
+                  "label": "NONE"
+                },
+                "discNumber": 1,
+                "trackDuration": {
+                  "totalMilliseconds": 296560
+                },
+                "mediaType": "AUDIO",
+                "name": "Iridescent",
+                "playability": {
+                  "playable": true,
+                  "reason": "PLAYABLE"
+                },
+                "playcount": "168237903",
+                "trackNumber": 12,
+                "uri": "spotify:track:69ZEgPX0hxWXJIqkTlYz41"
+              }
+            },
+            "itemV3": {
+              "__typename": "EntityResponseWrapper",
+              "data": {
+                "__typename": "Entity",
+                "consumptionExperienceTrait": {
+                  "__typename": "ConsumptionExperienceTrait",
+                  "contentRatings": [],
+                  "duration": {
+                    "nanoSeconds": 0,
+                    "seconds": 296
+                  }
+                },
+                "identityTrait": {
+                  "__typename": "IdentityTrait",
+                  "contentHierarchyParent": {
+                    "__typename": "Entity",
+                    "identityTrait": {
+                      "__typename": "IdentityTrait",
+                      "name": "A Thousand Suns"
+                    },
+                    "uri": "spotify:album:5uvXx5ZQswNRFCdHR521YZ"
+                  },
+                  "contributors": {
+                    "items": [
+                      {
+                        "name": "Linkin Park",
+                        "uri": "spotify:artist:6XyY86QOPPrYVGvF9ch6wz"
+                      }
+                    ],
+                    "totalCount": 1
+                  },
+                  "description": "",
+                  "name": "Iridescent",
+                  "type": "Song"
+                },
+                "uri": "spotify:track:69ZEgPX0hxWXJIqkTlYz41",
+                "visualIdentityTrait": {
+                  "__typename": "VisualIdentityTrait",
+                  "squareCoverImage": {
+                    "image": {
+                      "data": {
+                        "__typename": "ImageV2",
+                        "sources": [
+                          {
+                            "imageFormat": "WEBP",
+                            "maxHeight": 640,
+                            "maxWidth": 640,
+                            "url": "https://image-cdn-fa.spotifycdn.com/image/ab67616d000075a059211e56a493ac4509457bab"
+                          },
+                          {
+                            "imageFormat": "WEBP",
+                            "maxHeight": 64,
+                            "maxWidth": 64,
+                            "url": "https://image-cdn-fa.spotifycdn.com/image/ab67616d000090d559211e56a493ac4509457bab"
+                          },
+                          {
+                            "imageFormat": "WEBP",
+                            "maxHeight": 300,
+                            "maxWidth": 300,
+                            "url": "https://image-cdn-fa.spotifycdn.com/image/ab67616d0000ab8759211e56a493ac4509457bab"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "uid": "0e3acaf97803be1a"
+          }
+        ],
+        "pagingInfo": {
+          "limit": 3,
+          "offset": 0
+        },
+        "totalCount": 13
+      },
+      "attributes": [],
+      "basePermission": "VIEWER",
+      "currentUserCapabilities": {
+        "canAdministratePermissions": true,
+        "canCancelMembership": false,
+        "canEditItems": true,
+        "canView": true
+      },
+      "description": "",
+      "followers": 0,
+      "following": true,
+      "format": "",
+      "images": {
+        "items": [
+          {
+            "sources": [
+              {
+                "height": 640,
+                "url": "https://mosaic.scdn.co/640/ab67616d00001e0259211e56a493ac4509457babab67616d00001e026e996745f2c7b8036abef213ab67616d00001e028b5b6fa1326d996181e71dd7ab67616d00001e02987fb4c5ec8790e9f637a4a4",
+                "width": 640
+              },
+              {
+                "height": 300,
+                "url": "https://mosaic.scdn.co/300/ab67616d00001e0259211e56a493ac4509457babab67616d00001e026e996745f2c7b8036abef213ab67616d00001e028b5b6fa1326d996181e71dd7ab67616d00001e02987fb4c5ec8790e9f637a4a4",
+                "width": 300
+              },
+              {
+                "height": 60,
+                "url": "https://mosaic.scdn.co/60/ab67616d00001e0259211e56a493ac4509457babab67616d00001e026e996745f2c7b8036abef213ab67616d00001e028b5b6fa1326d996181e71dd7ab67616d00001e02987fb4c5ec8790e9f637a4a4",
+                "width": 60
+              }
+            ]
+          }
+        ]
+      },
+      "members": {
+        "items": [
+          {
+            "isOwner": true,
+            "permissionLevel": "CONTRIBUTOR",
+            "user": {
+              "data": {
+                "__typename": "User",
+                "avatar": null,
+                "name": "Daniel D",
+                "uri": "spotify:user:1121858487",
+                "username": "1121858487"
+              }
+            }
+          }
+        ],
+        "totalCount": 1
+      },
+      "name": "Linkin Park",
+      "ownerV2": {
+        "data": {
+          "__typename": "User",
+          "avatar": null,
+          "name": "Daniel D",
+          "uri": "spotify:user:1121858487",
+          "username": "1121858487"
+        }
+      },
+      "revisionId": "AAAAD0BvW40warchjREnKerxKidNWppZ",
+      "sharingInfo": {
+        "shareId": "c0Y1TNNHS_aHsucl9eJduw",
+        "shareUrl": "https://open.spotify.com/playlist/0Qb9Spsm26hjTg8FjJgCuN?si=c0Y1TNNHS_aHsucl9eJduw"
+      },
+      "uri": "spotify:playlist:0Qb9Spsm26hjTg8FjJgCuN",
+      "visualIdentity": {
+        "squareCoverImage": {
+          "__typename": "VisualIdentityImage",
+          "extractedColorSet": {
+            "encoreBaseSetTextColor": {
+              "alpha": 255,
+              "blue": 187,
+              "green": 187,
+              "red": 187
+            },
+            "highContrast": {
+              "backgroundBase": {
+                "alpha": 255,
+                "blue": 83,
+                "green": 83,
+                "red": 83
+              },
+              "backgroundTintedBase": {
+                "alpha": 255,
+                "blue": 51,
+                "green": 51,
+                "red": 51
+              },
+              "textBase": {
+                "alpha": 255,
+                "blue": 255,
+                "green": 255,
+                "red": 255
+              },
+              "textBrightAccent": {
+                "alpha": 255,
+                "blue": 255,
+                "green": 255,
+                "red": 255
+              },
+              "textSubdued": {
+                "alpha": 255,
+                "blue": 205,
+                "green": 205,
+                "red": 205
+              }
+            },
+            "higherContrast": {
+              "backgroundBase": {
+                "alpha": 255,
+                "blue": 53,
+                "green": 53,
+                "red": 53
+              },
+              "backgroundTintedBase": {
+                "alpha": 255,
+                "blue": 86,
+                "green": 86,
+                "red": 86
+              },
+              "textBase": {
+                "alpha": 255,
+                "blue": 255,
+                "green": 255,
+                "red": 255
+              },
+              "textBrightAccent": {
+                "alpha": 255,
+                "blue": 96,
+                "green": 215,
+                "red": 30
+              },
+              "textSubdued": {
+                "alpha": 255,
+                "blue": 205,
+                "green": 205,
+                "red": 205
+              }
+            },
+            "minContrast": {
+              "backgroundBase": {
+                "alpha": 255,
+                "blue": 83,
+                "green": 83,
+                "red": 83
+              },
+              "backgroundTintedBase": {
+                "alpha": 255,
+                "blue": 51,
+                "green": 51,
+                "red": 51
+              },
+              "textBase": {
+                "alpha": 255,
+                "blue": 255,
+                "green": 255,
+                "red": 255
+              },
+              "textBrightAccent": {
+                "alpha": 255,
+                "blue": 255,
+                "green": 255,
+                "red": 255
+              },
+              "textSubdued": {
+                "alpha": 255,
+                "blue": 255,
+                "green": 255,
+                "red": 255
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`
+
+func TestMapPlaylistTracksPage_RotatedAlbumOfTrack(t *testing.T) {
+	t.Parallel()
+	items, total, err := mapPlaylistTracksPage([]byte(playlistTracksRotated2026Fixture), 0)
+	if err != nil {
+		t.Fatalf("mapPlaylistTracksPage: %v", err)
+	}
+	if total != 13 {
+		t.Errorf("total = %d, want 13", total)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
+	}
+	entry, _ := items[0].(map[string]any)
+	tr, _ := entry["track"].(map[string]any)
+	if tr["name"] != "Iridescent" || tr["uri"] != "spotify:track:69ZEgPX0hxWXJIqkTlYz41" {
+		t.Errorf("track = %+v", tr)
+	}
+	album, _ := tr["album"].(map[string]any)
+	// the 2026 payload ships no inline album; name + cover come from albumOfTrack
+	if album["name"] != "A Thousand Suns" {
+		t.Errorf("album.name = %v, want A Thousand Suns (from albumOfTrack)", album["name"])
+	}
+	imgs, _ := album["images"].([]webApiImage)
+	if len(imgs) != 3 {
+		t.Fatalf("album.images = %+v, want 3 (albumOfTrack.coverArt.sources)", imgs)
+	}
+	if imgs[0].Width != 640 || imgs[1].Width != 300 || imgs[2].Width != 64 {
+		t.Errorf("image order = %+v, want 640/300/64", imgs)
+	}
+}
+
+const savedTracksRotated2026Fixture = `{
+  "data": {
+    "me": {
+      "library": {
+        "tracks": {
+          "__typename": "UserLibraryTrackPage",
+          "items": [
+            {
+              "__typename": "UserLibraryTrackResponse",
+              "addedAt": {
+                "isoString": "2026-08-12T13:16:30Z"
+              },
+              "track": {
+                "_uri": "spotify:track:0QepvU0N2fC2B5uIPafO1q",
+                "data": {
+                  "__typename": "Track",
+                  "albumOfTrack": {
+                    "artists": {
+                      "items": [
+                        {
+                          "profile": {
+                            "name": "Limp Bizkit"
+                          },
+                          "uri": "spotify:artist:165ZgPlLkK7bf5bDoFc6Sb"
+                        }
+                      ]
+                    },
+                    "coverArt": {
+                      "sources": [
+                        {
+                          "height": 300,
+                          "url": "https://i.scdn.co/image/ab67616d00001e024a31b146c7cf07705d912efe",
+                          "width": 300
+                        },
+                        {
+                          "height": 64,
+                          "url": "https://i.scdn.co/image/ab67616d000048514a31b146c7cf07705d912efe",
+                          "width": 64
+                        },
+                        {
+                          "height": 640,
+                          "url": "https://i.scdn.co/image/ab67616d0000b2734a31b146c7cf07705d912efe",
+                          "width": 640
+                        }
+                      ]
+                    },
+                    "name": "Chocolate Starfish And The Hot Dog Flavored Water",
+                    "uri": "spotify:album:5mi7FKaWE5CtcOjdyxScA7"
+                  },
+                  "artists": {
+                    "items": [
+                      {
+                        "profile": {
+                          "name": "Limp Bizkit"
+                        },
+                        "uri": "spotify:artist:165ZgPlLkK7bf5bDoFc6Sb"
+                      }
+                    ]
+                  },
+                  "associationsV3": {
+                    "audioAssociations": {
+                      "totalCount": 0
+                    },
+                    "videoAssociations": {
+                      "totalCount": 0
+                    }
+                  },
+                  "contentRating": {
+                    "label": "EXPLICIT"
+                  },
+                  "discNumber": 1,
+                  "duration": {
+                    "totalMilliseconds": 264040
+                  },
+                  "mediaType": "AUDIO",
+                  "name": "Livin' It Up",
+                  "playability": {
+                    "playable": true
+                  },
+                  "trackNumber": 7
+                }
+              }
+            }
+          ],
+          "pagingInfo": {
+            "limit": 3,
+            "offset": 0
+          },
+          "totalCount": 501
+        }
+      }
+    }
+  }
+}`
+
+func TestMapSavedTracksPage_RotatedAlbumOfTrack(t *testing.T) {
+	t.Parallel()
+	items, total, err := mapSavedTracksPage([]byte(savedTracksRotated2026Fixture), 0)
+	if err != nil {
+		t.Fatalf("mapSavedTracksPage: %v", err)
+	}
+	if total != 501 {
+		t.Errorf("total = %d, want 501", total)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
+	}
+	entry, _ := items[0].(map[string]any)
+	tr, _ := entry["track"].(map[string]any)
+	if tr["name"] != "Livin' It Up" {
+		t.Errorf("track = %+v", tr)
+	}
+	album, _ := tr["album"].(map[string]any)
+	if album["name"] != "Chocolate Starfish And The Hot Dog Flavored Water" {
+		t.Errorf("album.name = %v, want the albumOfTrack name", album["name"])
+	}
+	imgs, _ := album["images"].([]webApiImage)
+	if len(imgs) != 3 || imgs[0].Width != 640 {
+		t.Errorf("album.images = %+v, want 3 images, 640 first", imgs)
+	}
+}
+
+func TestWebApiImagesFromAny_RotatedShapes(t *testing.T) {
+	t.Parallel()
+	// ImageV2 (recents, 2026): squareCoverImage.image.data.sources with
+	// maxWidth/maxHeight, unsorted in the payload
+	imageV2 := map[string]any{
+		"squareCoverImage": map[string]any{
+			"image": map[string]any{
+				"data": map[string]any{
+					"sources": []any{
+						map[string]any{"url": "https://x/640.jpg", "maxWidth": 640, "maxHeight": 640},
+						map[string]any{"url": "https://x/64.jpg", "maxWidth": 64, "maxHeight": 64},
+						map[string]any{"url": "https://x/300.jpg", "maxWidth": 300, "maxHeight": 300},
+					},
+				},
+			},
+		},
+	}
+	imgs := webApiImagesFromAny(imageV2)
+	if len(imgs) != 3 || imgs[0].Width != 640 || imgs[1].Width != 300 || imgs[2].Width != 64 {
+		t.Errorf("ImageV2 = %+v, want 3 images largest-first", imgs)
+	}
+	if imgs[0].Height != 640 {
+		t.Errorf("ImageV2 height = %d, want maxHeight mapping", imgs[0].Height)
+	}
+
+	// coverArt wrapper (albumOfTrack, 2026)
+	coverArt := map[string]any{
+		"coverArt": map[string]any{
+			"sources": []any{
+				map[string]any{"url": "https://x/c300.jpg", "width": 300, "height": 300},
+				map[string]any{"url": "https://x/c640.jpg", "width": 640, "height": 640},
+			},
+		},
+	}
+	imgs2 := webApiImagesFromAny(coverArt)
+	if len(imgs2) != 2 || imgs2[0].Width != 640 || imgs2[1].Width != 300 {
+		t.Errorf("coverArt = %+v, want 2 images largest-first", imgs2)
+	}
+
+	// bare array using maxWidth spelling
+	bareMax := []any{
+		map[string]any{"url": "https://x/m300.jpg", "maxWidth": 300, "maxHeight": 300},
+		map[string]any{"url": "https://x/m640.jpg", "maxWidth": 640, "maxHeight": 640},
+	}
+	imgs3 := webApiImagesFromAny(bareMax)
+	if len(imgs3) != 2 || imgs3[0].Width != 640 {
+		t.Errorf("bare maxWidth array = %+v, want 2 images 640 first", imgs3)
+	}
+
+	// single source object (no wrapper at all)
+	single := map[string]any{"url": "https://x/s.jpg", "maxWidth": 300, "maxHeight": 300}
+	imgs4 := webApiImagesFromAny(single)
+	if len(imgs4) != 1 || imgs4[0].Width != 300 {
+		t.Errorf("single source = %+v, want 1 image", imgs4)
+	}
+
+	// entries without a url are skipped
+	noURL := map[string]any{
+		"sources": []any{
+			map[string]any{"maxWidth": 640, "maxHeight": 640},
+			map[string]any{"url": "https://x/kept.jpg", "width": 300, "height": 300},
+		},
+	}
+	imgs5 := webApiImagesFromAny(noURL)
+	if len(imgs5) != 1 || imgs5[0].URL != "https://x/kept.jpg" {
+		t.Errorf("url-less entry = %+v, want only the url-bearing source", imgs5)
+	}
+
+	// backwards compat: the pre-2026 shapes keep working
+	oldWrapped := map[string]any{
+		"sources": []any{
+			map[string]any{"url": "https://x/old640.jpg", "width": 640, "height": 640},
+		},
+	}
+	imgs6 := webApiImagesFromAny(oldWrapped)
+	if len(imgs6) != 1 || imgs6[0].Width != 640 {
+		t.Errorf("old {sources} shape = %+v, want unchanged", imgs6)
+	}
+	oldBare := []any{map[string]any{"url": "https://x/old.jpg", "width": 60, "height": 60}}
+	imgs7 := webApiImagesFromAny(oldBare)
+	if len(imgs7) != 1 || imgs7[0].Width != 60 {
+		t.Errorf("old bare shape = %+v, want unchanged", imgs7)
+	}
+
+	// degenerate inputs
+	if imgs := webApiImagesFromAny(map[string]any{"sources": []any{}}); imgs != nil {
+		t.Errorf("empty sources = %+v, want nil", imgs)
+	}
+	if imgs := webApiImagesFromAny(map[string]any{"squareCoverImage": map[string]any{}}); imgs != nil {
+		t.Errorf("empty ImageV2 = %+v, want nil", imgs)
+	}
+}
+
+func TestWebApiTrackAlbum_RotatedShapes(t *testing.T) {
+	t.Parallel()
+	// 2026 playlist/library track: no inline album, only albumOfTrack
+	item2026 := map[string]any{
+		"albumOfTrack": map[string]any{
+			"name": "A Thousand Suns",
+			"uri":  "spotify:album:5uvXx5ZQswNRFCdHR521YZ",
+			"coverArt": map[string]any{
+				"sources": []any{
+					map[string]any{"url": "https://x/p300.jpg", "width": 300, "height": 300},
+					map[string]any{"url": "https://x/p640.jpg", "width": 640, "height": 640},
+				},
+			},
+		},
+	}
+	alb := webApiTrackAlbum(item2026)
+	if alb["name"] != "A Thousand Suns" {
+		t.Errorf("album.name = %v, want the albumOfTrack name", alb["name"])
+	}
+	imgs, _ := alb["images"].([]webApiImage)
+	if len(imgs) != 2 || imgs[0].Width != 640 {
+		t.Errorf("album.images = %+v, want 2 images 640 first", imgs)
+	}
+
+	// inline album without images falls back to albumOfTrack's cover
+	itemMixed := map[string]any{
+		"album":        map[string]any{"name": "Inline Album", "images": []any{}},
+		"albumOfTrack": item2026["albumOfTrack"],
+	}
+	alb2 := webApiTrackAlbum(itemMixed)
+	if alb2["name"] != "Inline Album" {
+		t.Errorf("album.name = %v, want the inline album name to win", alb2["name"])
+	}
+	imgs2, _ := alb2["images"].([]webApiImage)
+	if len(imgs2) != 2 || imgs2[0].Width != 640 {
+		t.Errorf("album.images = %+v, want the albumOfTrack cover", imgs2)
+	}
+
+	// nothing but an ImageV2 visualIdentityTrait (recents-style fallback)
+	itemTrait := map[string]any{
+		"visualIdentityTrait": map[string]any{
+			"squareCoverImage": map[string]any{
+				"image": map[string]any{
+					"data": map[string]any{
+						"sources": []any{
+							map[string]any{"url": "https://x/t640.jpg", "maxWidth": 640, "maxHeight": 640},
+						},
+					},
+				},
+			},
+		},
+	}
+	alb3 := webApiTrackAlbum(itemTrait)
+	if alb3["name"] != "" {
+		t.Errorf("album.name = %v, want empty", alb3["name"])
+	}
+	imgs3, _ := alb3["images"].([]webApiImage)
+	if len(imgs3) != 1 || imgs3[0].Width != 640 {
+		t.Errorf("album.images = %+v, want the ImageV2 cover", imgs3)
 	}
 }

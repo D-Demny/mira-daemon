@@ -285,7 +285,9 @@ func pfIdentityFromAny(v any) pfIdentity {
 		if len(out.Images) == 0 {
 			if imgs := webApiImagesFromAny(c["images"]); imgs != nil {
 				out.Images = imgs
-			} else if imgs := webApiImagesFromAny(asMap(c["visualIdentityTrait"])["images"]); imgs != nil {
+			} else if imgs := webApiImagesFromAny(c["visualIdentityTrait"]); imgs != nil {
+				out.Images = imgs
+			} else if imgs := webApiImagesFromAny(c["coverArt"]); imgs != nil {
 				out.Images = imgs
 			}
 		}
@@ -293,8 +295,71 @@ func pfIdentityFromAny(v any) pfIdentity {
 	return out
 }
 
+// webApiImageSource is one entry of an image source list. The web-player
+// payloads rotate the size fields between width/height (images/coverArt
+// sources) and maxWidth/maxHeight (ImageV2 sources), so both spellings are
+// accepted.
+type webApiImageSource struct {
+	URL       string `json:"url"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	MaxWidth  int    `json:"maxWidth"`
+	MaxHeight int    `json:"maxHeight"`
+}
+
+func (s webApiImageSource) image() webApiImage {
+	w, h := s.Width, s.Height
+	if w == 0 {
+		w = s.MaxWidth
+	}
+	if h == 0 {
+		h = s.MaxHeight
+	}
+	return webApiImage{URL: s.URL, Width: w, Height: h}
+}
+
+// sourceImagesFromAny normalizes a list of image source objects to
+// webApiImage (largest first, like the Web API image arrays), skipping
+// entries without a url.
+func sourceImagesFromAny(v any) []webApiImage {
+	s := asSlice(v)
+	if s == nil {
+		return nil
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		return nil
+	}
+	var arr []webApiImageSource
+	if err := json.Unmarshal(b, &arr); err != nil {
+		return nil
+	}
+	out := make([]webApiImage, 0, len(arr))
+	for _, src := range arr {
+		im := src.image()
+		if im.URL == "" {
+			continue
+		}
+		out = append(out, im)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Width > out[j].Width })
+	return out
+}
+
 // webApiImagesFromAny normalizes the image payloads the web-player queries
-// ship ({sources:[{url,width,height}]} or a bare array) to webApiImage.
+// ship to webApiImage. The serialization rotates per web-player build, so
+// every shape we have seen is accepted, in order:
+//
+//	[{url,width,height}]                  bare source array
+//	{sources|items|images: [...]}         wrapper objects (images, coverArt)
+//	{url,width,height}                    single source object
+//	{squareCoverImage|image: {image: {data: {sources:
+//	  [{url,maxWidth,maxHeight}]}}}}       ImageV2 (2026 rotation, bug33)
+//	{coverArt: {sources: [...]}}          track/album coverArt (2026, bug33)
+//	{data: {...}}                         entity data wrapper
 func webApiImagesFromAny(v any) []webApiImage {
 	if v == nil {
 		return nil
@@ -303,21 +368,28 @@ func webApiImagesFromAny(v any) []webApiImage {
 	if err != nil {
 		return nil
 	}
-	var wrapped struct {
-		Sources []webApiImage `json:"sources"`
+	if imgs := sourceImagesFromAny(v); imgs != nil {
+		return imgs
 	}
-	if err := json.Unmarshal(b, &wrapped); err == nil && len(wrapped.Sources) > 0 {
-		return wrapped.Sources
+	m, isMap := v.(map[string]any)
+	if !isMap {
+		return nil
 	}
-	var items struct {
-		Items []webApiImage `json:"items"`
+	var single webApiImageSource
+	if err := json.Unmarshal(b, &single); err == nil && single.URL != "" {
+		return []webApiImage{single.image()}
 	}
-	if err := json.Unmarshal(b, &items); err == nil && len(items.Items) > 0 {
-		return items.Items
+	for _, key := range []string{"sources", "items", "images"} {
+		if imgs := sourceImagesFromAny(m[key]); imgs != nil {
+			return imgs
+		}
 	}
-	var bare []webApiImage
-	if err := json.Unmarshal(b, &bare); err == nil && len(bare) > 0 {
-		return bare
+	for _, key := range []string{"squareCoverImage", "image", "coverArt", "images", "data"} {
+		if sub := asMap(m[key]); sub != nil {
+			if imgs := webApiImagesFromAny(sub); imgs != nil {
+				return imgs
+			}
+		}
 	}
 	return nil
 }
@@ -407,7 +479,10 @@ func parseRecentsItem(raw any) (recentsItem, bool) {
 		it.name = firstString(dm, "name")
 	}
 	it.artists = webApiArtistsFromAny(idTrait["contributors"])
-	if imgs := webApiImagesFromAny(asMap(dm["visualIdentityTrait"])["images"]); imgs != nil {
+	// the visualIdentityTrait serialized as {images: {...}} in older builds
+	// and as {squareCoverImage: {image: {data: {sources}}}} (ImageV2) in the
+	// 2026 rotation — webApiImagesFromAny accepts both (bug33)
+	if imgs := webApiImagesFromAny(dm["visualIdentityTrait"]); imgs != nil {
 		it.images = imgs
 	}
 	if parent := asMap(idTrait["contentHierarchyParent"]); parent != nil {
@@ -605,12 +680,23 @@ func firstTrackWrapper(em map[string]any) map[string]any {
 }
 
 // webApiTrackAlbum extracts the album name + images of a track item from the
-// known pathfinder shapes: the item's album ref (inline {name,images} or an
-// entity wrapper) or, when the payload ships no album data at all, the
-// track's own cover art (visualIdentityTrait.images) — the same artwork.
+// known pathfinder shapes: the item's album ref (inline {name,images}, an
+// entity wrapper, or albumOfTrack {name,uri,coverArt} — the 2026 rotation,
+// bug33) or, when the payload ships no album data at all, the track's own
+// cover art (visualIdentityTrait) — the same artwork.
 func webApiTrackAlbum(itemData map[string]any) map[string]any {
 	album := map[string]any{"name": "", "images": []any{}}
 	id := pfIdentityFromAny(itemData["album"])
+	if a := asMap(itemData["albumOfTrack"]); a != nil {
+		if aid := pfIdentityFromAny(a); id.Name == "" || len(id.Images) == 0 {
+			if id.Name == "" {
+				id.Name = aid.Name
+			}
+			if len(id.Images) == 0 {
+				id.Images = aid.Images
+			}
+		}
+	}
 	if id.Name != "" {
 		album["name"] = id.Name
 	}
@@ -618,7 +704,7 @@ func webApiTrackAlbum(itemData map[string]any) map[string]any {
 		album["images"] = id.Images
 	}
 	if len(asSlice(album["images"])) == 0 {
-		if imgs := webApiImagesFromAny(asMap(itemData["visualIdentityTrait"])["images"]); imgs != nil {
+		if imgs := webApiImagesFromAny(itemData["visualIdentityTrait"]); imgs != nil {
 			album["images"] = imgs
 		}
 	}
