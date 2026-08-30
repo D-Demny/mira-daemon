@@ -355,13 +355,9 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 		if track.Metadata != nil {
 			trackName = track.Metadata["title"]
 			rawMeta = track.Metadata
-
-			for _, k := range []string{"image_url", "image_xlarge_url", "image_large_url", "image_small_url"} {
-				if img := track.Metadata[k]; img != "" {
-					imageUrl = convertSpotifyImageUrl(img)
-					break
-				}
-			}
+			// all rotated Connect image keys (bug33), same lookup the queue
+			// projection uses (bug42)
+			imageUrl = firstConnectImage(track.Metadata)
 		}
 	}
 

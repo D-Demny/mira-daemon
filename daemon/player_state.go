@@ -130,6 +130,23 @@ type QueueTrack struct {
 // cap remains a payload guard against pathological queue sizes.
 const QueueLimit = 100
 
+// connectImageKeys are the image metadata keys Spotify Connect ships; the
+// web-player build rotation (bug33) moves the artwork url between them, so
+// every known key is accepted (same order as the active-track projection)
+var connectImageKeys = []string{"image_url", "image_xlarge_url", "image_large_url", "image_small_url"}
+
+// firstConnectImage returns the first non-empty image metadata value among
+// the known Connect image keys, converted to a usable https url; empty when
+// the metadata carries no image at all (the UI keeps its placeholder)
+func firstConnectImage(metadata map[string]string) string {
+	for _, k := range connectImageKeys {
+		if img := metadata[k]; img != "" {
+			return convertSpotifyImageUrl(img)
+		}
+	}
+	return ""
+}
+
 // projects ProvidedTracks to QueueTracks, skips entries with no URI
 func projectQueue(tracks []*connectpb.ProvidedTrack, limit int) []QueueTrack {
 	if len(tracks) == 0 {
@@ -148,9 +165,9 @@ func projectQueue(tracks []*connectpb.ProvidedTrack, limit int) []QueueTrack {
 			name = t.Metadata["title"]
 			artist = t.Metadata["artist_name"]
 			album = t.Metadata["album_title"]
-			if img, ok := t.Metadata["image_url"]; ok && img != "" {
-				imageUrl = convertSpotifyImageUrl(img)
-			}
+			// bug42: queue items must map the artwork exactly like the active
+			// track (all rotated image keys), not a single image_url key
+			imageUrl = firstConnectImage(t.Metadata)
 		}
 		trackId := ""
 		if parts := strings.SplitN(t.Uri, ":", 3); len(parts) == 3 {
