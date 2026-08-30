@@ -276,6 +276,72 @@ func TestQueueTracksFromPfItems(t *testing.T) {
 	}
 }
 
+func TestQueueTracksFromPfItems_TypedImageSliceKeepsArtwork(t *testing.T) {
+	t.Parallel()
+
+	// bug42: webApiTrackAlbum hands the album images over as a TYPED
+	// []webApiImage slice — queueTracksFromPfItems must still map the artwork
+	// for the queue cards (before the fix the typed slice fell through
+	// asSlice and every expanded queue item lost its cover)
+	items := []any{
+		map[string]any{
+			"is_local": false,
+			"track": map[string]any{
+				"id":   "id-1",
+				"name": "First",
+				"uri":  "spotify:track:id-1",
+				"artists": []any{
+					map[string]any{"name": "Artist One", "uri": "spotify:artist:a1"},
+				},
+				"album": map[string]any{
+					"name": "Album One",
+					"images": []webApiImage{
+						{URL: "https://i.scdn.co/image/big", Width: 640, Height: 640},
+						{URL: "https://i.scdn.co/image/mid", Width: 300, Height: 300},
+						{URL: "https://i.scdn.co/image/small", Width: 64, Height: 64},
+					},
+				},
+			},
+		},
+	}
+
+	got := queueTracksFromPfItems(items)
+	if len(got) != 1 {
+		t.Fatalf("got %d queue tracks, want 1: %+v", len(got), got)
+	}
+	if got[0].ImageUrl != "https://i.scdn.co/image/mid" {
+		t.Errorf("typed image slice: ImageUrl got %q, want the ~300px variant", got[0].ImageUrl)
+	}
+}
+
+// bug42: the full pipeline — a real fetchPlaylist page (2026 rotated shape,
+// the bug33 fixture) through mapPlaylistTracksPage into queueTracksFromPfItems
+// must keep the album artwork for the queue items, not drop it at the
+// typed-slice handoff
+func TestQueueExpandPipeline_2026PayloadKeepsArtwork(t *testing.T) {
+	t.Parallel()
+
+	items, total, err := mapPlaylistTracksPage([]byte(playlistTracksRotated2026Fixture), 0)
+	if err != nil {
+		t.Fatalf("mapPlaylistTracksPage: %v", err)
+	}
+	if total != 13 {
+		t.Fatalf("total: got %d, want 13", total)
+	}
+	got := queueTracksFromPfItems(items)
+	if len(got) != 1 {
+		t.Fatalf("got %d queue tracks, want 1: %+v", len(got), got)
+	}
+	q := got[0]
+	if q.Name != "Iridescent" || q.TrackId != "69ZEgPX0hxWXJIqkTlYz41" {
+		t.Errorf("track identity: got %q/%q", q.Name, q.TrackId)
+	}
+	// the 300px albumOfTrack.coverArt source (largest-first order, 300 in band)
+	if q.ImageUrl != "https://i.scdn.co/image/ab67616d00001e0259211e56a493ac4509457bab" {
+		t.Errorf("2026 payload: ImageUrl got %q, want the 300px coverArt source", q.ImageUrl)
+	}
+}
+
 func TestPfImageUrl(t *testing.T) {
 	t.Parallel()
 
@@ -294,6 +360,23 @@ func TestPfImageUrl(t *testing.T) {
 	// map-shaped images (lenient payloads) work too
 	if got := pfImageUrl([]any{map[string]any{"url": "spotify:image:x", "width": 300}}); got != "spotify:image:x" {
 		t.Errorf("got %q, want the map-shaped url", got)
+	}
+	// bug42: the bug33 mappers hand over a TYPED []webApiImage slice
+	// (webApiTrackAlbum normalizes into it) — same variant selection must apply
+	typed := []webApiImage{
+		{URL: "spotify:image:big", Width: 640, Height: 640},
+		{URL: "spotify:image:mid", Width: 300, Height: 300},
+	}
+	if got := pfImageUrl(typed); got != "spotify:image:mid" {
+		t.Errorf("typed []webApiImage: got %q, want the 300px variant", got)
+	}
+	// typed slice without a mid-size variant: first usable url wins
+	if got := pfImageUrl([]webApiImage{{URL: "spotify:image:big", Width: 640}}); got != "spotify:image:big" {
+		t.Errorf("typed fallback: got %q, want the 640px url", got)
+	}
+	// empty typed slice: empty result
+	if got := pfImageUrl([]webApiImage{}); got != "" {
+		t.Errorf("empty typed slice: got %q, want empty", got)
 	}
 	// empty / junk: empty result
 	if got := pfImageUrl(nil); got != "" {

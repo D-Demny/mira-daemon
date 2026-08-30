@@ -332,27 +332,47 @@ func queueTracksFromPfItems(items []any) []QueueTrack {
 
 // pfImageUrl picks the queue card artwork from a pathfinder image payload:
 // the ~300px variant when available (the card art is 170px, a full-res 640px
-// decode is a main-thread cost — bug8.2), otherwise the first usable url
+// decode is a main-thread cost — bug8.2), otherwise the first usable url.
+// The image list arrives as a TYPED []webApiImage slice (the bug33 web-api
+// mappers — webApiTrackAlbum/pfIdentityFromAny — normalize into it) or as a
+// []any of webApiImage / map entries (lenient raw payloads). Both are
+// accepted, so queue expansion never drops the artwork its own mapper just
+// produced (bug42).
 func pfImageUrl(v any) string {
 	first := ""
-	for _, im := range asSlice(v) {
-		var url string
-		var width int
-		switch t := im.(type) {
-		case webApiImage:
-			url, width = t.URL, t.Width
-		case map[string]any:
-			url = firstString(t, "url", "URL")
-			width = int(asFloat(t["width"]))
-		}
+	pick := func(url string, width int) (string, bool) {
 		if url == "" {
-			continue
+			return "", false
 		}
 		if first == "" {
 			first = url
 		}
 		if width >= 250 && width <= 400 {
-			return url
+			return url, true
+		}
+		return "", false
+	}
+	switch s := v.(type) {
+	case []webApiImage:
+		for _, im := range s {
+			if url, ok := pick(im.URL, im.Width); ok {
+				return url
+			}
+		}
+	case []any:
+		for _, im := range s {
+			var url string
+			var width int
+			switch t := im.(type) {
+			case webApiImage:
+				url, width = t.URL, t.Width
+			case map[string]any:
+				url = firstString(t, "url", "URL")
+				width = int(asFloat(t["width"]))
+			}
+			if url, ok := pick(url, width); ok {
+				return url
+			}
 		}
 	}
 	return first

@@ -143,6 +143,41 @@ func TestProjectQueue_PopulatesMetadataFieldsAndConvertsImageUrl(t *testing.T) {
 	}
 }
 
+func TestProjectQueue_RotatedImageKeysMapArtwork(t *testing.T) {
+	t.Parallel()
+
+	// bug42: the web-player rotation (bug33) moves the Connect image url
+	// between the image_* keys — every key must map to the queue card artwork,
+	// exactly like the active track does, with an empty result (no "https://")
+	// when the metadata carries no image at all
+	tracks := []*connectpb.ProvidedTrack{
+		{Uri: "spotify:track:a", Metadata: map[string]string{"image_url": "spotify:image:aaa"}},
+		{Uri: "spotify:track:b", Metadata: map[string]string{"image_xlarge_url": "spotify:image:bbb"}},
+		{Uri: "spotify:track:c", Metadata: map[string]string{"image_large_url": "spotify:image:ccc"}},
+		{Uri: "spotify:track:d", Metadata: map[string]string{"image_small_url": "spotify:image:ddd"}},
+		{Uri: "spotify:track:e", Metadata: map[string]string{"image_url": ""}}, // empty stays empty
+		{Uri: "spotify:track:f"},                                               // nil metadata
+	}
+
+	got := projectQueue(tracks, 10)
+	if len(got) != 6 {
+		t.Fatalf("expected 6 entries, got %d: %+v", len(got), got)
+	}
+	want := []string{
+		"https://i.scdn.co/image/aaa",
+		"https://i.scdn.co/image/bbb",
+		"https://i.scdn.co/image/ccc",
+		"https://i.scdn.co/image/ddd",
+		"",
+		"",
+	}
+	for i, q := range got {
+		if q.ImageUrl != want[i] {
+			t.Errorf("entry[%d] (%q): ImageUrl got %q, want %q", i, q.Uri, q.ImageUrl, want[i])
+		}
+	}
+}
+
 func TestProjectQueue_NilMetadataAndEmptyImageUrlAreSafe(t *testing.T) {
 	t.Parallel()
 
