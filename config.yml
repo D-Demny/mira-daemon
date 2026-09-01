@@ -22,6 +22,11 @@ homeassistant:
 checkin: true
 checkin_url: "https://mira-checkin.mira-thing.workers.dev"
 
+# Raspberry Pi provisioning wizard (epic 10): the script the daemon execs
+# when the settings UI triggers "Pi automatisch einrichten"
+setup_pi:
+  script_path: "/usr/local/share/mira/setup-pi.sh"
+
 voice:
   enabled: false
   wake: false

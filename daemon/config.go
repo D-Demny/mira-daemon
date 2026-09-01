@@ -28,6 +28,12 @@ type Config struct {
 	// reach HA cross-origin (no CORS for the UI origin), so the UI calls
 	// /ha-api/... on the daemon API server instead. Empty URL = proxy off.
 	HomeAssistant HomeAssistantConfig
+
+	// Raspberry Pi provisioning wizard (epic 10): the daemon execs this
+	// script with SSH_HOST/SSH_USER/SSH_PASS when the settings UI triggers
+	// "Pi automatisch einrichten". Empty path = default rootfs location,
+	// overridable via the MIRA_SETUP_PI_SCRIPT env var.
+	SetupPi SetupPiConfig
 }
 
 type HomeAssistantConfig struct {
