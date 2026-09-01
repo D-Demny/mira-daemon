@@ -178,6 +178,9 @@ func New(opts *Options) (*App, error) {
 	// /ha-api/* CORS proxy for the Home Assistant REST API (epic 9)
 	app.server.SetHomeAssistantConfig(app.cfg.HomeAssistant)
 
+	// /api/setup-pi* Pi provisioning wizard (epic 10)
+	app.server.SetSetupPiHandler(NewSetupPiService(app.log, app.cfg.SetupPi))
+
 	// mirror persisted settings into the firmware brightness conf
 	if len(app.state.Settings) > 0 {
 		app.mirrorBacklightConf(app.state.Settings)

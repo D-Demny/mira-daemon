@@ -70,6 +70,9 @@ type ApiServer interface {
 	// /ha-api/* uses this; empty URL disables the proxy (503)
 	SetHomeAssistantConfig(cfg HomeAssistantConfig)
 
+	// /api/setup-pi* uses this (epic 10), nil = 503
+	SetSetupPiHandler(h SetupPiHandler)
+
 	Submit(ctx context.Context, t ApiRequestType, data any) (any, error)
 }
 
@@ -177,6 +180,9 @@ type ConcreteApiServer struct {
 	haCfg      HomeAssistantConfig
 	haClientMu sync.Mutex
 	haClient   *http.Client
+
+	setupMu sync.RWMutex
+	setupFn SetupPiHandler
 }
 
 var (
@@ -583,6 +589,8 @@ func (s *StubApiServer) SetBluetoothHandler(_ BluetoothHandler) {}
 
 func (s *StubApiServer) SetHomeAssistantConfig(_ HomeAssistantConfig) {}
 
+func (s *StubApiServer) SetSetupPiHandler(_ SetupPiHandler) {}
+
 func (s *ConcreteApiServer) SetAuthHandler(fn AuthStatusFunc) {
 	s.authMu.Lock()
 	s.authFn = fn
@@ -701,6 +709,18 @@ func (s *ConcreteApiServer) homeAssistantClient() *http.Client {
 		s.haClient = &http.Client{Timeout: haProxyTimeout}
 	}
 	return s.haClient
+}
+
+func (s *ConcreteApiServer) SetSetupPiHandler(h SetupPiHandler) {
+	s.setupMu.Lock()
+	s.setupFn = h
+	s.setupMu.Unlock()
+}
+
+func (s *ConcreteApiServer) getSetupPiHandler() SetupPiHandler {
+	s.setupMu.RLock()
+	defer s.setupMu.RUnlock()
+	return s.setupFn
 }
 
 // The browser cannot reach Home Assistant cross-origin (HA only answers
@@ -869,6 +889,53 @@ func (s *ConcreteApiServer) serve() {
 		}, w)
 	}))
 	m.Handle("/ha-api/", http.HandlerFunc(s.handleHaApiProxy))
+	// epic 10: the settings UI triggers the Pi provisioning wizard from the
+	// device over USB-Ethernet. Cross-service handler like /debug/* and
+	// /ha-api/: no player session needed. The password is only passed to the
+	// script process (SSH_PASS env) and never logged.
+	m.HandleFunc("POST /api/setup-pi", func(w http.ResponseWriter, r *http.Request) {
+		var req SetupPiRequest
+		if err := jsonDecode(r, &req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json body"})
+			return
+		}
+		h := s.getSetupPiHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if err := validateSetupPiRequest(req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		jobId, err := h.StartSetupPi(req)
+		if err != nil {
+			code := http.StatusInternalServerError
+			if errors.Is(err, ErrSetupPiBusy) {
+				code = http.StatusConflict
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{"job_id": jobId})
+	})
+	m.HandleFunc("GET /api/setup-pi/status", func(w http.ResponseWriter, r *http.Request) {
+		h := s.getSetupPiHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(h.SetupPiStatus())
+	})
 	m.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			w.WriteHeader(http.StatusMethodNotAllowed)

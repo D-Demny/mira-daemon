@@ -85,6 +85,11 @@ type cliConfig struct {
 		URL   string `koanf:"url"`
 		Token string `koanf:"token"`
 	} `koanf:"homeassistant"`
+
+	// Raspberry Pi provisioning wizard (epic 10)
+	SetupPi struct {
+		ScriptPath string `koanf:"script_path"`
+	} `koanf:"setup_pi"`
 }
 
 func (c *cliConfig) toDaemonConfig() *daemon.Config {
@@ -124,6 +129,7 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 	dc.Credentials.SpotifyToken.AccessToken = c.Credentials.SpotifyToken.AccessToken
 	dc.HomeAssistant.URL = c.HomeAssistant.URL
 	dc.HomeAssistant.Token = c.HomeAssistant.Token
+	dc.SetupPi = daemon.SetupPiConfig{ScriptPath: c.SetupPi.ScriptPath}
 	return dc
 }
 
@@ -185,6 +191,8 @@ func loadCLIConfig(cfg *cliConfig) error {
 		"voice.catalog_sync":           true,
 		"voice.hash_rotate":            true,
 		"voice.sherpa_bin":             "sherpa_asr_server",
+
+		"setup_pi.script_path": "/usr/local/share/mira/setup-pi.sh",
 	}, "."), nil)
 
 	var configPath string
