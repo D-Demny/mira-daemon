@@ -126,8 +126,15 @@ func sshTransportError(err error) bool {
 // (SSH_AUTH_SOCK emptied, so a foreign key cannot mask whether OUR key
 // works), accept-new known-host handling.
 func runSshKey(ctx context.Context, host, user, command string) (string, error) {
+	return runSshKeyWith(ctx, KeyPath(), host, user, command)
+}
+
+// runSshKeyWith is runSshKey with an explicit key path. The PiSession
+// manager (ticket10-4) pins the exact key file it checks on disk, so its
+// probe and its long-lived session always use the same key.
+func runSshKeyWith(ctx context.Context, keyPath, host, user, command string) (string, error) {
 	args := []string{
-		"-i", KeyPath(),
+		"-i", keyPath,
 		"-o", "BatchMode=yes",
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", sshConnectTimeout),
