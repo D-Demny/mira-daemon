@@ -19,11 +19,33 @@ import (
 //	             otherwise fails with exit 255 (like a real auth failure)
 //	password auth -i absent  (the fake sshpass drops to this mode) ->
 //	             succeeds unless FAKE_SSH_PASS_FAIL=1
+//
+//	Additional env hooks (ticket10-4 PiSession tests):
+//	FAKE_SSH_MARK    every invocation appends one line to this file
+//	FAKE_SSH_DELAY   artificial delay (s) before the auth decision
+//	FAKE_PI_UP       long-lived session (-N): stays alive while this file
+//	             exists, dies with exit 255 when it is removed (Pi pulled)
 const fakeSSH = `#!/bin/sh
 key_mode=0
+no_cmd=0
 for a in "$@"; do
     [ "$a" = "-i" ] && key_mode=1
+    [ "$a" = "-N" ] && no_cmd=1
 done
+[ -n "${FAKE_SSH_MARK:-}" ] && echo x >> "$FAKE_SSH_MARK"
+[ -n "${FAKE_SSH_DELAY:-}" ] && sleep "$FAKE_SSH_DELAY"
+if [ "$no_cmd" = 1 ]; then
+    # long-lived session (ssh -N): key auth only, then alive while the
+    # fake Pi is up
+    if [ "${FAKE_SSH_KEY_OK:-0}" != 1 ]; then
+        printf 'Permission denied (publickey).\n' >&2
+        exit 255
+    fi
+    while [ -e "${FAKE_PI_UP:-/nonexistent-fake-pi-up}" ]; do
+        sleep 0.2
+    done
+    exit 255
+fi
 if [ "$key_mode" = 1 ] && [ "${FAKE_SSH_KEY_OK:-0}" != 1 ]; then
     printf 'Permission denied (publickey).\n' >&2
     exit 255
@@ -114,7 +136,8 @@ func fakeSSHBinDir(t *testing.T) {
 }
 
 // fakeKeyEnv sets the key path to a temp location and the fake
-// authorized_keys file; returns both paths.
+// authorized_keys file; returns both paths. It also points FAKE_PI_UP at a
+// temp file that does not exist (fake Pi down, ticket10-4 session tests).
 func fakeKeyEnv(t *testing.T) (keyPath, authKeys string) {
 	t.Helper()
 	keyPath = filepath.Join(t.TempDir(), "id_ed25519")
@@ -122,7 +145,18 @@ func fakeKeyEnv(t *testing.T) (keyPath, authKeys string) {
 	authKeys = filepath.Join(t.TempDir(), "authorized_keys")
 	t.Setenv("FAKE_PI_AUTHKEYS", authKeys)
 	t.Setenv("FAKE_SSH_KEY_OK", "0")
+	t.Setenv("FAKE_PI_UP", filepath.Join(t.TempDir(), "pi-up"))
 	return keyPath, authKeys
+}
+
+// fakePiUpFile returns the FAKE_PI_UP path set by fakeKeyEnv.
+func fakePiUpFile(t *testing.T) string {
+	t.Helper()
+	p := os.Getenv("FAKE_PI_UP")
+	if p == "" {
+		t.Fatal("FAKE_PI_UP not set (run fakeKeyEnv first)")
+	}
+	return p
 }
 
 func fakeKeyOK(t *testing.T, ok bool) {

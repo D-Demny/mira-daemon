@@ -68,6 +68,9 @@ type App struct {
 	// voice is the on-device voice service
 	voice *voiceService
 
+	// piSession is the Pi SSH auto-reconnect manager (epic 10 ticket10-4)
+	piSession *PiSession
+
 	retryNowCh chan struct{}
 
 	// pre-network attempt sits in DNS resolution for 20-30s. parking here until network is up dodges that
@@ -179,7 +182,21 @@ func New(opts *Options) (*App, error) {
 	app.server.SetHomeAssistantConfig(app.cfg.HomeAssistant)
 
 	// /api/setup-pi* Pi provisioning wizard (epic 10)
-	app.server.SetSetupPiHandler(NewSetupPiService(app.log, app.cfg.SetupPi))
+	setupPi := NewSetupPiService(app.log, app.cfg.SetupPi)
+	app.server.SetSetupPiHandler(setupPi)
+
+	// /api/pi/status Pi session auto-reconnect (epic 10 ticket10-4): the
+	// manager starts with the daemon (key-based, never prompts for a
+	// password) and is stopped in Close.
+	app.piSession = NewPiSession(app.log, PiSessionConfig{
+		LoadConfig: app.loadPiServerConfig,
+		ModelTier: func() (string, string) {
+			st := setupPi.SetupPiStatus()
+			return st.Model, st.Tier
+		},
+	})
+	app.server.SetPiSessionHandler(app.piSession)
+	app.piSession.Start()
 
 	// mirror persisted settings into the firmware brightness conf
 	if len(app.state.Settings) > 0 {
@@ -347,6 +364,9 @@ func (app *App) Close() error {
 	}
 	app.closed = true
 
+	if app.piSession != nil {
+		app.piSession.Stop()
+	}
 	if app.voice != nil {
 		app.voice.Stop()
 	}
@@ -403,6 +423,37 @@ func (app *App) PutSettings(body []byte) error {
 		app.voice.setWakeEnabled(voiceMicFromSettings(body))
 	}
 	return app.persistState()
+}
+
+// loadPiServerConfig reads the stored Pi target (ip/user) from the UI
+// settings blob - the same JSON the frontend persists via /settings
+// (piServer: {ip, user, password}). The password is deliberately NOT read:
+// the auto-reconnect session is key-only (ticket10-4 must never re-prompt
+// for a password). The daemon config (config.yml) is build-time static and
+// is not the source for the user-chosen Pi target.
+func (app *App) loadPiServerConfig() (string, string, bool) {
+	app.state.Lock()
+	blob := make([]byte, len(app.state.Settings))
+	copy(blob, app.state.Settings)
+	app.state.Unlock()
+	if len(blob) == 0 {
+		return "", "", false
+	}
+	var s struct {
+		PiServer struct {
+			Ip   string `json:"ip"`
+			User string `json:"user"`
+		} `json:"piServer"`
+	}
+	if err := json.Unmarshal(blob, &s); err != nil {
+		return "", "", false
+	}
+	ip := strings.TrimSpace(s.PiServer.Ip)
+	user := strings.TrimSpace(s.PiServer.User)
+	if ip == "" || user == "" {
+		return "", "", false
+	}
+	return ip, user, true
 }
 
 // reads the "voiceMic" preference from the UI settings

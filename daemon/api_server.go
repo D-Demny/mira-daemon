@@ -73,6 +73,9 @@ type ApiServer interface {
 	// /api/setup-pi* uses this (epic 10), nil = 503
 	SetSetupPiHandler(h SetupPiHandler)
 
+	// /api/pi/status uses this (epic 10 ticket10-4), nil = 503
+	SetPiSessionHandler(h PiSessionHandler)
+
 	Submit(ctx context.Context, t ApiRequestType, data any) (any, error)
 }
 
@@ -183,6 +186,9 @@ type ConcreteApiServer struct {
 
 	setupMu sync.RWMutex
 	setupFn SetupPiHandler
+
+	piMu sync.RWMutex
+	piFn PiSessionHandler
 }
 
 var (
@@ -591,6 +597,8 @@ func (s *StubApiServer) SetHomeAssistantConfig(_ HomeAssistantConfig) {}
 
 func (s *StubApiServer) SetSetupPiHandler(_ SetupPiHandler) {}
 
+func (s *StubApiServer) SetPiSessionHandler(_ PiSessionHandler) {}
+
 func (s *ConcreteApiServer) SetAuthHandler(fn AuthStatusFunc) {
 	s.authMu.Lock()
 	s.authFn = fn
@@ -721,6 +729,18 @@ func (s *ConcreteApiServer) getSetupPiHandler() SetupPiHandler {
 	s.setupMu.RLock()
 	defer s.setupMu.RUnlock()
 	return s.setupFn
+}
+
+func (s *ConcreteApiServer) SetPiSessionHandler(h PiSessionHandler) {
+	s.piMu.Lock()
+	s.piFn = h
+	s.piMu.Unlock()
+}
+
+func (s *ConcreteApiServer) getPiSessionHandler() PiSessionHandler {
+	s.piMu.RLock()
+	defer s.piMu.RUnlock()
+	return s.piFn
 }
 
 // The browser cannot reach Home Assistant cross-origin (HA only answers
@@ -935,6 +955,19 @@ func (s *ConcreteApiServer) serve() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(h.SetupPiStatus())
+	})
+	// epic 10 ticket10-4: the Pi session auto-reconnect status for the
+	// settings UI. Cross-service handler like /api/setup-pi: no player
+	// session needed. The provisioning-job status stays on
+	// /api/setup-pi/status (new endpoint, untouched).
+	m.HandleFunc("GET /api/pi/status", func(w http.ResponseWriter, r *http.Request) {
+		h := s.getPiSessionHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(h.PiStatus())
 	})
 	m.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
