@@ -25,6 +25,8 @@
 #   SSH_HOST  Pi IP address (default network: 192.168.7.1)
 #   SSH_USER  ssh user on the Pi
 #   SSH_PASS  ssh password (never printed; handed to sshpass via SSHPASS)
+#   MIRA_SSH_KEY_PATH  path of the device ssh key for the key-first attempt
+#                      (epic 10 ticket10-3; default /etc/mira/ssh/id_ed25519)
 #
 # On success the script prints the machine-readable line
 #   RESULT model="<model>" tier="<lightweight|compute>"
@@ -56,10 +58,43 @@ command -v ssh >/dev/null 2>&1 || die "ssh client is not installed on this devic
 # up in the process list (sshpass -p would)
 export SSHPASS="$SSH_PASS"
 
-# run one command (or a multi-line script) on the Pi
-run_ssh() {
+# epic 10 ticket10-3: key-first SSH. The daemon generates the device key
+# pair lazily at this path before exec'ing this script (it passes the path
+# as MIRA_SSH_KEY_PATH; the default is the rootfs location created by the
+# firmware build). Once a finished run installed the key on the Pi, every
+# operation can run without the password.
+MIRA_SSH_KEY_PATH="${MIRA_SSH_KEY_PATH:-/etc/mira/ssh/id_ed25519}"
+
+# key attempt: BatchMode (no password prompt, fails fast), no inherited
+# agent (SSH_AUTH_SOCK emptied, so a foreign key cannot mask whether OUR
+# key works), accept-new known-host handling
+run_ssh_key() {
+    SSH_AUTH_SOCK= ssh -i "$MIRA_SSH_KEY_PATH" \
+        -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        -o ConnectTimeout=10 -o LogLevel=ERROR "$SSH_USER@$SSH_HOST" "$1"
+}
+
+run_ssh_pass() {
     sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=10 -o LogLevel=ERROR "$SSH_USER@$SSH_HOST" "$1"
+}
+
+# run one command (or a multi-line script) on the Pi: key-first, password
+# fallback. A key attempt that fails with ssh exit 255 is a connection or
+# authentication problem -> retry with the password. Any other exit code is
+# the REMOTE command's own exit code (it already ran) -> returned as-is, a
+# password retry would double-execute it. Without the key file (manual runs
+# on older images) the behaviour is unchanged: straight to sshpass.
+run_ssh() {
+    if [ -f "$MIRA_SSH_KEY_PATH" ]; then
+        run_ssh_key "$1"
+        rc=$?
+        if [ "$rc" -ne 255 ]; then
+            return "$rc"
+        fi
+        # rc 255: connection/authentication level - fall through
+    fi
+    run_ssh_pass "$1"
 }
 
 log "provisioning $SSH_HOST (user: $SSH_USER)"

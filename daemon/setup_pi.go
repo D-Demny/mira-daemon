@@ -75,6 +75,15 @@ type SetupPiStatus struct {
 	Tier       string   `json:"tier,omitempty"`
 	Error      string   `json:"error,omitempty"`
 	LogTail    []string `json:"log_tail,omitempty"`
+	// KeyInstalled reports whether the device's SSH public key is (believed
+	// to be) in the Pi's authorized_keys. Set by a successful key
+	// installation; in-memory like the whole job state, a daemon restart
+	// resets it to false.
+	KeyInstalled bool `json:"key_installed"`
+	// KeyError carries the key-setup problem (generation or installation)
+	// as a clear message, empty when there is no key-specific failure.
+	// Password login keeps working in every case - no half state.
+	KeyError string `json:"key_error,omitempty"`
 }
 
 // SetupPiHandler is the cross-service handler for the /api/setup-pi*
@@ -91,15 +100,17 @@ type SetupPiService struct {
 	log        librespot.Logger
 	scriptPath string
 
-	mu       sync.Mutex
-	jobId    string
-	state    string
-	started  time.Time
-	finished time.Time
-	model    string
-	tier     string
-	errMsg   string
-	logLines []string
+	mu           sync.Mutex
+	jobId        string
+	state        string
+	started      time.Time
+	finished     time.Time
+	model        string
+	tier         string
+	errMsg       string
+	keyInstalled bool
+	keyError     string
+	logLines     []string
 }
 
 // NewSetupPiService resolves the wizard script path: env override wins over
@@ -157,6 +168,8 @@ func (s *SetupPiService) StartSetupPi(req SetupPiRequest) (string, error) {
 	s.model = ""
 	s.tier = ""
 	s.errMsg = ""
+	s.keyInstalled = false
+	s.keyError = ""
 	s.logLines = nil
 	s.mu.Unlock()
 
@@ -171,14 +184,36 @@ func (s *SetupPiService) run(req SetupPiRequest, jobId string) {
 	ctx, cancel := context.WithTimeout(context.Background(), setupPiScriptTimeout)
 	defer cancel()
 
+	// epic 10 ticket10-3: lazy key generation on the device side (no-op when
+	// the pair already exists). A generation failure must not break
+	// provisioning - password login keeps working, only the key installation
+	// step below is disabled.
+	pubKey := ""
+	keyErr := ""
+	if err := EnsureKey(ctx); err != nil {
+		keyErr = "key generation failed: " + err.Error()
+		s.appendLog("setup-pi: " + keyErr)
+	} else if pub, err := ReadPublicKey(KeyPath()); err != nil {
+		keyErr = "key generation failed: " + err.Error()
+		s.appendLog("setup-pi: " + keyErr)
+	} else {
+		pubKey = pub
+	}
+
 	// exec the script directly (rootfs installs it 0755); the password
-	// travels only in the environment, never on the command line
+	// travels only in the environment, never on the command line. The wizard
+	// gets the key path for its key-first ssh (first run: key not installed
+	// on the Pi yet, so it falls back to the password like before).
 	cmd := exec.CommandContext(ctx, s.scriptPath)
 	cmd.Env = append(os.Environ(),
 		"SSH_HOST="+req.Ip,
 		"SSH_USER="+req.User,
 		"SSH_PASS="+req.Password,
+		"MIRA_SSH_KEY_PATH="+KeyPath(),
 	)
+	if pubKey != "" {
+		cmd.Env = append(cmd.Env, "MIRA_SSH_PUBKEY="+pubKey)
+	}
 	s.appendLog(fmt.Sprintf("exec %s (host %s, user %s)", s.scriptPath, req.Ip, req.User))
 
 	// stdout and stderr share the log ring so the UI sees one stream
@@ -200,6 +235,45 @@ func (s *SetupPiService) run(req SetupPiRequest, jobId string) {
 	// the wizard prints RESULT model="..." tier="..." on the success path
 	model, tier := parseSetupPiResult(s.snapshotLogLines())
 
+	// epic 10 ticket10-3: the finished run IS the successful password login
+	// - install the device key on the Pi now, in the same authenticated
+	// flow (key-first: already works on re-runs; sshpass fallback on the
+	// first run where the key is not installed yet). A key failure must not
+	// turn the successful provisioning into a failure (no half state): it
+	// is surfaced as key_error and password login keeps working. If the
+	// run itself failed, key_error stays empty - the run error carries the
+	// reason, key_installed simply stays false.
+	keyInstalled := false
+	if errMsg == "" && pubKey != "" {
+		script, err := installKeyCommand(pubKey)
+		if err != nil {
+			keyErr = "key installation failed: " + err.Error()
+			s.appendLog("setup-pi: " + keyErr)
+		} else {
+			// a fresh context: the install is one ssh round-trip, not part
+			// of the 30-minute wizard budget
+			ictx, icancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			usedKey, out, instErr := RunKeyFirst(ictx, req.Ip, req.User, req.Password, script)
+			icancel()
+			for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+				if line != "" {
+					s.appendLog(line)
+				}
+			}
+			if instErr != nil {
+				keyErr = "key installation failed: " + instErr.Error()
+				s.log.Warnf("setup-pi: key installation failed: %s", instErr)
+			} else {
+				keyInstalled = true
+				mode := "password"
+				if usedKey {
+					mode = "ssh key"
+				}
+				s.log.Infof("setup-pi: ssh key installed on %s (via %s)", req.Ip, mode)
+			}
+		}
+	}
+
 	s.mu.Lock()
 	// a newer job has already reset the fields; only the job that owns them writes the outcome
 	if s.jobId == jobId {
@@ -216,6 +290,8 @@ func (s *SetupPiService) run(req SetupPiRequest, jobId string) {
 		if tier != "" {
 			s.tier = tier
 		}
+		s.keyInstalled = keyInstalled
+		s.keyError = keyErr
 	}
 	s.mu.Unlock()
 
@@ -246,7 +322,8 @@ func (s *SetupPiService) snapshotLogLines() []string {
 // SetupPiStatus returns the current job state. Times are UTC RFC3339.
 func (s *SetupPiService) SetupPiStatus() SetupPiStatus {
 	s.mu.Lock()
-	st := SetupPiStatus{State: s.state, JobId: s.jobId, Model: s.model, Tier: s.tier, Error: s.errMsg}
+	st := SetupPiStatus{State: s.state, JobId: s.jobId, Model: s.model, Tier: s.tier, Error: s.errMsg,
+		KeyInstalled: s.keyInstalled, KeyError: s.keyError}
 	if !s.started.IsZero() {
 		st.StartedAt = s.started.UTC().Format(time.RFC3339)
 	}
