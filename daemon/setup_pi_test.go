@@ -90,8 +90,11 @@ func TestSetupPi_ValidationErrors(t *testing.T) {
 	}
 }
 
+// no t.Parallel(): the run execs ssh-keygen/ssh/sshpass, so the fake
+// binaries and their env vars must be installed (t.Setenv)
 func TestSetupPi_StartAndStatusTransition(t *testing.T) {
-	t.Parallel()
+	fakeSSHBinDir(t)
+	fakeKeyEnv(t)
 
 	script := writeFakeScript(t, `#!/bin/sh
 echo "wizard start host=$SSH_HOST user=$SSH_USER passlen=${#SSH_PASS}"
@@ -159,8 +162,10 @@ printf 'RESULT model="Fake Pi Zero W" tier="lightweight"\n'
 	}
 }
 
+// no t.Parallel(): the run execs ssh-keygen (t.Setenv fake binaries)
 func TestSetupPi_FailedJob(t *testing.T) {
-	t.Parallel()
+	fakeSSHBinDir(t)
+	fakeKeyEnv(t)
 
 	script := writeFakeScript(t, `#!/bin/sh
 echo "wizard start"
@@ -194,8 +199,10 @@ exit 3
 	}
 }
 
+// no t.Parallel(): the runs exec ssh-keygen (t.Setenv fake binaries)
 func TestSetupPi_BusyConflict(t *testing.T) {
-	t.Parallel()
+	fakeSSHBinDir(t)
+	fakeKeyEnv(t)
 
 	script := writeFakeScript(t, "#!/bin/sh\nsleep 2\necho done\n")
 	srv, base := newTestApiServer(t)
@@ -335,5 +342,129 @@ func TestValidateSetupPiRequest(t *testing.T) {
 		if err != nil && strings.Contains(err.Error(), "topsecret") {
 			t.Errorf("validation error leaks password: %v", err)
 		}
+	}
+}
+
+// epic 10 ticket10-3: key installation after the successful password login.
+// All three tests are no-t.Parallel (t.Setenv fake SSH binaries) and use the
+// fake wizard script + the fake remote authorized_keys file.
+
+func TestSetupPi_KeyInstalledOnSuccess(t *testing.T) {
+	fakeSSHBinDir(t)
+	keyPath, authKeys := fakeKeyEnv(t)
+	fakeKeyOK(t, false) // first run: key not on the Pi yet -> password fallback
+
+	script := writeFakeScript(t, `#!/bin/sh
+printf 'RESULT model="Fake Pi 4" tier="compute"\n'
+`)
+	srv, base := newTestApiServer(t)
+	srv.SetSetupPiHandler(NewSetupPiService(&librespot.NullLogger{}, SetupPiConfig{ScriptPath: script}))
+
+	status, _ := postSetupPi(t, base, `{"ip":"192.168.7.1","user":"u","password":"p"}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want 202", status)
+	}
+	st := waitForSetupPiState(t, base, setupPiStateSuccess)
+	if !st.KeyInstalled {
+		t.Errorf("key_installed = false, want true after a successful run")
+	}
+	if st.KeyError != "" {
+		t.Errorf("key_error = %q, want empty", st.KeyError)
+	}
+
+	// the key pair was generated on the device side
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Errorf("device key missing: %v", err)
+	}
+	// and the public key landed in the (fake) authorized_keys
+	b, err := os.ReadFile(authKeys)
+	if err != nil {
+		t.Fatalf("fake authorized_keys missing: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 1 || lines[0] != fakePublicKey {
+		t.Errorf("authorized_keys = %q, want exactly one line %q", lines, fakePublicKey)
+	}
+}
+
+func TestSetupPi_KeyInstallFailureSurfacesError(t *testing.T) {
+	fakeSSHBinDir(t)
+	_, _ = fakeKeyEnv(t)
+	fakeKeyOK(t, false)
+	t.Setenv("FAKE_SSH_PASS_FAIL", "1") // both attempts fail
+
+	// the wizard itself still succeeds (its own ssh is the fake script, no
+	// real auth) - only the key install step must fail, without turning the
+	// run into a failure (no half state: password login keeps working)
+	script := writeFakeScript(t, `#!/bin/sh
+printf 'RESULT model="Fake Pi 4" tier="compute"\n'
+`)
+	srv, base := newTestApiServer(t)
+	srv.SetSetupPiHandler(NewSetupPiService(&librespot.NullLogger{}, SetupPiConfig{ScriptPath: script}))
+
+	status, _ := postSetupPi(t, base, `{"ip":"192.168.7.1","user":"u","password":"s3cret-pw"}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want 202", status)
+	}
+	st := waitForSetupPiState(t, base, setupPiStateSuccess)
+	if st.State != setupPiStateSuccess {
+		t.Fatalf("state = %q, want success (key failure must not fail the run)", st.State)
+	}
+	if st.KeyInstalled {
+		t.Errorf("key_installed = true, want false")
+	}
+	if !strings.Contains(st.KeyError, "key installation failed") {
+		t.Errorf("key_error = %q, want a key installation failure message", st.KeyError)
+	}
+	// the password must not leak into the key error
+	if strings.Contains(st.KeyError, "s3cret-pw") {
+		t.Errorf("password leaked into key_error: %q", st.KeyError)
+	}
+}
+
+func TestSetupPi_KeyInstallIdempotentSecondRun(t *testing.T) {
+	fakeSSHBinDir(t)
+	_, authKeys := fakeKeyEnv(t)
+	fakeKeyOK(t, false) // first run: password fallback installs the key
+
+	script := writeFakeScript(t, `#!/bin/sh
+printf 'RESULT model="Fake Pi 4" tier="compute"\n'
+`)
+	srv, base := newTestApiServer(t)
+	srv.SetSetupPiHandler(NewSetupPiService(&librespot.NullLogger{}, SetupPiConfig{ScriptPath: script}))
+
+	status, _ := postSetupPi(t, base, `{"ip":"192.168.7.1","user":"u","password":"p"}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("first POST status = %d, want 202", status)
+	}
+	st := waitForSetupPiState(t, base, setupPiStateSuccess)
+	if !st.KeyInstalled {
+		t.Fatalf("first run: key_installed = false, want true")
+	}
+
+	// second run: the key is on the Pi now -> key auth serves the install,
+	// the append must be skipped (no duplicate line)
+	fakeKeyOK(t, true)
+	status, _ = postSetupPi(t, base, `{"ip":"192.168.7.1","user":"u","password":"p"}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("second POST status = %d, want 202", status)
+	}
+	st = waitForSetupPiState(t, base, setupPiStateSuccess)
+	if !st.KeyInstalled {
+		t.Errorf("second run: key_installed = false, want true")
+	}
+	if st.KeyError != "" {
+		t.Errorf("second run: key_error = %q, want empty", st.KeyError)
+	}
+	b, err := os.ReadFile(authKeys)
+	if err != nil {
+		t.Fatalf("fake authorized_keys missing: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("authorized_keys has %d lines after the second run, want exactly 1 (idempotent): %q", len(lines), lines)
+	}
+	if lines[0] != fakePublicKey {
+		t.Errorf("authorized_keys line = %q, want %q", lines[0], fakePublicKey)
 	}
 }
