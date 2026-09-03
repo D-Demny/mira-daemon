@@ -55,6 +55,12 @@ var ErrSetupPiBusy = errors.New("a provisioning run is already in progress")
 type SetupPiConfig struct {
 	// ScriptPath of the provisioning wizard; empty = default path.
 	ScriptPath string
+
+	// LoadSettings returns the UI settings blob (ticket10-5): the wizard
+	// resolves the DEFAULT target profile from it (the active profile)
+	// when the POST body carries no explicit profile_id. nil = the implicit
+	// legacy profile is always the default (old UI images without piProfiles).
+	LoadSettings func() []byte
 }
 
 // SetupPiRequest is the POST /api/setup-pi body. The password is only
@@ -63,12 +69,22 @@ type SetupPiRequest struct {
 	Ip       string `json:"ip"`
 	User     string `json:"user"`
 	Password string `json:"password"`
+	// ProfileId selects the profile whose key pair the wizard uses
+	// (ticket10-5). Design decision: the wizard works on the ACTIVE profile
+	// - the UI saves the profile into the settings blob (and sets it
+	// active) before starting the run - and may additionally name it here
+	// explicitly. Empty = active profile from the settings blob, or the
+	// implicit legacy profile when the blob has no profiles (old UI).
+	ProfileId string `json:"profile_id"`
 }
 
 // SetupPiStatus is the GET /api/setup-pi/status response.
 type SetupPiStatus struct {
-	State      string   `json:"state"`
-	JobId      string   `json:"job_id,omitempty"`
+	State string `json:"state"`
+	JobId string `json:"job_id,omitempty"`
+	// ProfileId is the profile this job ran on (ticket10-5); the key
+	// fields (KeyInstalled/KeyError) refer to its key pair.
+	ProfileId  string   `json:"profile_id,omitempty"`
 	StartedAt  string   `json:"started_at,omitempty"`
 	FinishedAt string   `json:"finished_at,omitempty"`
 	Model      string   `json:"model,omitempty"`
@@ -97,11 +113,13 @@ type SetupPiHandler interface {
 // /api/setup-pi endpoints. No persistence: a daemon restart resets the job
 // to idle. Only one run at a time.
 type SetupPiService struct {
-	log        librespot.Logger
-	scriptPath string
+	log          librespot.Logger
+	scriptPath   string
+	loadSettings func() []byte
 
 	mu           sync.Mutex
 	jobId        string
+	profileID    string
 	state        string
 	started      time.Time
 	finished     time.Time
@@ -123,7 +141,7 @@ func NewSetupPiService(log librespot.Logger, cfg SetupPiConfig) *SetupPiService 
 	if path == "" {
 		path = setupPiDefaultScriptPath
 	}
-	return &SetupPiService{log: log, scriptPath: path, state: setupPiStateIdle}
+	return &SetupPiService{log: log, scriptPath: path, loadSettings: cfg.LoadSettings, state: setupPiStateIdle}
 }
 
 // validateSetupPiRequest checks the request fields. It must never include
@@ -141,6 +159,14 @@ func validateSetupPiRequest(req SetupPiRequest) error {
 	if req.Password == "" {
 		return errors.New("missing password")
 	}
+	// an explicit profile id (ticket10-5) must be safe as a file name; an
+	// EMPTY id is valid (it means "the active profile from the settings
+	// blob"). The HTTP layer maps this to a synchronous 400.
+	if strings.TrimSpace(req.ProfileId) != "" {
+		if _, err := sanitizeProfileID(req.ProfileId); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -155,6 +181,13 @@ func (s *SetupPiService) StartSetupPi(req SetupPiRequest) (string, error) {
 		return "", fmt.Errorf("provisioning script not found at %s (not packaged in this firmware build)", s.scriptPath)
 	}
 
+	// ticket10-5: resolve the target profile before the job starts so a
+	// bad id is a synchronous 400, not an in-job failure.
+	profileID, err := s.resolveProfileID(req.ProfileId)
+	if err != nil {
+		return "", err
+	}
+
 	s.mu.Lock()
 	if s.state == setupPiStateRunning {
 		s.mu.Unlock()
@@ -162,6 +195,7 @@ func (s *SetupPiService) StartSetupPi(req SetupPiRequest) (string, error) {
 	}
 	jobId := fmt.Sprintf("pi-%d", time.Now().UnixNano())
 	s.jobId = jobId
+	s.profileID = profileID
 	s.state = setupPiStateRunning
 	s.started = time.Now()
 	s.finished = time.Time{}
@@ -174,30 +208,62 @@ func (s *SetupPiService) StartSetupPi(req SetupPiRequest) (string, error) {
 	s.mu.Unlock()
 
 	// the password deliberately never reaches the log
-	s.log.Infof("setup-pi: starting provisioning of %s (user %s) via %s", req.Ip, req.User, s.scriptPath)
+	s.log.Infof("setup-pi: starting provisioning of %s (user %s, profile %s) via %s", req.Ip, req.User, profileID, s.scriptPath)
 
-	go s.run(req, jobId)
+	go s.run(req, jobId, profileID)
 	return jobId, nil
 }
 
-func (s *SetupPiService) run(req SetupPiRequest, jobId string) {
+// resolveProfileID picks the profile whose key pair the wizard runs on
+// (ticket10-5): an explicit profile_id from the request body (the
+// add-profile flow of the settings UI), otherwise the active profile of
+// the UI settings blob, otherwise the implicit legacy profile (blobs
+// written before the profile model). The result is sanitized: an unsafe
+// id is rejected (the HTTP layer maps it to a 400).
+func (s *SetupPiService) resolveProfileID(explicit string) (string, error) {
+	if explicit = strings.TrimSpace(explicit); explicit != "" {
+		return sanitizeProfileID(explicit)
+	}
+	if s.loadSettings != nil {
+		if p := ResolveActiveProfile(s.loadSettings()); p != nil {
+			return sanitizeProfileID(p.ID)
+		}
+	}
+	return legacyPiProfileID, nil
+}
+
+func (s *SetupPiService) run(req SetupPiRequest, jobId, profileID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), setupPiScriptTimeout)
 	defer cancel()
 
-	// epic 10 ticket10-3: lazy key generation on the device side (no-op when
-	// the pair already exists). A generation failure must not break
-	// provisioning - password login keeps working, only the key installation
-	// step below is disabled.
+	// epic 10 ticket10-3 + ticket10-5: lazy key generation on the device
+	// side, PER PROFILE (the legacy profile keeps id_ed25519, all others
+	// get <profileId>_ed25519 - see sshkey.go); no-op when the pair already
+	// exists. A generation failure must not break provisioning - password
+	// login keeps working, only the key installation step below is disabled.
+	keyPath := KeyPath()
 	pubKey := ""
 	keyErr := ""
-	if err := EnsureKey(ctx); err != nil {
-		keyErr = "key generation failed: " + err.Error()
-		s.appendLog("setup-pi: " + keyErr)
-	} else if pub, err := ReadPublicKey(KeyPath()); err != nil {
+	if p, err := KeyPathForProfile(profileID); err != nil {
+		// cannot happen after StartSetupPi validated the id; defensive
 		keyErr = "key generation failed: " + err.Error()
 		s.appendLog("setup-pi: " + keyErr)
 	} else {
-		pubKey = pub
+		keyPath = p
+	}
+	if keyErr == "" {
+		if err := EnsureKeyForProfile(ctx, profileID); err != nil {
+			keyErr = "key generation failed: " + err.Error()
+			s.appendLog("setup-pi: " + keyErr)
+		}
+	}
+	if keyErr == "" {
+		if pub, err := ReadPublicKey(keyPath); err != nil {
+			keyErr = "key generation failed: " + err.Error()
+			s.appendLog("setup-pi: " + keyErr)
+		} else {
+			pubKey = pub
+		}
 	}
 
 	// exec the script directly (rootfs installs it 0755); the password
@@ -209,7 +275,7 @@ func (s *SetupPiService) run(req SetupPiRequest, jobId string) {
 		"SSH_HOST="+req.Ip,
 		"SSH_USER="+req.User,
 		"SSH_PASS="+req.Password,
-		"MIRA_SSH_KEY_PATH="+KeyPath(),
+		"MIRA_SSH_KEY_PATH="+keyPath,
 	)
 	if pubKey != "" {
 		cmd.Env = append(cmd.Env, "MIRA_SSH_PUBKEY="+pubKey)
@@ -235,14 +301,15 @@ func (s *SetupPiService) run(req SetupPiRequest, jobId string) {
 	// the wizard prints RESULT model="..." tier="..." on the success path
 	model, tier := parseSetupPiResult(s.snapshotLogLines())
 
-	// epic 10 ticket10-3: the finished run IS the successful password login
-	// - install the device key on the Pi now, in the same authenticated
-	// flow (key-first: already works on re-runs; sshpass fallback on the
-	// first run where the key is not installed yet). A key failure must not
-	// turn the successful provisioning into a failure (no half state): it
-	// is surfaced as key_error and password login keeps working. If the
-	// run itself failed, key_error stays empty - the run error carries the
-	// reason, key_installed simply stays false.
+	// epic 10 ticket10-3 + ticket10-5: the finished run IS the successful
+	// password login - install the PROFILE'S key on the Pi now (the key
+	// pair of the job's profile, not a global one), in the same
+	// authenticated flow (key-first: already works on re-runs; sshpass
+	// fallback on the first run where the key is not installed yet). A key
+	// failure must not turn the successful provisioning into a failure (no
+	// half state): it is surfaced as key_error and password login keeps
+	// working. If the run itself failed, key_error stays empty - the run
+	// error carries the reason, key_installed simply stays false.
 	keyInstalled := false
 	if errMsg == "" && pubKey != "" {
 		script, err := installKeyCommand(pubKey)
@@ -253,7 +320,7 @@ func (s *SetupPiService) run(req SetupPiRequest, jobId string) {
 			// a fresh context: the install is one ssh round-trip, not part
 			// of the 30-minute wizard budget
 			ictx, icancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			usedKey, out, instErr := RunKeyFirst(ictx, req.Ip, req.User, req.Password, script)
+			usedKey, out, instErr := RunKeyFirstWithKey(ictx, keyPath, req.Ip, req.User, req.Password, script)
 			icancel()
 			for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
 				if line != "" {
@@ -269,7 +336,7 @@ func (s *SetupPiService) run(req SetupPiRequest, jobId string) {
 				if usedKey {
 					mode = "ssh key"
 				}
-				s.log.Infof("setup-pi: ssh key installed on %s (via %s)", req.Ip, mode)
+				s.log.Infof("setup-pi: ssh key installed on %s (profile %s, via %s)", req.Ip, profileID, mode)
 			}
 		}
 	}
@@ -322,8 +389,8 @@ func (s *SetupPiService) snapshotLogLines() []string {
 // SetupPiStatus returns the current job state. Times are UTC RFC3339.
 func (s *SetupPiService) SetupPiStatus() SetupPiStatus {
 	s.mu.Lock()
-	st := SetupPiStatus{State: s.state, JobId: s.jobId, Model: s.model, Tier: s.tier, Error: s.errMsg,
-		KeyInstalled: s.keyInstalled, KeyError: s.keyError}
+	st := SetupPiStatus{State: s.state, JobId: s.jobId, ProfileId: s.profileID, Model: s.model, Tier: s.tier,
+		Error: s.errMsg, KeyInstalled: s.keyInstalled, KeyError: s.keyError}
 	if !s.started.IsZero() {
 		st.StartedAt = s.started.UTC().Format(time.RFC3339)
 	}

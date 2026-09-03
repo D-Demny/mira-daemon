@@ -79,6 +79,23 @@ case "$cmd" in
         fi
         exit 0
         ;;
+    *"MIRA_KEY_REMOVE"*)
+        f="${FAKE_PI_AUTHKEYS:-/nonexistent-fake-authkeys}"
+        [ -f "$f" ] || exit 0
+        line=$(printf '%s\n' "$cmd" | sed -n 's/^LINE="\([^"]*\)"[[:space:]]*$/\1/p')
+        if [ -n "$line" ] && grep -qxF "$line" "$f"; then
+            grep -vxF "$line" "$f" > "$f.mira-del"
+            rc=$?
+            # same grep exit-1 nuance as the real script (file held only
+            # the line being removed = success)
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then exit 1; fi
+            mv "$f.mira-del" "$f"
+            echo "mira-key: removed"
+        else
+            echo "mira-key: not present"
+        fi
+        exit 0
+        ;;
     *)
         exit 0
         ;;
