@@ -192,6 +192,15 @@ func New(opts *Options) (*App, error) {
 	// /api/pi/profile (DELETE) Pi profile deletion (epic 10 ticket10-5)
 	app.server.SetPiProfileHandler(NewPiProfileService(app.log))
 
+	// /api/pi/tethering* USB-tethering setup for the (active) Pi profile
+	// (epic 10 ticket10-6): key-first by contract - the provisioning wizard
+	// must have installed the device key pair first (a missing key is a
+	// synchronous 409), the target profile resolves from the UI settings blob
+	// (ticket10-5) when the request carries no explicit profile_id.
+	app.server.SetTetheringHandler(NewTetheringService(app.log, TetheringConfig{
+		LoadSettings: app.piSettingsBlob,
+	}))
+
 	// /api/pi/status Pi session auto-reconnect (epic 10 ticket10-4): the
 	// manager starts with the daemon (key-based, never prompts for a
 	// password) and is stopped in Close. It is bound to the ACTIVE profile

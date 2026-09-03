@@ -79,6 +79,9 @@ type ApiServer interface {
 	// DELETE /api/pi/profile uses this (epic 10 ticket10-5), nil = 503
 	SetPiProfileHandler(h PiProfileHandler)
 
+	// /api/pi/tethering* uses this (epic 10 ticket10-6), nil = 503
+	SetTetheringHandler(h TetheringHandler)
+
 	Submit(ctx context.Context, t ApiRequestType, data any) (any, error)
 }
 
@@ -195,6 +198,9 @@ type ConcreteApiServer struct {
 
 	piProfileMu sync.RWMutex
 	piProfileFn PiProfileHandler
+
+	tethMu sync.RWMutex
+	tethFn TetheringHandler
 }
 
 var (
@@ -607,6 +613,8 @@ func (s *StubApiServer) SetPiSessionHandler(_ PiSessionHandler) {}
 
 func (s *StubApiServer) SetPiProfileHandler(_ PiProfileHandler) {}
 
+func (s *StubApiServer) SetTetheringHandler(_ TetheringHandler) {}
+
 func (s *ConcreteApiServer) SetAuthHandler(fn AuthStatusFunc) {
 	s.authMu.Lock()
 	s.authFn = fn
@@ -761,6 +769,18 @@ func (s *ConcreteApiServer) getPiProfileHandler() PiProfileHandler {
 	s.piProfileMu.RLock()
 	defer s.piProfileMu.RUnlock()
 	return s.piProfileFn
+}
+
+func (s *ConcreteApiServer) SetTetheringHandler(h TetheringHandler) {
+	s.tethMu.Lock()
+	s.tethFn = h
+	s.tethMu.Unlock()
+}
+
+func (s *ConcreteApiServer) getTetheringHandler() TetheringHandler {
+	s.tethMu.RLock()
+	defer s.tethMu.RUnlock()
+	return s.tethFn
 }
 
 // The browser cannot reach Home Assistant cross-origin (HA only answers
@@ -1024,6 +1044,52 @@ func (s *ConcreteApiServer) serve() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(res)
+	})
+	// epic 10 ticket10-6: USB-tethering setup for the (active) Pi profile.
+	// The onboarding wizard triggers the run; the daemon execs the packaged
+	// setup-tethering.sh key-first (password from the stored profile only as
+	// run_ssh fallback, never logged). Cross-service handler like /api/setup-pi:
+	// no player session needed. 409 = no device key yet (wizard first) or a run
+	// already in progress; 400 = unknown/unsafe/empty profile.
+	m.HandleFunc("POST /api/pi/tethering", func(w http.ResponseWriter, r *http.Request) {
+		var req TetheringRequest
+		if err := jsonDecode(r, &req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json body"})
+			return
+		}
+		h := s.getTetheringHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		jobId, err := h.StartTethering(req)
+		if err != nil {
+			code := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, ErrTetheringProfile):
+				code = http.StatusBadRequest
+			case errors.Is(err, ErrTetheringNoKey), errors.Is(err, ErrTetheringBusy):
+				code = http.StatusConflict
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{"job_id": jobId})
+	})
+	m.HandleFunc("GET /api/pi/tethering/status", func(w http.ResponseWriter, r *http.Request) {
+		h := s.getTetheringHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(h.TetheringStatus())
 	})
 	m.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
