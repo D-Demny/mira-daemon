@@ -76,6 +76,9 @@ type ApiServer interface {
 	// /api/pi/status uses this (epic 10 ticket10-4), nil = 503
 	SetPiSessionHandler(h PiSessionHandler)
 
+	// DELETE /api/pi/profile uses this (epic 10 ticket10-5), nil = 503
+	SetPiProfileHandler(h PiProfileHandler)
+
 	Submit(ctx context.Context, t ApiRequestType, data any) (any, error)
 }
 
@@ -189,6 +192,9 @@ type ConcreteApiServer struct {
 
 	piMu sync.RWMutex
 	piFn PiSessionHandler
+
+	piProfileMu sync.RWMutex
+	piProfileFn PiProfileHandler
 }
 
 var (
@@ -599,6 +605,8 @@ func (s *StubApiServer) SetSetupPiHandler(_ SetupPiHandler) {}
 
 func (s *StubApiServer) SetPiSessionHandler(_ PiSessionHandler) {}
 
+func (s *StubApiServer) SetPiProfileHandler(_ PiProfileHandler) {}
+
 func (s *ConcreteApiServer) SetAuthHandler(fn AuthStatusFunc) {
 	s.authMu.Lock()
 	s.authFn = fn
@@ -741,6 +749,18 @@ func (s *ConcreteApiServer) getPiSessionHandler() PiSessionHandler {
 	s.piMu.RLock()
 	defer s.piMu.RUnlock()
 	return s.piFn
+}
+
+func (s *ConcreteApiServer) SetPiProfileHandler(h PiProfileHandler) {
+	s.piProfileMu.Lock()
+	s.piProfileFn = h
+	s.piProfileMu.Unlock()
+}
+
+func (s *ConcreteApiServer) getPiProfileHandler() PiProfileHandler {
+	s.piProfileMu.RLock()
+	defer s.piProfileMu.RUnlock()
+	return s.piProfileFn
 }
 
 // The browser cannot reach Home Assistant cross-origin (HA only answers
@@ -968,6 +988,42 @@ func (s *ConcreteApiServer) serve() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(h.PiStatus())
+	})
+	// epic 10 ticket10-5: Pi profile deletion. The profile id is a required
+	// query parameter; an optional JSON body {ip,user,password} enables the
+	// best-effort Pi-side authorized_keys cleanup. The settings blob itself
+	// is NOT touched by the daemon - the UI removes the profile from the
+	// store (and updates activePiId). A session bound to the deleted profile
+	// reacts through the normal config re-read.
+	m.HandleFunc("DELETE /api/pi/profile", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "missing 'id' query parameter"})
+			return
+		}
+		var req PiProfileDeleteRequest
+		if err := jsonDecode(r, &req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json body"})
+			return
+		}
+		h := s.getPiProfileHandler()
+		if h == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		res, err := h.DeletePiProfile(id, req)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(res)
 	})
 	m.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {

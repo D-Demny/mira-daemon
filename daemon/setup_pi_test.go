@@ -468,3 +468,127 @@ printf 'RESULT model="Fake Pi 4" tier="compute"\n'
 		t.Errorf("authorized_keys line = %q, want %q", lines[0], fakePublicKey)
 	}
 }
+
+// epic 10 ticket10-5: the wizard works PER PROFILE - explicit profile_id,
+// the active blob profile as default, the implicit legacy profile for old
+// blobs, and a synchronous 400 for unsafe ids.
+
+// no t.Parallel(): the run execs ssh-keygen/ssh/sshpass (t.Setenv fakes)
+func TestSetupPi_PerProfileKeyWithExplicitId(t *testing.T) {
+	fakeSSHBinDir(t)
+	_, _ = fakeKeyEnv(t)
+	fakeKeyOK(t, false)
+
+	script := writeFakeScript(t, `#!/bin/sh
+printf 'RESULT model="Fake Pi 4" tier="compute"\n'
+`)
+	srv, base := newTestApiServer(t)
+	srv.SetSetupPiHandler(NewSetupPiService(&librespot.NullLogger{}, SetupPiConfig{ScriptPath: script}))
+
+	status, _ := postSetupPi(t, base, `{"ip":"192.168.7.1","user":"u","password":"p","profile_id":"pi-2"}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want 202", status)
+	}
+	st := waitForSetupPiState(t, base, setupPiStateSuccess)
+	if st.ProfileId != "pi-2" {
+		t.Errorf("status profile_id = %q, want pi-2", st.ProfileId)
+	}
+	if !st.KeyInstalled {
+		t.Errorf("key_installed = false, want true")
+	}
+	p2, err := KeyPathForProfile("pi-2")
+	if err != nil {
+		t.Fatalf("KeyPathForProfile(pi-2): %v", err)
+	}
+	if _, err := os.Stat(p2); err != nil {
+		t.Errorf("device key for pi-2 missing: %v", err)
+	}
+	// the legacy pair must NOT be created by a pi-2 run
+	if _, err := os.Stat(KeyPath()); !os.IsNotExist(err) {
+		t.Errorf("legacy key pair created although the job ran on pi-2")
+	}
+}
+
+// no t.Parallel(): the run execs ssh-keygen (t.Setenv fakes)
+func TestSetupPi_DefaultProfileFromSettingsBlob(t *testing.T) {
+	fakeSSHBinDir(t)
+	_, _ = fakeKeyEnv(t)
+	fakeKeyOK(t, false)
+
+	blob := `{"v":2,"piProfiles":[{"id":"pi-1","label":"first","ip":"192.168.7.1","user":"u1"},{"id":"pi-3","label":"third","ip":"192.168.7.3","user":"u3"}],"activePiId":"pi-3"}`
+	script := writeFakeScript(t, `#!/bin/sh
+printf 'RESULT model="Fake Pi 4" tier="compute"\n'
+`)
+	srv, base := newTestApiServer(t)
+	srv.SetSetupPiHandler(NewSetupPiService(&librespot.NullLogger{}, SetupPiConfig{
+		ScriptPath:   script,
+		LoadSettings: func() []byte { return []byte(blob) },
+	}))
+
+	status, _ := postSetupPi(t, base, `{"ip":"192.168.7.3","user":"u3","password":"p"}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want 202", status)
+	}
+	st := waitForSetupPiState(t, base, setupPiStateSuccess)
+	if st.ProfileId != "pi-3" {
+		t.Errorf("status profile_id = %q, want the active blob profile pi-3", st.ProfileId)
+	}
+	if !st.KeyInstalled {
+		t.Errorf("key_installed = false, want true")
+	}
+	p3, err := KeyPathForProfile("pi-3")
+	if err != nil {
+		t.Fatalf("KeyPathForProfile(pi-3): %v", err)
+	}
+	if _, err := os.Stat(p3); err != nil {
+		t.Errorf("device key for pi-3 missing: %v", err)
+	}
+}
+
+// no t.Parallel(): the run execs ssh-keygen (t.Setenv fakes)
+func TestSetupPi_LegacyBlobUsesLegacyProfile(t *testing.T) {
+	fakeSSHBinDir(t)
+	keyPath, _ := fakeKeyEnv(t)
+	fakeKeyOK(t, false)
+
+	blob := `{"piServer":{"ip":"192.168.7.9","user":"legacyuser","password":"x"}}`
+	script := writeFakeScript(t, `#!/bin/sh
+printf 'RESULT model="Fake Pi 4" tier="compute"\n'
+`)
+	srv, base := newTestApiServer(t)
+	srv.SetSetupPiHandler(NewSetupPiService(&librespot.NullLogger{}, SetupPiConfig{
+		ScriptPath:   script,
+		LoadSettings: func() []byte { return []byte(blob) },
+	}))
+
+	status, _ := postSetupPi(t, base, `{"ip":"192.168.7.9","user":"legacyuser","password":"p"}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want 202", status)
+	}
+	st := waitForSetupPiState(t, base, setupPiStateSuccess)
+	if st.ProfileId != legacyPiProfileID {
+		t.Errorf("status profile_id = %q, want the implicit legacy profile", st.ProfileId)
+	}
+	if !st.KeyInstalled {
+		t.Errorf("key_installed = false, want true")
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Errorf("legacy device key missing: %v", err)
+	}
+}
+
+// an unsafe explicit profile_id is a synchronous 400 (validated before the
+// job starts, so it is never an in-job failure)
+func TestSetupPi_InvalidProfileIdIs400(t *testing.T) {
+	t.Parallel()
+	srv, base := newTestApiServer(t)
+	srv.SetSetupPiHandler(NewSetupPiService(&librespot.NullLogger{}, SetupPiConfig{ScriptPath: writeFakeScript(t, "#!/bin/sh\nexit 0\n")}))
+
+	status, out := postSetupPi(t, base, `{"ip":"192.168.7.1","user":"u","password":"p","profile_id":"../escape"}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("POST status = %d, want 400 (error: %s)", status, out["error"])
+	}
+	if out["error"] == "" {
+		t.Errorf("expected an error message in the body")
+	}
+}

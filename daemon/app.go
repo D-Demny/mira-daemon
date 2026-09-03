@@ -181,15 +181,24 @@ func New(opts *Options) (*App, error) {
 	// /ha-api/* CORS proxy for the Home Assistant REST API (epic 9)
 	app.server.SetHomeAssistantConfig(app.cfg.HomeAssistant)
 
-	// /api/setup-pi* Pi provisioning wizard (epic 10)
-	setupPi := NewSetupPiService(app.log, app.cfg.SetupPi)
+	// /api/setup-pi* Pi provisioning wizard (epic 10); the target profile
+	// resolves from the UI settings blob (ticket10-5) when the request
+	// carries no explicit profile_id.
+	setupPiCfg := app.cfg.SetupPi
+	setupPiCfg.LoadSettings = app.piSettingsBlob
+	setupPi := NewSetupPiService(app.log, setupPiCfg)
 	app.server.SetSetupPiHandler(setupPi)
+
+	// /api/pi/profile (DELETE) Pi profile deletion (epic 10 ticket10-5)
+	app.server.SetPiProfileHandler(NewPiProfileService(app.log))
 
 	// /api/pi/status Pi session auto-reconnect (epic 10 ticket10-4): the
 	// manager starts with the daemon (key-based, never prompts for a
-	// password) and is stopped in Close.
+	// password) and is stopped in Close. It is bound to the ACTIVE profile
+	// of the UI settings blob (ticket10-5).
 	app.piSession = NewPiSession(app.log, PiSessionConfig{
-		LoadConfig: app.loadPiServerConfig,
+		LoadConfig:   app.loadPiProfileTarget,
+		LoadProfiles: app.loadPiProfiles,
 		ModelTier: func() (string, string) {
 			st := setupPi.SetupPiStatus()
 			return st.Model, st.Tier
@@ -425,35 +434,42 @@ func (app *App) PutSettings(body []byte) error {
 	return app.persistState()
 }
 
-// loadPiServerConfig reads the stored Pi target (ip/user) from the UI
-// settings blob - the same JSON the frontend persists via /settings
-// (piServer: {ip, user, password}). The password is deliberately NOT read:
-// the auto-reconnect session is key-only (ticket10-4 must never re-prompt
-// for a password). The daemon config (config.yml) is build-time static and
-// is not the source for the user-chosen Pi target.
-func (app *App) loadPiServerConfig() (string, string, bool) {
+// piSettingsBlob returns a copy of the UI settings blob under the state
+// lock - the same JSON the frontend persists via /settings (ticket10-5
+// profile model: piProfiles[] + activePiId; the legacy piServer shape is
+// handled by the readers below).
+func (app *App) piSettingsBlob() []byte {
 	app.state.Lock()
 	blob := make([]byte, len(app.state.Settings))
 	copy(blob, app.state.Settings)
 	app.state.Unlock()
-	if len(blob) == 0 {
-		return "", "", false
+	return blob
+}
+
+// loadPiProfileTarget reads the stored ACTIVE Pi profile (id, ip, user)
+// from the UI settings blob - the same JSON the frontend persists via
+// /settings (piProfiles/activePiId, ticket10-5; the legacy piServer shape
+// resolves to the implicit "legacy" profile). The password is deliberately
+// NOT read: the auto-reconnect session is key-only (ticket10-4 must never
+// re-prompt for a password). The daemon config (config.yml) is build-time
+// static and is not the source for the user-chosen Pi target.
+func (app *App) loadPiProfileTarget() (string, string, string, bool) {
+	p := ResolveActiveProfile(app.piSettingsBlob())
+	if p == nil {
+		return "", "", "", false
 	}
-	var s struct {
-		PiServer struct {
-			Ip   string `json:"ip"`
-			User string `json:"user"`
-		} `json:"piServer"`
-	}
-	if err := json.Unmarshal(blob, &s); err != nil {
-		return "", "", false
-	}
-	ip := strings.TrimSpace(s.PiServer.Ip)
-	user := strings.TrimSpace(s.PiServer.User)
+	ip := strings.TrimSpace(p.Ip)
+	user := strings.TrimSpace(p.User)
 	if ip == "" || user == "" {
-		return "", "", false
+		return "", "", "", false
 	}
-	return ip, user, true
+	return p.ID, ip, user, true
+}
+
+// loadPiProfiles returns all stored Pi profiles (ticket10-5): the session
+// reports their per-profile key existence in /api/pi/status.
+func (app *App) loadPiProfiles() []PiProfile {
+	return ParsePiProfiles(app.piSettingsBlob())
 }
 
 // reads the "voiceMic" preference from the UI settings

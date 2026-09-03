@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -112,7 +113,7 @@ func TestPiSession_BootAutoReconnect(t *testing.T) {
 	writeFakeKey(t, keyPath)
 
 	sess := NewPiSession(&librespot.NullLogger{}, PiSessionConfig{
-		LoadConfig: func() (string, string, bool) { return "192.168.7.1", "piuser", true },
+		LoadConfig: func() (string, string, string, bool) { return "legacy", "192.168.7.1", "piuser", true },
 		ModelTier:  func() (string, string) { return "Fake Pi 4", "compute" },
 	})
 	sess.Start()
@@ -140,7 +141,7 @@ func TestPiSession_FixedTenSecondRetryRhythm(t *testing.T) {
 	var nowOffset time.Duration
 	var cur *fakeTicker
 	sess := NewPiSession(&librespot.NullLogger{}, PiSessionConfig{
-		LoadConfig: func() (string, string, bool) { return "192.168.7.1", "piuser", true },
+		LoadConfig: func() (string, string, string, bool) { return "legacy", "192.168.7.1", "piuser", true },
 		Now:        func() time.Time { return t0.Add(nowOffset) },
 		NewTicker: func(d time.Duration) tickerLike {
 			if d != piSessionRetryInterval {
@@ -193,7 +194,7 @@ func TestPiSession_NoStackingWhileAttemptInFlight(t *testing.T) {
 
 	var cur *fakeTicker
 	sess := NewPiSession(&librespot.NullLogger{}, PiSessionConfig{
-		LoadConfig: func() (string, string, bool) { return "192.168.7.1", "piuser", true },
+		LoadConfig: func() (string, string, string, bool) { return "legacy", "192.168.7.1", "piuser", true },
 		NewTicker:  func(d time.Duration) tickerLike { ft := &fakeTicker{ch: make(chan time.Time, 1)}; cur = ft; return ft },
 	})
 	sess.Start()
@@ -236,7 +237,7 @@ func TestPiSession_24hOutageStaysStable(t *testing.T) {
 	// all ticks without pacing the loop tick by tick.
 	const ticks24h = 24 * 60 * 6
 	sess := NewPiSession(&librespot.NullLogger{}, PiSessionConfig{
-		LoadConfig: func() (string, string, bool) { return "192.168.7.1", "piuser", true },
+		LoadConfig: func() (string, string, string, bool) { return "legacy", "192.168.7.1", "piuser", true },
 		Now:        func() time.Time { return t0.Add(nowOffset) },
 		NewTicker: func(d time.Duration) tickerLike {
 			ft := &fakeTicker{ch: make(chan time.Time, ticks24h+1)}
@@ -245,6 +246,9 @@ func TestPiSession_24hOutageStaysStable(t *testing.T) {
 		},
 	})
 	sess.Start()
+	// cleanup must run even on t.Fatalf (the explicit Stop below is a
+	// no-op in that case)
+	defer sess.Stop()
 	// the boot attempt (t=0) also guarantees the ticker is already created
 	waitForAttempts(t, sess, 1, 5*time.Second)
 
@@ -270,6 +274,16 @@ func TestPiSession_24hOutageStaysStable(t *testing.T) {
 	}
 	if got := sess.logLineCount(); got != piSessionLogCap {
 		t.Fatalf("log ring = %d lines, want exactly %d (bounded, full after 8641 appends)", got, piSessionLogCap)
+	}
+	// the last attempt may still be in flight when the counter hits its
+	// final value (state "connecting"): wait for it to finish (the Pi never
+	// comes back, so the settled state is disconnected)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if st := sess.PiStatus(); st.Conn == piConnDisconnected {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if st := sess.PiStatus(); st.Conn != piConnDisconnected {
 		t.Fatalf("conn = %q, want disconnected", st.Conn)
@@ -300,7 +314,7 @@ func TestPiSession_PiReturnsWithoutRestart(t *testing.T) {
 	piUp := fakePiUpFile(t)
 
 	sess := NewPiSession(&librespot.NullLogger{}, PiSessionConfig{
-		LoadConfig:    func() (string, string, bool) { return "192.168.7.1", "piuser", true },
+		LoadConfig:    func() (string, string, string, bool) { return "legacy", "192.168.7.1", "piuser", true },
 		RetryInterval: 100 * time.Millisecond, // real ticker, short rhythm
 	})
 	sess.Start()
@@ -342,7 +356,7 @@ func TestPiSession_NoKeyNoAttempts(t *testing.T) {
 	t.Setenv("FAKE_SSH_MARK", mark)
 
 	sess := NewPiSession(&librespot.NullLogger{}, PiSessionConfig{
-		LoadConfig:    func() (string, string, bool) { return "192.168.7.1", "piuser", true },
+		LoadConfig:    func() (string, string, string, bool) { return "legacy", "192.168.7.1", "piuser", true },
 		RetryInterval: 50 * time.Millisecond,
 	})
 	sess.Start()
@@ -387,9 +401,13 @@ func TestPiSession_StopCleansUp(t *testing.T) {
 	before := runtime.NumGoroutine()
 
 	sess := NewPiSession(&librespot.NullLogger{}, PiSessionConfig{
-		LoadConfig: func() (string, string, bool) { return "192.168.7.1", "piuser", true },
+		LoadConfig: func() (string, string, string, bool) { return "legacy", "192.168.7.1", "piuser", true },
 	})
 	sess.Start()
+	// a no-op if the explicit Stop below already ran; guarantees cleanup if
+	// an assertion fails first (a leaked loop goroutine would poison the
+	// global goroutine-count of later tests)
+	defer sess.Stop()
 	waitForPiConn(t, sess, piConnConnected, 15*time.Second)
 
 	sess.Stop()
@@ -422,7 +440,7 @@ func TestPiStatus_NoHandlerIs503(t *testing.T) {
 func TestPiStatus_EndpointShape(t *testing.T) {
 	srv, base := newTestApiServer(t)
 	sess := NewPiSession(&librespot.NullLogger{}, PiSessionConfig{
-		LoadConfig: func() (string, string, bool) { return "", "", false },
+		LoadConfig: func() (string, string, string, bool) { return "", "", "", false },
 		ModelTier:  func() (string, string) { return "Fake Pi 4", "compute" },
 	})
 	srv.SetPiSessionHandler(sess)
@@ -451,5 +469,123 @@ func TestPiStatus_EndpointShape(t *testing.T) {
 	}
 	if body["model"] != "Fake Pi 4" || body["tier"] != "compute" {
 		t.Errorf("model/tier = %v/%v, want the last known-good state", body["model"], body["tier"])
+	}
+}
+
+// (f) ticket10-5: the session is bound to the ACTIVE profile; the status
+// reports profile_id and the PER-PROFILE key existence (profiles[].
+// key_installed) instead of a global key flag. The other stored profiles
+// have no live session state, only their key existence.
+func TestPiSession_BindsToActiveProfileStatus(t *testing.T) {
+	fakeSSHBinDir(t)
+	_, _ = fakeKeyEnv(t)
+	p1, err := KeyPathForProfile("pi-1")
+	if err != nil {
+		t.Fatalf("KeyPathForProfile(pi-1): %v", err)
+	}
+	writeFakeKey(t, p1) // only pi-1 has a device key
+	fakeKeyOK(t, true)
+	if err := os.WriteFile(fakePiUpFile(t), []byte("up\n"), 0o644); err != nil {
+		t.Fatalf("creating fake Pi-up file: %v", err)
+	}
+
+	sess := NewPiSession(&librespot.NullLogger{}, PiSessionConfig{
+		LoadConfig: func() (string, string, string, bool) { return "pi-1", "192.168.7.1", "piuser", true },
+		LoadProfiles: func() []PiProfile {
+			return []PiProfile{
+				{ID: "pi-1", Ip: "192.168.7.1", User: "piuser"},
+				{ID: "pi-2", Ip: "192.168.7.2", User: "piuser2"},
+			}
+		},
+		ModelTier: func() (string, string) { return "Fake Pi 4", "compute" },
+	})
+	sess.Start()
+	defer sess.Stop()
+
+	st := waitForPiConn(t, sess, piConnConnected, 15*time.Second)
+	if st.ProfileId != "pi-1" {
+		t.Errorf("profile_id = %q, want the active profile pi-1", st.ProfileId)
+	}
+	if st.Model != "Fake Pi 4" || st.Tier != "compute" {
+		t.Errorf("model/tier = %q/%q, want the last known-good state", st.Model, st.Tier)
+	}
+	if len(st.Profiles) != 2 {
+		t.Fatalf("profiles = %d entries, want 2: %+v", len(st.Profiles), st.Profiles)
+	}
+	if st.Profiles[0].ID != "pi-1" || !st.Profiles[0].KeyInstalled {
+		t.Errorf("profiles[0] = %+v, want pi-1 with key_installed=true", st.Profiles[0])
+	}
+	if st.Profiles[1].ID != "pi-2" || st.Profiles[1].KeyInstalled {
+		t.Errorf("profiles[1] = %+v, want pi-2 with key_installed=false", st.Profiles[1])
+	}
+}
+
+// (g) ticket10-5: a profile switch while connected kills the running
+// session and reconnects IMMEDIATELY to the new active profile (no extra
+// 10 s wait). The UI changes activePiId in the settings blob; the session
+// picks it up on the next grid tick through the config re-read.
+func TestPiSession_ProfileSwitchReconnectsImmediately(t *testing.T) {
+	fakeSSHBinDir(t)
+	_, _ = fakeKeyEnv(t)
+	p1, err1 := KeyPathForProfile("pi-1")
+	p2, err2 := KeyPathForProfile("pi-2")
+	if err1 != nil || err2 != nil {
+		t.Fatalf("KeyPathForProfile: %v / %v", err1, err2)
+	}
+	writeFakeKey(t, p1)
+	writeFakeKey(t, p2)
+	fakeKeyOK(t, true)
+	if err := os.WriteFile(fakePiUpFile(t), []byte("up\n"), 0o644); err != nil {
+		t.Fatalf("creating fake Pi-up file: %v", err)
+	}
+
+	var mu sync.Mutex
+	activeID := "pi-1"
+	sess := NewPiSession(&librespot.NullLogger{}, PiSessionConfig{
+		LoadConfig: func() (string, string, string, bool) {
+			mu.Lock()
+			id := activeID
+			mu.Unlock()
+			ip := "192.168.7.1"
+			if id == "pi-2" {
+				ip = "192.168.7.2"
+			}
+			return id, ip, "piuser", true
+		},
+		LoadProfiles: func() []PiProfile {
+			return []PiProfile{
+				{ID: "pi-1", Ip: "192.168.7.1", User: "piuser"},
+				{ID: "pi-2", Ip: "192.168.7.2", User: "piuser"},
+			}
+		},
+		RetryInterval: 20 * time.Millisecond,
+	})
+	sess.Start()
+	defer sess.Stop()
+
+	st := waitForPiConn(t, sess, piConnConnected, 15*time.Second)
+	if st.ProfileId != "pi-1" {
+		t.Fatalf("profile_id = %q, want pi-1", st.ProfileId)
+	}
+	time.Sleep(50 * time.Millisecond) // let the loop settle into watchSession
+
+	// the UI switches the active profile
+	mu.Lock()
+	activeID = "pi-2"
+	mu.Unlock()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if st := sess.PiStatus(); st.ProfileId == "pi-2" && st.Conn == piConnConnected {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	st = sess.PiStatus()
+	if st.ProfileId != "pi-2" {
+		t.Fatalf("profile_id = %q, want pi-2 after the switch", st.ProfileId)
+	}
+	if st.Conn != piConnConnected {
+		t.Fatalf("conn = %q, want connected after the switch", st.Conn)
 	}
 }

@@ -11,18 +11,21 @@ import (
 	"time"
 )
 
-// epic 10 ticket10-3: after the first successful password login the daemon
-// installs its own SSH key on the Pi so every later SSH operation can run
-// key-first (no password round-trip). The key pair lives on the device side
-// at a fixed path (the firmware build creates the directory 0700):
+// epic 10 ticket10-3 + ticket10-5: after the first successful password
+// login the daemon installs its own SSH key on the Pi so every later SSH
+// operation can run key-first (no password round-trip). The key pairs live
+// on the device side in a fixed directory (the firmware build creates it
+// 0700), one pair per Pi profile (ticket10-5):
 //
-//	/etc/mira/ssh/id_ed25519        private key (0600)
-//	/etc/mira/ssh/id_ed25519.pub    public key (0644)
+//	/etc/mira/ssh/id_ed25519            legacy profile (ticket10-3): blobs
+//	                                     with the old flat piServer shape
+//	/etc/mira/ssh/<profileId>_ed25519   every other profile (ticket10-5)
 //
-// Generation is lazy (first use) and idempotent; installation onto the Pi
+// plus the matching .pub files (private 0600, public 0644). Generation is
+// lazy (first use) and idempotent per profile; installation onto the Pi
 // happens right after a successful password-authenticated provisioning run
 // (see SetupPiService.run) and is idempotent as well (grep -qxF before the
-// append). ticket10-4 (auto-reconnect) reuses RunKeyFirst.
+// append). ticket10-4 (auto-reconnect) reuses the key-first path.
 
 // defaultSshKeyPath is where the daemon keeps its device-side key pair.
 const defaultSshKeyPath = "/etc/mira/ssh/id_ed25519"
@@ -38,8 +41,8 @@ const sshKeyGenTimeout = 10 * time.Second
 // and the password attempt.
 const sshConnectTimeout = 10
 
-// KeyPath resolves the device-side key location: env override (tests) wins
-// over the default rootfs location.
+// KeyPath resolves the device-side key location of the LEGACY profile: env
+// override (tests) wins over the default rootfs location.
 func KeyPath() string {
 	if p := os.Getenv(sshKeyPathEnv); p != "" {
 		return p
@@ -47,13 +50,45 @@ func KeyPath() string {
 	return defaultSshKeyPath
 }
 
-// EnsureKey lazily generates the ed25519 key pair. It is a no-op when both
-// the private key and its .pub already exist, so restarts and re-runs never
-// rewrite a working pair. A half pair is repaired: a missing .pub is
-// derived from the private key, a missing private key (with or without a
-// stale .pub) is regenerated from scratch.
+// KeyPathForProfile returns the device-side private key path for a profile
+// (ticket10-5): the legacy profile keeps the original id_ed25519 (reused
+// without re-generation), every other profile gets <profileId>_ed25519 in
+// the same directory. The env override (tests) relocates the whole set,
+// anchored at the legacy path. An unsafe profile id is an error (see
+// sanitizeProfileID).
+func KeyPathForProfile(profileID string) (string, error) {
+	id, err := sanitizeProfileID(profileID)
+	if err != nil {
+		return "", err
+	}
+	if id == legacyPiProfileID {
+		return KeyPath(), nil
+	}
+	return filepath.Join(filepath.Dir(KeyPath()), id+"_ed25519"), nil
+}
+
+// EnsureKey lazily generates the ed25519 key pair of the LEGACY profile
+// (ticket10-3, the original id_ed25519 path).
 func EnsureKey(ctx context.Context) error {
-	path := KeyPath()
+	return ensureKeyAt(ctx, KeyPath())
+}
+
+// EnsureKeyForProfile is EnsureKey for one profile (ticket10-5): the key
+// pair lives at KeyPathForProfile(profileID).
+func EnsureKeyForProfile(ctx context.Context, profileID string) error {
+	path, err := KeyPathForProfile(profileID)
+	if err != nil {
+		return err
+	}
+	return ensureKeyAt(ctx, path)
+}
+
+// ensureKeyAt lazily generates the ed25519 key pair at path. It is a no-op
+// when both the private key and its .pub already exist, so restarts and
+// re-runs never rewrite a working pair. A half pair is repaired: a missing
+// .pub is derived from the private key, a missing private key (with or
+// without a stale .pub) is regenerated from scratch.
+func ensureKeyAt(ctx context.Context, path string) error {
 	_, privErr := os.Stat(path)
 	_, pubErr := os.Stat(path + ".pub")
 	switch {
@@ -168,15 +203,16 @@ func runSshPass(ctx context.Context, host, user, password, command string) (stri
 	return string(out), err
 }
 
-// RunKeyFirst runs one command on the Pi, key-auth first, password
-// fallback. It returns which authentication served the successful run.
+// RunKeyFirstWithKey runs one command on the Pi, key-auth first (with the
+// given device key), password fallback. It returns which authentication
+// served the successful run.
 //
 // Only a connection/authentication failure of the key attempt (ssh exit
 // 255) may fall back to the password: any other non-zero exit code is the
 // remote command's own result (it already ran) and is returned as-is - a
 // password retry would double-execute it.
-func RunKeyFirst(ctx context.Context, host, user, password, command string) (usedKey bool, output string, err error) {
-	out, keyErr := runSshKey(ctx, host, user, command)
+func RunKeyFirstWithKey(ctx context.Context, keyPath, host, user, password, command string) (usedKey bool, output string, err error) {
+	out, keyErr := runSshKeyWith(ctx, keyPath, host, user, command)
 	if keyErr == nil {
 		return true, out, nil
 	}
@@ -190,6 +226,13 @@ func RunKeyFirst(ctx context.Context, host, user, password, command string) (use
 		return false, passOut, nil
 	}
 	return false, passOut, fmt.Errorf("ssh to %s@%s failed: key: %v; password: %v", user, host, keyErr, passErr)
+}
+
+// RunKeyFirst is RunKeyFirstWithKey with the LEGACY profile key (the
+// ticket10-3 default; the ticket10-4 session uses the per-profile key via
+// runSshKeyWith directly).
+func RunKeyFirst(ctx context.Context, host, user, password, command string) (usedKey bool, output string, err error) {
+	return RunKeyFirstWithKey(ctx, KeyPath(), host, user, password, command)
 }
 
 // installKeyScript is the remote program that puts the device public key
@@ -210,19 +253,62 @@ else
 fi
 chmod 600 "$AK"`
 
+// removeKeyScript is the remote program that removes the device public key
+// from the Pi's authorized_keys (ticket10-5 profile deletion). Idempotent:
+// a missing line is a no-op success. The leading MIRA_KEY_REMOVE marker
+// doubles as the fixture hook in the daemon tests.
+const removeKeyScript = `# MIRA_KEY_REMOVE
+AK="$HOME/.ssh/authorized_keys"
+[ -f "$AK" ] || exit 0
+LINE="__MIRA_PUBKEY__"
+if grep -qxF "$LINE" "$AK" 2>/dev/null; then
+    TMP="${AK}.mira-del"
+    grep -vxF "$LINE" "$AK" > "$TMP"
+    rc=$?
+    # grep exits 1 when no lines are selected (the file held only OUR key,
+    # the common case) - that is a successful removal, not an error
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+        rm -f "$TMP"
+        exit 1
+    fi
+    mv "$TMP" "$AK"
+    chmod 600 "$AK"
+    echo "mira-key: removed"
+else
+    echo "mira-key: not present"
+fi`
+
+// safePublicKeyForScript checks the public key for characters that would
+// break the double-quoted LINE="..." rendering both install and remove use.
+func safePublicKeyForScript(publicKey string) error {
+	for _, bad := range []string{"\"", "$", "`", "\n"} {
+		if strings.Contains(publicKey, bad) {
+			return fmt.Errorf("public key contains unsupported character %q", bad)
+		}
+	}
+	if strings.TrimSpace(publicKey) == "" {
+		return errors.New("public key is empty")
+	}
+	return nil
+}
+
 // installKeyCommand renders the remote key-install program for the given
 // public key. The key is embedded in double quotes, so it must not contain
 // characters that would break the quoting; the daemon-generated key
 // (ssh-ed25519 <base64> mira@device) never does, and anything else is
 // refused instead of risking a mangled command.
 func installKeyCommand(publicKey string) (string, error) {
-	for _, bad := range []string{"\"", "$", "`", "\n"} {
-		if strings.Contains(publicKey, bad) {
-			return "", fmt.Errorf("public key contains unsupported character %q", bad)
-		}
-	}
-	if strings.TrimSpace(publicKey) == "" {
-		return "", errors.New("public key is empty")
+	if err := safePublicKeyForScript(publicKey); err != nil {
+		return "", err
 	}
 	return strings.Replace(installKeyScript, "__MIRA_PUBKEY__", publicKey, 1), nil
+}
+
+// removeKeyCommand renders the remote key-removal program for the given
+// public key (same quoting contract as installKeyCommand).
+func removeKeyCommand(publicKey string) (string, error) {
+	if err := safePublicKeyForScript(publicKey); err != nil {
+		return "", err
+	}
+	return strings.Replace(removeKeyScript, "__MIRA_PUBKEY__", publicKey, 1), nil
 }
