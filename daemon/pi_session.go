@@ -68,6 +68,23 @@ import (
 //     (profiles[].key_installed = device-side key file presence). Conn
 //     describes the session of the ACTIVE profile only; the other profiles
 //     have no live session state.
+//   - Recovery state (ticket10-6B): the status additionally carries the
+//     reboot-recovery state of the active profile
+//     (recovery: "rebooting" | "waiting_after_reboot" + recovery_started_at,
+//     injected via RecoveryStatus, omitted when idle). The UI
+//     (ticket10-6C) suppresses the first-run onboarding card while the
+//     recovery state is set.
+//   - Boot-timing tolerance (ticket10-6 constraint 3, anchored here):
+//     while the recovery window is open (the RPi reboots slower than the
+//     Mira), this session keeps its patient 10 s key-only loop. Early SSH
+//     failures draw NO false conclusions by construction: the loop has no
+//     password path (BatchMode key auth only - a "wrong password" is
+//     unrepresentable), the key file is treated read-only (a "no key"
+//     conclusion would mean the file disappeared from disk, which the loop
+//     simply re-stats on the next tick - no state is reset), and the only
+//     states that change are the expected connection states. The recovery
+//     service itself (recovery.go) resets its 15 s no-internet clock on
+//     every unreachability instead of acting on it.
 //   - Shutdown: Stop() cancels the loop context (killing a running ssh
 //     session via exec.CommandContext) and waits for the loop goroutine.
 
@@ -109,19 +126,24 @@ type PiProfileStatus struct {
 }
 
 // PiStatus is the GET /api/pi/status response (epic 10 ticket10-4, profile
-// context ticket10-5). Conn is always one of connected|connecting|
-// disconnected and describes the session bound to the ACTIVE profile
-// (ProfileId); LastAttemptAt is UTC RFC3339; Model/Tier come from the last
-// known-good provisioning result and are omitted when unknown; Profiles
-// carries the per-profile key existence for all stored profiles (omitted
-// when none are stored).
+// context ticket10-5, recovery extension ticket10-6B). Conn is always one of
+// connected|connecting|disconnected and describes the session bound to the
+// ACTIVE profile (ProfileId); LastAttemptAt is UTC RFC3339; Model/Tier come
+// from the last known-good provisioning result and are omitted when unknown;
+// Profiles carries the per-profile key existence for all stored profiles
+// (omitted when none are stored); Recovery is the reboot-recovery state of
+// the active profile ("rebooting" | "waiting_after_reboot") and
+// RecoveryStartedAt the episode start (RFC3339 UTC, the persisted flag's
+// started_at) - both omitted when the recovery is idle.
 type PiStatus struct {
-	Conn          string            `json:"conn"`
-	LastAttemptAt string            `json:"last_attempt_at,omitempty"`
-	Model         string            `json:"model,omitempty"`
-	Tier          string            `json:"tier,omitempty"`
-	ProfileId     string            `json:"profile_id,omitempty"`
-	Profiles      []PiProfileStatus `json:"profiles,omitempty"`
+	Conn              string            `json:"conn"`
+	LastAttemptAt     string            `json:"last_attempt_at,omitempty"`
+	Model             string            `json:"model,omitempty"`
+	Tier              string            `json:"tier,omitempty"`
+	ProfileId         string            `json:"profile_id,omitempty"`
+	Profiles          []PiProfileStatus `json:"profiles,omitempty"`
+	Recovery          string            `json:"recovery,omitempty"`
+	RecoveryStartedAt string            `json:"recovery_started_at,omitempty"`
 }
 
 // PiSessionHandler is the cross-service handler for the /api/pi/status
@@ -167,6 +189,12 @@ type PiSessionConfig struct {
 	// result); may return empty.
 	ModelTier func() (model, tier string)
 
+	// RecoveryStatus reports the reboot-recovery state of the active
+	// profile (ticket10-6B): "" = idle (the recovery fields are omitted
+	// from the status), otherwise "rebooting"/"waiting_after_reboot" plus
+	// the episode start (zero time = unknown, the field is omitted).
+	RecoveryStatus func() (state string, startedAt time.Time)
+
 	// Now is the clock; defaults to time.Now (tests inject a fake clock).
 	Now func() time.Time
 
@@ -197,12 +225,13 @@ func (p piIdentity) same(o piIdentity) bool {
 type PiSession struct {
 	log librespot.Logger
 
-	loadConfig   func() (id, ip, user string, ok bool)
-	loadProfiles func() []PiProfile
-	modelTier    func() (model, tier string)
-	now          func() time.Time
-	retryEvery   time.Duration
-	newTicker    func(d time.Duration) tickerLike
+	loadConfig     func() (id, ip, user string, ok bool)
+	loadProfiles   func() []PiProfile
+	modelTier      func() (model, tier string)
+	recoveryStatus func() (state string, startedAt time.Time)
+	now            func() time.Time
+	retryEvery     time.Duration
+	newTicker      func(d time.Duration) tickerLike
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -255,20 +284,25 @@ func NewPiSession(log librespot.Logger, cfg PiSessionConfig) *PiSession {
 	if mt == nil {
 		mt = func() (string, string) { return "", "" }
 	}
+	rec := cfg.RecoveryStatus
+	if rec == nil {
+		rec = func() (string, time.Time) { return "", time.Time{} }
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PiSession{
-		log:          log,
-		loadConfig:   load,
-		loadProfiles: profiles,
-		modelTier:    mt,
-		now:          now,
-		retryEvery:   interval,
-		newTicker:    newTicker,
-		ctx:          ctx,
-		cancel:       cancel,
-		state:        piConnDisconnected,
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
+		log:            log,
+		loadConfig:     load,
+		loadProfiles:   profiles,
+		modelTier:      mt,
+		recoveryStatus: rec,
+		now:            now,
+		retryEvery:     interval,
+		newTicker:      newTicker,
+		ctx:            ctx,
+		cancel:         cancel,
+		state:          piConnDisconnected,
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
 	}
 }
 
@@ -613,7 +647,34 @@ func (s *PiSession) PiStatus() PiStatus {
 		}
 		st.Profiles = append(st.Profiles, PiProfileStatus{ID: p.ID, KeyInstalled: installed})
 	}
+	if state, startedAt := s.recoveryStatus(); state != "" {
+		// ticket10-6B: the reboot-recovery state of the active profile,
+		// omitted when idle (the UI suppresses the first-run onboarding
+		// card while it is set)
+		st.Recovery = state
+		if !startedAt.IsZero() {
+			st.RecoveryStartedAt = startedAt.UTC().Format(time.RFC3339)
+		}
+	}
 	return st
+}
+
+// ProbeReachable reports whether the currently stored active profile is
+// reachable right now via key-only ssh (one fast BatchMode round-trip, the
+// same code path as the reconnect probe). It is the reachability probe of
+// the reboot-recovery service (ticket10-6B): it reuses the target
+// resolution of the reconnect loop, so profile switches are honored. A
+// missing config or key is simply unreachable (no error to report).
+func (s *PiSession) ProbeReachable(ctx context.Context) bool {
+	identity, ok := s.resolveTarget()
+	if !ok {
+		return false
+	}
+	if _, err := os.Stat(identity.keyPath); err != nil {
+		return false
+	}
+	_, err := runSshKeyWith(ctx, identity.keyPath, identity.ip, identity.user, "true")
+	return err == nil
 }
 
 // setState flips the state, logging the transition. Repeats are silent so a
