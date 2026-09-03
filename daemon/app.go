@@ -71,6 +71,12 @@ type App struct {
 	// piSession is the Pi SSH auto-reconnect manager (epic 10 ticket10-4)
 	piSession *PiSession
 
+	// piRecovery is the reboot-orchestration manager for an already
+	// recognized Pi without tethering internet (epic 10 ticket10-6B); its
+	// persistent "reboot started by us" flag survives the Mira's own
+	// restart (daemon-owned flag file, see recovery.go)
+	piRecovery *PiRecovery
+
 	retryNowCh chan struct{}
 
 	// pre-network attempt sits in DNS resolution for 20-30s. parking here until network is up dodges that
@@ -197,14 +203,16 @@ func New(opts *Options) (*App, error) {
 	// must have installed the device key pair first (a missing key is a
 	// synchronous 409), the target profile resolves from the UI settings blob
 	// (ticket10-5) when the request carries no explicit profile_id.
-	app.server.SetTetheringHandler(NewTetheringService(app.log, TetheringConfig{
+	tethering := NewTetheringService(app.log, TetheringConfig{
 		LoadSettings: app.piSettingsBlob,
-	}))
+	})
+	app.server.SetTetheringHandler(tethering)
 
 	// /api/pi/status Pi session auto-reconnect (epic 10 ticket10-4): the
 	// manager starts with the daemon (key-based, never prompts for a
 	// password) and is stopped in Close. It is bound to the ACTIVE profile
 	// of the UI settings blob (ticket10-5).
+	var piRecovery *PiRecovery
 	app.piSession = NewPiSession(app.log, PiSessionConfig{
 		LoadConfig:   app.loadPiProfileTarget,
 		LoadProfiles: app.loadPiProfiles,
@@ -212,9 +220,48 @@ func New(opts *Options) (*App, error) {
 			st := setupPi.SetupPiStatus()
 			return st.Model, st.Tier
 		},
+		// ticket10-6B: the reboot-recovery state rides on the same status
+		// (recovery + recovery_started_at, omitted when idle); the closure
+		// captures the variable so the manager can be constructed after the
+		// session (it needs the session for its reachability probe)
+		RecoveryStatus: func() (string, time.Time) {
+			if piRecovery == nil {
+				return "", time.Time{}
+			}
+			return piRecovery.Status()
+		},
 	})
 	app.server.SetPiSessionHandler(app.piSession)
 	app.piSession.Start()
+
+	// Reboot orchestration for an ALREADY RECOGNIZED Pi without tethering
+	// internet (epic 10 ticket10-6B): 15 s continuous "Pi reachable + no
+	// internet" -> the Pi is rebooted EXACTLY ONCE per daemon lifetime and
+	// the persistent "reboot started by us" flag is written BEFORE the
+	// reboot (it must survive the Mira's own restart - shared USB power).
+	// The flag is a daemon-owned file (/etc/mira/pi_reboot_recovery.json,
+	// env override MIRA_RECOVERY_FLAG, NOT the UI settings blob - see
+	// recovery.go for the rationale), then a patient 10 min window waits
+	// for the full Pi boot, in which the re-run-safe tethering script is
+	// re-fired (the iptables NAT rules are runtime-only). Boot-timing
+	// tolerance: the 15 s clock starts at the first "reachable + no
+	// internet" observation and resets on every unreachability - early
+	// SSH failures draw no false conclusions (key-only, no password path).
+	piRecovery = NewPiRecovery(app.log, PiRecoveryConfig{
+		FlagPath:     "", // default /etc/mira/pi_reboot_recovery.json (recovery.go)
+		LoadSettings: app.piSettingsBlob,
+		PiReachable: func(ctx context.Context) bool {
+			if app.piSession.PiStatus().Conn == piConnConnected {
+				return true
+			}
+			return app.piSession.ProbeReachable(ctx)
+		},
+		RunTethering: func() (string, error) {
+			return tethering.StartTethering(TetheringRequest{})
+		},
+	})
+	app.piRecovery = piRecovery
+	app.piRecovery.Start()
 
 	// mirror persisted settings into the firmware brightness conf
 	if len(app.state.Settings) > 0 {
@@ -382,6 +429,9 @@ func (app *App) Close() error {
 	}
 	app.closed = true
 
+	if app.piRecovery != nil {
+		app.piRecovery.Stop()
+	}
 	if app.piSession != nil {
 		app.piSession.Stop()
 	}
