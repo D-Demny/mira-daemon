@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
 )
@@ -203,7 +204,7 @@ func TestPiProfileDelete_RemovesDeviceKeyAndAuthorizedKeys(t *testing.T) {
 	}
 	fakeKeyOK(t, true)
 
-	svc := NewPiProfileService(&librespot.NullLogger{})
+	svc := NewPiProfileService(&librespot.NullLogger{}, PiProfileServiceConfig{})
 	res, err := svc.DeletePiProfile("pi-1", PiProfileDeleteRequest{Ip: "192.168.7.1", User: "u", Password: "p"})
 	if err != nil {
 		t.Fatalf("DeletePiProfile: %v", err)
@@ -237,7 +238,7 @@ func TestPiProfileDelete_NoCredentialsDeviceSideOnly(t *testing.T) {
 	mark := filepath.Join(t.TempDir(), "ssh-calls")
 	t.Setenv("FAKE_SSH_MARK", mark)
 
-	svc := NewPiProfileService(&librespot.NullLogger{})
+	svc := NewPiProfileService(&librespot.NullLogger{}, PiProfileServiceConfig{})
 	res, err := svc.DeletePiProfile("pi-1", PiProfileDeleteRequest{})
 	if err != nil {
 		t.Fatalf("DeletePiProfile: %v", err)
@@ -258,11 +259,86 @@ func TestPiProfileDelete_NoCredentialsDeviceSideOnly(t *testing.T) {
 
 func TestPiProfileDelete_InvalidProfileId(t *testing.T) {
 	t.Parallel()
-	svc := NewPiProfileService(&librespot.NullLogger{})
+	svc := NewPiProfileService(&librespot.NullLogger{}, PiProfileServiceConfig{})
 	for _, id := range []string{"", "  ", "../x", "a/b", ".hidden", strings.Repeat("a", 100)} {
 		if _, err := svc.DeletePiProfile(id, PiProfileDeleteRequest{}); err == nil {
 			t.Errorf("DeletePiProfile(%q) accepted, want an error", id)
 		}
+	}
+}
+
+// ticket10-7 (G-D1): deleting a profile clears the reboot-recovery flag
+// that belongs to it (file + in-memory episode, so the /api/pi/status
+// recovery fields go idle immediately), keeps the flag of another
+// profile, and is a no-op when no flag exists.
+func TestPiProfileDelete_ClearsMatchingRecoveryFlag(t *testing.T) {
+	// no t.Parallel(): t.Setenv (fakeSSHBinDir/fakeKeyEnv) + MIRA_RECOVERY_FLAG
+	fakeSSHBinDir(t)
+	_, _ = fakeKeyEnv(t)
+	t0 := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	flagPath := filepath.Join(t.TempDir(), "flag.json")
+	t.Setenv(recoveryFlagEnv, flagPath) // NewPiRecovery resolves the flag path from the env
+
+	// (a) matching profile with an active waiting episode: the flag file
+	// AND the in-memory recovery state are cleared by the deletion
+	rec := NewPiRecovery(&librespot.NullLogger{}, PiRecoveryConfig{
+		LoadSettings: func() []byte {
+			return recoveryProfilesBlobJSON("pi-1", PiProfile{ID: "pi-1", Ip: "192.168.7.1", User: "piuser"})
+		},
+		PiReachable:   func(ctx context.Context) bool { return true },
+		CheckInternet: func(ctx context.Context) (bool, error) { return false, nil },
+		Now:           func() time.Time { return t0 },
+		NewTicker:     func(d time.Duration) tickerLike { return &fakeTicker{ch: make(chan time.Time, 1)} },
+	})
+	recoveryWriteFlag(t, flagPath, t0, "pi-1")
+	rec.Start()
+	defer rec.Stop()
+	if st, _ := rec.Status(); st != "waiting_after_reboot" {
+		t.Fatalf("recovery state = %q, want waiting_after_reboot (fresh flag of the active profile)", st)
+	}
+	if err := EnsureKeyForProfile(context.Background(), "pi-1"); err != nil {
+		t.Fatalf("EnsureKeyForProfile: %v", err)
+	}
+	svc := NewPiProfileService(&librespot.NullLogger{}, PiProfileServiceConfig{
+		ClearRecoveryFlag: rec.ClearFlagForProfile,
+	})
+	res, err := svc.DeletePiProfile("pi-1", PiProfileDeleteRequest{})
+	if err != nil {
+		t.Fatalf("DeletePiProfile: %v", err)
+	}
+	if !res.KeyRemoved {
+		t.Errorf("key_removed = false, want true")
+	}
+	if recoveryFlagExists(flagPath) {
+		t.Errorf("the flag file of the deleted profile survived the deletion")
+	}
+	if st, _ := rec.Status(); st != "" {
+		t.Errorf("recovery state after the deletion = %q, want idle (no status field for a gone profile)", st)
+	}
+
+	// (b) a flag belonging to ANOTHER profile is kept (its episode continues)
+	recoveryWriteFlag(t, flagPath, t0, "pi-2")
+	if err := EnsureKeyForProfile(context.Background(), "pi-1"); err != nil {
+		t.Fatalf("EnsureKeyForProfile: %v", err)
+	}
+	if _, err := svc.DeletePiProfile("pi-1", PiProfileDeleteRequest{}); err != nil {
+		t.Fatalf("DeletePiProfile: %v", err)
+	}
+	flag, err := recoveryReadFlag(flagPath)
+	if err != nil || flag == nil || flag.ProfileId != "pi-2" {
+		t.Errorf("a flag of another profile was modified (got %+v, %v), want unchanged pi-2", flag, err)
+	}
+
+	// (c) no flag file: the deletion succeeds (missing flag = no-op)
+	if err := EnsureKeyForProfile(context.Background(), "pi-1"); err != nil {
+		t.Fatalf("EnsureKeyForProfile: %v", err)
+	}
+	res, err = svc.DeletePiProfile("pi-1", PiProfileDeleteRequest{})
+	if err != nil {
+		t.Fatalf("DeletePiProfile: %v", err)
+	}
+	if res.Error != "" {
+		t.Errorf("error = %q, want empty (a missing flag is a no-op)", res.Error)
 	}
 }
 
@@ -301,7 +377,7 @@ func TestPiProfileDeleteEndpoint_NoHandlerIs503(t *testing.T) {
 func TestPiProfileDeleteEndpoint_MissingIdIs400(t *testing.T) {
 	t.Parallel()
 	srv, base := newTestApiServer(t)
-	srv.SetPiProfileHandler(NewPiProfileService(&librespot.NullLogger{}))
+	srv.SetPiProfileHandler(NewPiProfileService(&librespot.NullLogger{}, PiProfileServiceConfig{}))
 
 	// no id in the query string
 	req, err := http.NewRequest("DELETE", base+"/api/pi/profile", nil)
@@ -321,7 +397,7 @@ func TestPiProfileDeleteEndpoint_MissingIdIs400(t *testing.T) {
 func TestPiProfileDeleteEndpoint_InvalidIdIs400(t *testing.T) {
 	t.Parallel()
 	srv, base := newTestApiServer(t)
-	srv.SetPiProfileHandler(NewPiProfileService(&librespot.NullLogger{}))
+	srv.SetPiProfileHandler(NewPiProfileService(&librespot.NullLogger{}, PiProfileServiceConfig{}))
 	resp := deletePiProfile(t, base, "../x", "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
@@ -341,7 +417,7 @@ func TestPiProfileDeleteEndpoint_FullFlow(t *testing.T) {
 	fakeKeyOK(t, true)
 
 	srv, base := newTestApiServer(t)
-	srv.SetPiProfileHandler(NewPiProfileService(&librespot.NullLogger{}))
+	srv.SetPiProfileHandler(NewPiProfileService(&librespot.NullLogger{}, PiProfileServiceConfig{}))
 
 	resp := deletePiProfile(t, base, "pi-1", `{"ip":"192.168.7.1","user":"u","password":"p"}`)
 	defer resp.Body.Close()

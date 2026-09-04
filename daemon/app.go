@@ -195,8 +195,22 @@ func New(opts *Options) (*App, error) {
 	setupPi := NewSetupPiService(app.log, setupPiCfg)
 	app.server.SetSetupPiHandler(setupPi)
 
-	// /api/pi/profile (DELETE) Pi profile deletion (epic 10 ticket10-5)
-	app.server.SetPiProfileHandler(NewPiProfileService(app.log))
+	// /api/pi/profile (DELETE) Pi profile deletion (epic 10 ticket10-5).
+	// ticket10-7 (G-D1): a deletion must also clear the reboot-recovery
+	// flag of the deleted profile. The hook is a closure over the (later
+	// constructed) recovery manager - the same late-wiring pattern as the
+	// RecoveryStatus hook of the session (the recovery manager is
+	// constructed after the session because it needs it for its
+	// reachability probe; the server only dispatches after this sequence).
+	var piRecovery *PiRecovery
+	app.server.SetPiProfileHandler(NewPiProfileService(app.log, PiProfileServiceConfig{
+		ClearRecoveryFlag: func(profileID string) {
+			if piRecovery == nil {
+				return
+			}
+			piRecovery.ClearFlagForProfile(profileID)
+		},
+	}))
 
 	// /api/pi/tethering* USB-tethering setup for the (active) Pi profile
 	// (epic 10 ticket10-6): key-first by contract - the provisioning wizard
@@ -212,7 +226,6 @@ func New(opts *Options) (*App, error) {
 	// manager starts with the daemon (key-based, never prompts for a
 	// password) and is stopped in Close. It is bound to the ACTIVE profile
 	// of the UI settings blob (ticket10-5).
-	var piRecovery *PiRecovery
 	app.piSession = NewPiSession(app.log, PiSessionConfig{
 		LoadConfig:   app.loadPiProfileTarget,
 		LoadProfiles: app.loadPiProfiles,

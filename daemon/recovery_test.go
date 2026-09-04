@@ -933,8 +933,10 @@ func TestPiRecovery_LeakCheckAndCleanStop(t *testing.T) {
 }
 
 // (h) flag file contract: the env override wins over the configured path;
-// the on-disk shape is {"started_at": RFC3339 UTC, "profile_id"}; a
-// corrupt flag file is tolerated (warning + continue, never a crash).
+// the on-disk shape is {"started_at": RFC3339 UTC, "profile_id"}; an
+// unparseable flag file is cleared with a warning (like the bad-timestamp
+// flag, ticket10-7 G-D2) instead of surviving until the next boot; an
+// empty-field flag is treated as absent (untouched).
 func TestPiRecovery_FlagFileShapeAndCorruption(t *testing.T) {
 	fakeSSHBinDir(t)
 	_, _ = fakeKeyEnv(t)
@@ -1003,6 +1005,9 @@ func TestPiRecovery_FlagFileShapeAndCorruption(t *testing.T) {
 	badRec.bootCheck() // synchronous: no loop needed
 	if st, _ := badRec.Status(); st != "" {
 		t.Errorf("state after a corrupt flag = %q, want idle", st)
+	}
+	if recoveryFlagExists(bad) {
+		t.Errorf("the corrupt flag file was not cleared (ticket10-7 G-D2: same path as the bad-timestamp flag)")
 	}
 
 	empty := filepath.Join(t.TempDir(), "empty.json")
