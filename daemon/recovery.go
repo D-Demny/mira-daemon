@@ -352,6 +352,38 @@ func (r *PiRecovery) Status() (string, time.Time) {
 	}
 }
 
+// ClearFlagForProfile clears the persistent reboot flag if it belongs to
+// the given profile. It is called by the profile deletion (ticket10-7
+// G-D1, wired from app.go via the PiProfileService hook): a deleted
+// profile must not leave a stale flag file or a recovery status field for
+// a profile that no longer exists. Only a flag whose profile_id matches
+// is cleared - other profiles keep their episode. The in-memory episode
+// is reset as well (the /api/pi/status recovery fields go idle
+// immediately instead of staying set until the 10 min patience window
+// expires). A missing, empty or corrupt flag file is a no-op without
+// error (a corrupt file is cleaned up by the boot check of the next
+// start, G-D2). Single-writer invariant: this is the only flag access
+// outside the recovery loop itself (the loop only writes the flag in
+// issueReboot and clears it in its own ticks, so the file operations do
+// not interleave with a tick of the same service).
+func (r *PiRecovery) ClearFlagForProfile(profileID string) {
+	flag, err := r.loadFlag()
+	if err != nil || flag == nil {
+		return // absent / empty / unreadable: nothing to clear
+	}
+	if flag.ProfileId != profileID {
+		return // belongs to another profile: keep its episode
+	}
+	r.clearFlag()
+	r.mu.Lock()
+	if r.flagProfileID == profileID {
+		r.state = recoveryStateIdle
+		r.flagStartedAt = time.Time{}
+		r.flagProfileID = ""
+	}
+	r.mu.Unlock()
+}
+
 func (r *PiRecovery) loop() {
 	r.loopStarted.Store(true)
 	defer close(r.doneCh)
@@ -376,7 +408,11 @@ func (r *PiRecovery) loop() {
 func (r *PiRecovery) bootCheck() {
 	flag, err := r.loadFlag()
 	if err != nil {
-		r.log.Warnf("recovery: reading the flag file: %v (starting without it)", err)
+		// an unparseable flag file is as unusable as a stale one: clear it
+		// (like the bad-timestamp path below) instead of logging the same
+		// warning on every boot (ticket10-7 G-D2)
+		r.log.Warnf("recovery: corrupt flag file (%v) - clearing it", err)
+		r.clearFlag()
 		return
 	}
 	if flag == nil {

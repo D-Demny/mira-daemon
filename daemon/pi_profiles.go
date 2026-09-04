@@ -179,14 +179,26 @@ type PiProfileHandler interface {
 	DeletePiProfile(profileID string, req PiProfileDeleteRequest) (PiProfileDeleteResult, error)
 }
 
+// PiProfileServiceConfig configures the profile deletion service.
+type PiProfileServiceConfig struct {
+	// ClearRecoveryFlag clears the persistent reboot-recovery flag when a
+	// profile is deleted (wired to PiRecovery.ClearFlagForProfile in
+	// app.go, ticket10-7 G-D1: a deleted profile must not leave a stale
+	// flag file or a recovery status field behind). It must be a no-op
+	// when the flag is absent or belongs to another profile. nil = no
+	// cleanup hook (the recovery service is not available).
+	ClearRecoveryFlag func(profileID string)
+}
+
 // PiProfileService implements PiProfileHandler.
 type PiProfileService struct {
-	log librespot.Logger
+	log               librespot.Logger
+	clearRecoveryFlag func(profileID string)
 }
 
 // NewPiProfileService builds the profile deletion handler.
-func NewPiProfileService(log librespot.Logger) *PiProfileService {
-	return &PiProfileService{log: log}
+func NewPiProfileService(log librespot.Logger, cfg PiProfileServiceConfig) *PiProfileService {
+	return &PiProfileService{log: log, clearRecoveryFlag: cfg.ClearRecoveryFlag}
 }
 
 // DeletePiProfile removes a profile's device-side key pair and - when the
@@ -203,6 +215,14 @@ func NewPiProfileService(log librespot.Logger) *PiProfileService {
 // from the store itself (and updates activePiId). A session bound to the
 // deleted profile reacts through the normal config re-read (the profile is
 // gone from the blob on the next tick).
+//
+// ticket10-7 (G-D1): the deletion also clears the reboot-recovery flag of
+// the deleted profile (via the ClearRecoveryFlag hook, which owns the
+// flag file and only acts when its profile_id matches - other profiles
+// keep their episode, a missing or corrupt flag is a no-op). Without it a
+// leftover flag would keep reporting a recovery status for a profile that
+// no longer exists (up to the 10 min patience window) and the flag file
+// would survive on disk until the next daemon start.
 func (s *PiProfileService) DeletePiProfile(profileID string, req PiProfileDeleteRequest) (PiProfileDeleteResult, error) {
 	id, err := sanitizeProfileID(profileID)
 	if err != nil {
@@ -228,6 +248,14 @@ func (s *PiProfileService) DeletePiProfile(profileID string, req PiProfileDelete
 		} else if !os.IsNotExist(err) {
 			return PiProfileDeleteResult{}, fmt.Errorf("removing %s: %w", p, err)
 		}
+	}
+
+	// ticket10-7 (G-D1): end the recovery episode of the deleted profile
+	// (flag file + in-memory state, see the function header). This happens
+	// before the best-effort Pi-side cleanup so a failing/slow ssh run
+	// cannot skip it.
+	if s.clearRecoveryFlag != nil {
+		s.clearRecoveryFlag(id)
 	}
 
 	ip := strings.TrimSpace(req.Ip)
