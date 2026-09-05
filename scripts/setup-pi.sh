@@ -5,21 +5,31 @@
 # the USB-Ethernet-connected Raspberry Pi compute server:
 #   1. connection test against the Pi's SSH port
 #   2. model auto-detection via /proc/device-tree/model
-#   3. tier deploy (both tiers serve the epic 10 T2 route contract on :8080
-#      with CORS Access-Control-Allow-Origin: * because the UI origin
+#   3. deploy (both tiers run the SAME nodejs compute-server on :8080,
+#      serving the epic 10 T2 route contract with CORS
+#      Access-Control-Allow-Origin: * because the UI origin
 #      http://localhost:80 is cross-origin to the Pi):
 #        GET /api/v1/capabilities -> {"tier":"cache"|"compute",
 #                                     "disk_cache":bool,
 #                                     "remote_colors":bool,
 #                                     "remote_blur":bool}
-#        GET /img/<urlencoded-cdn-url>/160.jpg -> artwork
+#        GET /img/<urlencoded-cdn-url>/160.jpg -> artwork (real 160x160
+#                              JPEG resize via jpeg-js; non-JPEG/PNG sources
+#                              or a missing jpeg-js install -> the original
+#                              bytes are passed through unchanged)
 #        GET /img/<urlencoded-cdn-url>/colors  -> {"dominant":[r,g,b]}
-#      Tier services:
-#        Pi Zero W          -> lightweight: nginx :8080 (capabilities + /img/
-#                              disk-cache alias) + SQLite cache file
-#        Pi Zero 2 W / Pi 4 -> compute: nodejs compute-server on :8080
-#                              (capabilities + /img/ pass-through; Sharp/Canvas
-#                              image preprocessing is a later epic 10 task)
+#                              (4-bit quant histogram; decode failure ->
+#                              grey [128,128,128])
+#      Disk cache: /var/cache/mira/img/<sha1(url)>/{160.jpg,colors.json}.
+#
+#      Design decision (epic 10 follow-up): the Pi Zero W (lightweight)
+#      tier no longer gets the old nginx static tier. A static file server
+#      has no fetcher, so its /img/ disk cache could never be filled and
+#      the advertised remote_colors/remote_blur features could never be
+#      delivered. jpeg-js is pure JS (no native build step), which makes
+#      the node service viable on armv6/armv7 as well. The tier only
+#      changes the capabilities tier field (cache vs compute) and the
+#      default cache cap (200 vs 500 files) inside the service.
 #
 # Environment (set by the daemon's /api/setup-pi, or manually when run by hand):
 #   SSH_HOST  Pi IP address (default network: 192.168.7.1)
@@ -27,6 +37,8 @@
 #   SSH_PASS  ssh password (never printed; handed to sshpass via SSHPASS)
 #   MIRA_SSH_KEY_PATH  path of the device ssh key for the key-first attempt
 #                      (epic 10 ticket10-3; default /etc/mira/ssh/id_ed25519)
+#   MIRA_COMPUTE_JS  path of compute-server.js (default: next to this
+#                    script; override for tests)
 #
 # On success the script prints the machine-readable line
 #   RESULT model="<model>" tier="<lightweight|compute>"
@@ -143,161 +155,89 @@ log "selected tier: $TIER"
 # NOTE: package-manager detection happens REMOTELY in each deploy block,
 # because the Pi (Debian/Raspbian/Alpine/Void) and the device (Void) have
 # different package managers.
-log "step 3/3: deploying $TIER tier on $SSH_HOST"
+#
+# Both tiers deploy the same node compute service (epic 10 follow-up):
+# the tier only selects MIRA_PI_TIER (capabilities tier field + default
+# cache cap inside the service). The remote programs are single-quoted
+# blocks (no local expansion, no single quotes inside) or double-quoted
+# lines where the local variables are the intended expansion.
+log "step 3/3: deploying node compute service on $SSH_HOST (tier: $TIER)"
 
-if [ "$TIER" = "lightweight" ]; then
-    # nginx :8080 serving the capabilities JSON + the /img/ disk-cache dir,
-    # plus the SQLite cache db (content addressing lives in the daemon/UI).
-    # The whole remote program is one single-quoted block: no local
-    # expansion, no single quotes inside.
-    run_ssh '
+# 3a: install node if needed (per-distro package manager, remotely)
+run_ssh '
 set -e
-if command -v nginx >/dev/null 2>&1; then
-    echo "nginx already installed"
+if command -v node >/dev/null 2>&1; then
+    echo "node already installed"
 else
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nginx
+        apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-progress nginx
+        apk add --no-progress nodejs
     elif command -v xbps-install >/dev/null 2>&1; then
-        xbps-install -y nginx
+        xbps-install -y nodejs
     else
         echo "no supported package manager found" >&2
         exit 1
     fi
 fi
-mkdir -p /etc/nginx/conf.d /var/cache/mira/img /var/lib/mira
-cat > /etc/nginx/conf.d/mira.conf << MIRAEOF
-server {
-    listen 8080;
-    server_name _;
-    # UI origin http://localhost:80 is cross-origin to the Pi (epic 10 T2)
-    add_header Access-Control-Allow-Origin * always;
-    location = /api/v1/capabilities {
-        default_type application/json;
-        return 200 "{\"tier\":\"cache\",\"disk_cache\":true,\"remote_colors\":false,\"remote_blur\":false}";
-    }
-    # /img/<urlencoded-cdn-url>/160.jpg -> /var/cache/mira/img/<decoded-url>/160.jpg
-    location /img/ {
-        alias /var/cache/mira/img/;
-    }
-}
-MIRAEOF
-nginx -t >/dev/null 2>&1 || { echo "nginx config test failed" >&2; exit 1; }
-if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 /var/lib/mira/cache.db "CREATE TABLE IF NOT EXISTS img (uri TEXT PRIMARY KEY, path TEXT, ts INTEGER);"
-else
-    [ -f /var/lib/mira/cache.db ] || : > /var/lib/mira/cache.db
+' || die "node install failed"
+
+# 3b: remove the legacy lightweight tier (nginx on :8080) if a previous
+# run installed it, so :8080 is free for the node service
+run_ssh '
+if [ -f /etc/nginx/conf.d/mira.conf ]; then
+    rm -f /etc/nginx/conf.d/mira.conf
+    if command -v nginx >/dev/null 2>&1; then
+        nginx -s stop 2>/dev/null || service nginx stop 2>/dev/null || sv stop nginx 2>/dev/null || rc-service nginx stop 2>/dev/null || true
+        echo "removed legacy nginx tier (conf removed, nginx stopped)"
+    fi
 fi
-nginx -s reload 2>/dev/null || nginx
-sleep 1
-' || die "lightweight deploy failed"
-    if run_ssh "command -v curl >/dev/null 2>&1" >/dev/null 2>&1; then
-        caps="$(run_ssh "curl -sf http://127.0.0.1:8080/api/v1/capabilities")" || die "lightweight endpoint check failed"
-        log "endpoint check: $caps"
-    else
-        log "WARNING: no curl on the Pi, skipping endpoint check"
-    fi
+' || die "legacy tier cleanup failed"
+
+# 3c: write the service file. The JS is read from disk (MIRA_COMPUTE_JS
+# override, default: next to this script) and transferred base64 encoded
+# so no shell quoting can mangle it.
+COMPUTE_JS_SRC="${MIRA_COMPUTE_JS:-$(dirname "$0")/compute-server.js}"
+[ -f "$COMPUTE_JS_SRC" ] || die "compute-server.js not found at $COMPUTE_JS_SRC (set MIRA_COMPUTE_JS to override)"
+B64="$(cat "$COMPUTE_JS_SRC" | base64 | tr -d '\n')" || die "base64 encoding failed"
+run_ssh "mkdir -p /opt/mira /var/log && printf %s \"$B64\" | base64 -d > /opt/mira/compute-server.js" \
+    || die "compute deploy: service file write failed"
+
+# 3d: npm + jpeg-js, best-effort. npm is missing on some distros (nodejs
+# without npm), and a failed install must NOT abort the provisioning: the
+# service degrades to 160.jpg passthrough + grey colors and the UI
+# fallbacks apply (documented degradation, see compute-server.js header).
+run_ssh '
+if command -v npm >/dev/null 2>&1; then
+    echo "npm present"
 else
-    # compute tier: nodejs service on :8080. The JS is transferred base64
-    # encoded so no shell quoting can mangle it.
-    COMPUTE_JS='
-const http = require("http");
-const os = require("os");
-
-const PORT = 8080;
-// epic 10 T2 contract: {"tier":..., "disk_cache":..., "remote_colors":..., "remote_blur":...}
-const CAPS = JSON.stringify({
-  tier: "compute",
-  disk_cache: true,
-  remote_colors: true,
-  remote_blur: true,
-  host: os.hostname(),
-  model: process.env.MIRA_PI_MODEL || ""
-});
-
-// /img/<urlencoded-cdn-url>/<160.jpg|colors> (epic 10 T2 contract); the
-// encoded URL contains no raw slashes, so the path splits cleanly
-const IMG_RE = /^\/img\/([^/]+)\/([^/]+)$/;
-
-http
-  .createServer((req, res) => {
-    // the UI (http://localhost:80) is cross-origin to the Pi (epic 10 T2)
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    if (req.method === "OPTIONS") {
-      res.writeHead(204, {
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "*"
-      });
-      res.end();
-      return;
-    }
-    const u = new URL(req.url, "http://localhost");
-    if (u.pathname === "/api/v1/capabilities") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(CAPS);
-      return;
-    }
-    const m = u.pathname.match(IMG_RE);
-    if (m) {
-      let src;
-      try {
-        src = decodeURIComponent(m[1]);
-      } catch (e) {
-        src = m[1];
-      }
-      if (!/^https?:\/\//.test(src)) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "invalid cdn url in path" }));
-        return;
-      }
-      if (m[2] === "160.jpg" || m[2] === "160") {
-        // real pass-through of the upstream CDN image; Sharp based 160px
-        // downscaling lands in a later epic 10 task
-        const up = http.get(src, (upres) => {
-          res.writeHead(upres.statusCode || 502, {
-            "Content-Type": upres.headers["content-type"] || "application/octet-stream"
-          });
-          upres.pipe(res);
-        });
-        up.on("error", () => {
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "upstream fetch failed" }));
-        });
-        return;
-      }
-      if (m[2] === "colors") {
-        // contract shape per epic 10 T2; placeholder dominant color until
-        // Sharp/Canvas extraction lands in a later epic 10 task
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ dominant: [128, 128, 128] }));
-        return;
-      }
-    }
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "not found" }));
-  })
-  .listen(PORT, "0.0.0.0", () => {
-    console.log("mira compute-server listening on :" + PORT);
-  });
-'
-    B64="$(printf '%s' "$COMPUTE_JS" | base64 | tr -d '\n')" || die "base64 encoding failed"
-
-    # install node if needed + write the service file
-    run_ssh "mkdir -p /opt/mira /var/log && (command -v node >/dev/null 2>&1 || { if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs; elif command -v apk >/dev/null 2>&1; then apk add --no-progress nodejs; elif command -v xbps-install >/dev/null 2>&1; then xbps-install -y nodejs; else echo 'no supported package manager found on pi' >&2; exit 1; fi; }) && printf %s \"$B64\" | base64 -d > /opt/mira/compute-server.js" \
-        || die "compute deploy: node install / file write failed"
-
-    # restart the service. NEVER pkill -f: the pattern would match this ssh
-    # session's own command line. Restart by pid file.
-    run_ssh "export MIRA_PI_MODEL=\"$MODEL\"; if [ -f /opt/mira/compute-server.pid ]; then kill \"\$(cat /opt/mira/compute-server.pid)\" 2>/dev/null || true; sleep 1; fi; nohup node /opt/mira/compute-server.js > /var/log/mira-compute.log 2>&1 < /dev/null & echo \$! > /opt/mira/compute-server.pid" \
-        || die "compute deploy: service start failed"
-
-    # health check: process alive + endpoint answers
-    if run_ssh "sleep 2; if kill -0 \"\$(cat /opt/mira/compute-server.pid)\" 2>/dev/null; then if command -v curl >/dev/null 2>&1; then curl -sf http://127.0.0.1:8080/api/v1/capabilities; echo; else echo \"ok (no curl)\"; fi; else echo 'compute server not running' >&2; tail -5 /var/log/mira-compute.log 2>/dev/null; exit 1; fi"; then
-        log "compute endpoint check passed"
-    else
-        die "compute endpoint check failed"
+    echo "npm missing, attempting install"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends npm
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-progress npm
+    elif command -v xbps-install >/dev/null 2>&1; then
+        xbps-install -y npm
     fi
+fi
+if command -v npm >/dev/null 2>&1; then
+    npm install --prefix /opt/mira jpeg-js --no-audit --no-fund --loglevel=error || echo "WARNING: npm install jpeg-js failed - degraded mode (160.jpg passthrough + grey colors) until jpeg-js is installed"
+else
+    echo "WARNING: npm unavailable on pi - degraded mode (160.jpg passthrough + grey colors); install npm manually and re-run setup"
+fi
+' || die "npm / jpeg-js step failed"
+
+# 3e: start (or restart) the service. NEVER pkill -f: the pattern would
+# match this ssh session's own command line. Restart by pid file. The
+# tier env feeds the capabilities tier field + the default cache cap.
+run_ssh "export MIRA_PI_MODEL=\"$MODEL\" MIRA_PI_TIER=\"$TIER\"; if [ -f /opt/mira/compute-server.pid ]; then kill \"\$(cat /opt/mira/compute-server.pid)\" 2>/dev/null || true; sleep 1; fi; nohup node /opt/mira/compute-server.js > /var/log/mira-compute.log 2>&1 < /dev/null & echo \$! > /opt/mira/compute-server.pid" \
+    || die "compute deploy: service start failed"
+
+# 3f: health check: process alive + endpoint answers
+if run_ssh "sleep 2; if kill -0 \"\$(cat /opt/mira/compute-server.pid)\" 2>/dev/null; then if command -v curl >/dev/null 2>&1; then curl -sf http://127.0.0.1:8080/api/v1/capabilities; echo; else echo \"ok (no curl)\"; fi; else echo 'compute server not running' >&2; tail -5 /var/log/mira-compute.log 2>/dev/null; exit 1; fi"; then
+    log "compute endpoint check passed"
+else
+    die "compute endpoint check failed"
 fi
 
 log "provisioning finished: model '$MODEL' -> tier '$TIER'"
