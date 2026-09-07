@@ -1254,6 +1254,17 @@ func (p *AppPlayer) applyCurationsBody(uri, curationType string) []byte {
 	return body
 }
 
+// reports whether the active Spotify device is the kind we might be bonded to over Bluetooth
+// spotify reports a tablet as TABLET rather than SMARTPHONE
+func canRoutePhoneVolume(deviceType string) bool {
+	switch deviceType {
+	case "SMARTPHONE", "TABLET":
+		return true
+	default:
+		return false
+	}
+}
+
 func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -1501,7 +1512,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		if rs.VolumeDisabled {
 			// route volume controls to phone directly
-			if data.Relative && rs.DeviceType == "SMARTPHONE" && p.app.bt != nil && p.app.bt.SendPhoneVolumeSteps(int(data.Volume)) {
+			if data.Relative && canRoutePhoneVolume(rs.DeviceType) && p.app.bt != nil && p.app.bt.SendPhoneVolumeSteps(int(data.Volume)) {
 				p.app.log.Debugf("set_volume: routed %+d phone-volume step(s) (%s)", data.Volume, rs.DeviceName)
 				return nil, nil
 			}
