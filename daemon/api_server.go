@@ -1104,6 +1104,15 @@ func (s *ConcreteApiServer) serve() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(h.TetheringStatus())
 	})
+	// ticket 9.4: the settings UI configures the Home Assistant connection.
+	// /api/ha/login exchanges username+password for a fresh 10-year
+	// long-lived token via the HA websocket API; /api/ha/test probes
+	// GET <url>/api/. Cross-service handlers like /api/pi/*: no player
+	// session needed (no playerReady gate). SECURITY: credentials never
+	// reach a log line, the token only appears in the login response body
+	// (ha_login.go).
+	m.HandleFunc("POST /api/ha/login", s.handleHaLogin)
+	m.HandleFunc("POST /api/ha/test", s.handleHaTest)
 	m.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
