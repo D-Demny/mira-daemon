@@ -720,7 +720,20 @@ func (s *ConcreteApiServer) SetHomeAssistantConfig(cfg HomeAssistantConfig) {
 	s.haMu.Unlock()
 }
 
+// ticket 9.4: resolve the HA proxy config per request. The UI settings
+// blob (schema v3, "ha" object, see ha_config.go) wins over the build-time
+// config.yml defaults; a missing or unusable "ha" object falls back to
+// s.haCfg. The blob read is lock-free (the handler is read-only from our
+// side, the daemon never writes the blob); haMu still guards the defaults
+// exactly as before.
 func (s *ConcreteApiServer) getHomeAssistantConfig() HomeAssistantConfig {
+	if h := s.getSettingsHandler(); h != nil {
+		if hc := ParseHaConfig(h.GetSettings()); hc != nil {
+			// the proxy only needs URL + Token; username/password belong
+			// to the WS login endpoint, which receives them in its body
+			return HomeAssistantConfig{URL: hc.URL, Token: hc.Token}
+		}
+	}
 	s.haMu.RLock()
 	defer s.haMu.RUnlock()
 	return s.haCfg
