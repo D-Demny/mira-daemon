@@ -552,12 +552,13 @@ func TestHaTest_BadRequest(t *testing.T) {
 	srv, base := newTestApiServer(t)
 	_ = srv
 
+	// Note: an empty/missing url is NO LONGER bad_request (ticket 9.4,
+	// task 7) - see TestHaTest_EmptyURLSkipsProbe. Only non-empty urls
+	// that do not normalize are rejected here.
 	cases := []struct {
 		name string
 		body string
 	}{
-		{"missing url", `{"token":"t"}`},
-		{"empty url", `{"url":"   "}`},
 		{"unknown scheme", `{"url":"ftp://h:8123"}`},
 		{"invalid json", `{"url":`},
 	}
@@ -571,5 +572,56 @@ func TestHaTest_BadRequest(t *testing.T) {
 			t.Errorf("%s: body = %v, want ok:false error:bad_request", tc.name, body)
 		}
 		resp.Body.Close()
+	}
+}
+
+// TestHaTest_EmptyURLSkipsProbe: an empty or missing url is legal (ticket
+// 9.4, task 7) - the settings UI fetches defaults.url in the unconfigured
+// state (no ha entry saved) - so the probe is skipped and the response
+// carries the defaults only.
+func TestHaTest_EmptyURLSkipsProbe(t *testing.T) {
+	t.Parallel()
+	srv, base := newTestApiServer(t)
+	srv.SetHomeAssistantConfig(HomeAssistantConfig{URL: "http://default:8123"})
+
+	// The stub counts probe hits: an empty url must never dial it.
+	var mu sync.Mutex
+	probeHits := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		probeHits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(ts.Close)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty url", `{"url":""}`},
+		{"whitespace url", `{"url":"   "}`},
+		{"missing url field", `{"token":"t"}`},
+	}
+	for _, tc := range cases {
+		resp := postHaTest(t, base, tc.body)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200", tc.name, resp.StatusCode)
+		}
+		body := mustReadJSON(t, resp.Body)
+		if body["reachable"] != false || body["authenticated"] != false {
+			t.Errorf("%s: body = %v, want reachable:false authenticated:false", tc.name, body)
+		}
+		defaults, _ := body["defaults"].(map[string]any)
+		if defaults == nil || defaults["url"] != "http://default:8123" {
+			t.Errorf("%s: defaults = %v, want url http://default:8123", tc.name, body["defaults"])
+		}
+		resp.Body.Close()
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if probeHits != 0 {
+		t.Errorf("probe hits = %d, want 0 (an empty url must skip the probe)", probeHits)
 	}
 }

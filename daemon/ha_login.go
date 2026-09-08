@@ -44,7 +44,12 @@ import (
 //	REST root) with the Bearer token if one was given. The response is
 //	always 200 with {"reachable":bool,"authenticated":bool,
 //	"defaults":{"url":<config default>}}, except 400 {"ok":false,
-//	"error":"bad_request"} for a missing/invalid url:
+//	"error":"bad_request"} for a non-empty but invalid url (unknown
+//	scheme, unparseable, no host). An empty or missing url is legal and
+//	just skips the probe (reachable+authenticated stay false): the UI
+//	needs defaults.url in the unconfigured state (no ha entry saved in
+//	the settings blob) and this endpoint is the only source for the
+//	build-time default URL (ticket 9.4, task 7):
 //	  200 from HA            -> reachable+authenticated
 //	  401/403                -> reachable, unauthenticated
 //	  any other HTTP status  -> reachable, unauthenticated (HA answered the
@@ -344,6 +349,20 @@ func (s *ConcreteApiServer) handleHaTest(w http.ResponseWriter, r *http.Request)
 	var req haTestRequest
 	if err := jsonDecode(r, &req); err != nil {
 		writeHaJSON(w, http.StatusBadRequest, haLoginErrorBody{OK: false, Error: haErrBadRequest})
+		return
+	}
+	// An empty (or missing) url is NOT bad_request (ticket 9.4, task 7):
+	// the settings UI needs defaults.url in the unconfigured state (no ha
+	// entry in the settings blob) to pre-fill the URL field and to render
+	// the "not configured (default: ...)" status line, and this endpoint
+	// is the only source for the build-time default URL. So an empty url
+	// skips the probe and answers with defaults only (reachable and
+	// authenticated stay false). A non-empty url that does not normalize
+	// (unknown scheme, unparseable, no host) is still bad_request.
+	if strings.TrimSpace(req.URL) == "" {
+		writeHaJSON(w, http.StatusOK, haTestResponse{
+			Defaults: haTestDefaults{URL: s.getHomeAssistantConfig().URL},
+		})
 		return
 	}
 	canonical := normalizeHaURL(req.URL)
