@@ -96,6 +96,10 @@ type RemoteState struct {
 
 	// ShuffleContext indicates whether shuffle is enabled.
 	ShuffleContext bool
+	// SmartShuffle indicates whether Spotify's smart shuffle mode is active.
+	// The Connect proto has no explicit field for it, so this is derived
+	// defensively from ContextPlayerOptions.Modes (see deriveSmartShuffle).
+	SmartShuffle bool
 	// RepeatContext indicates whether repeat context is enabled.
 	RepeatContext bool
 	// RepeatTrack indicates whether repeat track is enabled.

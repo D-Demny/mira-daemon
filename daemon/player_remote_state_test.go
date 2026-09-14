@@ -174,6 +174,83 @@ func TestClusterToRemoteState_ShufflePassThrough(t *testing.T) {
 	}
 }
 
+func TestClusterToRemoteState_SmartShuffleDerivedFromModesMap(t *testing.T) {
+	t.Parallel()
+
+	// issue #39: the Connect proto has no explicit smart-shuffle field, so
+	// SmartShuffle is probed out of ContextPlayerOptions.Modes. Plain shuffle
+	// stays ON in every case to prove the two flags are independent.
+	tests := []struct {
+		name  string
+		modes map[string]string
+		want  bool
+	}{
+		{"snake_case_true", map[string]string{"smart_shuffle": "true"}, true},
+		{"snake_case_one", map[string]string{"smart_shuffle": "1"}, true},
+		{"snake_case_true_upper", map[string]string{"smart_shuffle": "TRUE"}, true},
+		{"camel_case_true", map[string]string{"smartShuffle": "true"}, true},
+		{"upper_case_one", map[string]string{"SMART_SHUFFLE": "1"}, true},
+		{"snake_case_false", map[string]string{"smart_shuffle": "false"}, false},
+		{"camel_case_zero", map[string]string{"smartShuffle": "0"}, false},
+		{"priority_first_present_key_wins", map[string]string{
+			"smartShuffle":  "true",
+			"smart_shuffle": "false",
+		}, false},
+		{"unrelated_keys_only", map[string]string{"some_other_mode": "true"}, false},
+		{"empty_modes", map[string]string{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := baseCluster()
+			c.PlayerState.Options = &connectpb.ContextPlayerOptions{
+				ShufflingContext: true,
+				Modes:            tt.modes,
+			}
+
+			rs := clusterToRemoteState(c)
+			if rs.SmartShuffle != tt.want {
+				t.Errorf("SmartShuffle (modes=%v): got %v want %v", tt.modes, rs.SmartShuffle, tt.want)
+			}
+			if !rs.ShuffleContext {
+				t.Errorf("ShuffleContext: must stay true, smart-shuffle probing must not touch it")
+			}
+		})
+	}
+}
+
+func TestClusterToRemoteState_SmartShuffleAbsentModesFalseAndShuffleUnaffected(t *testing.T) {
+	t.Parallel()
+
+	// Modes map absent (or Options nil) → SmartShuffle false, shuffle unaffected
+	c := baseCluster()
+	c.PlayerState.Options = &connectpb.ContextPlayerOptions{ShufflingContext: true}
+	rs := clusterToRemoteState(c)
+	if rs.SmartShuffle {
+		t.Errorf("SmartShuffle must be false when Modes is absent")
+	}
+	if !rs.ShuffleContext {
+		t.Errorf("ShuffleContext: plain shuffle must pass through untouched")
+	}
+
+	// explicit empty Modes map, same result
+	c.PlayerState.Options.Modes = map[string]string{}
+	rs = clusterToRemoteState(c)
+	if rs.SmartShuffle {
+		t.Errorf("SmartShuffle must be false for an empty Modes map")
+	}
+	if !rs.ShuffleContext {
+		t.Errorf("ShuffleContext: plain shuffle must pass through untouched")
+	}
+
+	// nil Options: both flags false, no crash
+	c.PlayerState.Options = nil
+	rs = clusterToRemoteState(c)
+	if rs.SmartShuffle || rs.ShuffleContext {
+		t.Errorf("nil Options: got Shuffle=%v Smart=%v, want false/false", rs.ShuffleContext, rs.SmartShuffle)
+	}
+}
+
 func TestClusterToRemoteState_RepeatFlagsPassThroughIndependently(t *testing.T) {
 	t.Parallel()
 

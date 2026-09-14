@@ -389,6 +389,7 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 		VolumeDisabled:        volumeDisabled,
 		VolumeSteps:           volumeSteps,
 		ShuffleContext:        ps.Options != nil && ps.Options.ShufflingContext,
+		SmartShuffle:          deriveSmartShuffle(ps.Options),
 		RepeatContext:         ps.Options != nil && ps.Options.RepeatingContext,
 		RepeatTrack:           ps.Options != nil && ps.Options.RepeatingTrack,
 		DisallowSkipPrev:      ps.Restrictions != nil && len(ps.Restrictions.DisallowSkippingPrevReasons) > 0,
@@ -403,6 +404,35 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 	rs.ReceivedAtWallMs = now.UnixMilli()
 	rs.Position = rs.RemotePosition()
 	return rs
+}
+
+// smartShuffleModeKeys are candidate keys inside ContextPlayerOptions.Modes
+// that may carry the smart-shuffle flag. The exact key name is unverified
+// (on-device spike pending, issue #39), so we probe in priority order: the
+// first PRESENT key decides, and it counts as on only for "true"/"1".
+var smartShuffleModeKeys = []string{"smart_shuffle", "smartShuffle", "SMART_SHUFFLE"}
+
+// deriveSmartShuffle reads the smart-shuffle flag from the Connect state.
+// The proto has no explicit smart-shuffle field, so this probes the Modes
+// map defensively and falls back to false when nothing plausible is found.
+func deriveSmartShuffle(options *connectpb.ContextPlayerOptions) bool {
+	if options == nil || len(options.Modes) == 0 {
+		return false
+	}
+	for _, key := range smartShuffleModeKeys {
+		val, ok := options.Modes[key]
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "true", "1":
+			return true
+		default:
+			// first present key is authoritative even when it says off
+			return false
+		}
+	}
+	return false
 }
 
 const clockSyncedFlag = "/run/clock_synced"
@@ -439,6 +469,17 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 	p.noteClusterTiming(rs)
 	if dev, ok := cluster.Device[rs.DeviceId]; ok {
 		rs.DeviceName = p.deviceDisplayName(rs.DeviceId, dev)
+		// issue #39: Modes map says smart shuffle but the active device
+		// doesn't advertise the capability — note it for the on-device spike
+		if rs.SmartShuffle && dev.Capabilities != nil && !dev.Capabilities.SupportsSmartShuffleMode {
+			p.app.log.Debugf("cluster: smart shuffle active on %q but device does not advertise supports_smart_shuffle_mode", rs.DeviceId)
+		}
+		// issue #39 spike instrumentation: log the state echo only on
+		// transitions (never per poll) so the on-device test can confirm
+		// whether Spotify accepts/reverts the smart flag.
+		if prev := p.state.remoteState; prev != nil && prev.SmartShuffle != rs.SmartShuffle {
+			p.app.log.Debugf("cluster: smart shuffle state echo on %q: %v -> %v", rs.DeviceId, prev.SmartShuffle, rs.SmartShuffle)
+		}
 	}
 	track := cluster.PlayerState.Track
 	if prev := p.state.remoteState; prev != nil && prev.TrackUri == rs.TrackUri {
@@ -1258,6 +1299,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			"volume_disabled":   rs.VolumeDisabled,
 			"volume_steps":      rs.VolumeSteps,
 			"shuffle":           rs.ShuffleContext,
+			"smart_shuffle":     rs.SmartShuffle,
 			"repeat_context":    rs.RepeatContext,
 			"repeat_track":      rs.RepeatTrack,
 			"disallow_prev":     rs.DisallowSkipPrev,
@@ -1336,12 +1378,12 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "seek_to", Value: data.Position})
 	case ApiRequestTypeSetShufflingContext:
-		val, _ := req.Data.(bool)
+		data, _ := req.Data.(ApiRequestDataShuffle)
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
 			return nil, fmt.Errorf("no target device for shuffle")
 		}
-		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "set_shuffling_context", Value: val})
+		return nil, p.sendDeviceCommand(ctx, targetId, targetName, buildShuffleCommand(data))
 	case ApiRequestTypeSetRepeatingContext:
 		val, _ := req.Data.(bool)
 		targetId, targetName, _ := p.resolveTargetDevice()
@@ -1504,6 +1546,16 @@ type connectPlayerOptionsOverride struct {
 	ShufflingContext *bool `json:"shuffling_context,omitempty"`
 }
 
+// connectShuffleValue is the best-guess wire encoding of a shuffle command
+// that also carries a smart-shuffle flag (issue #39). The Connect protocol
+// exposes no documented field for smart shuffle yet, so on-device
+// verification (see the set_shuffling_context envelope debug log) must pin
+// down the real shape; until then both flags ship as one JSON object in "value".
+type connectShuffleValue struct {
+	ShuffleContext bool `json:"shuffle_context"`
+	SmartShuffle   bool `json:"smart_shuffle"`
+}
+
 type connectSkipTo struct {
 	TrackUri string `json:"track_uri,omitempty"`
 }
@@ -1573,6 +1625,19 @@ func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
 	return cmd
 }
 
+// buildShuffleCommand assembles the connect set_shuffling_context command.
+// Pure function of the request data so the wire contract stays unit-testable
+// without a live cluster (issue #39). When Smart is nil the value stays the
+// legacy bare bool; when present it becomes a {shuffle_context, smart_shuffle}
+// object — best-guess encoding, see connectShuffleValue.
+func buildShuffleCommand(data ApiRequestDataShuffle) connectCommand {
+	var value any = data.Shuffle
+	if data.Smart != nil {
+		value = connectShuffleValue{ShuffleContext: data.Shuffle, SmartShuffle: *data.Smart}
+	}
+	return connectCommand{Endpoint: "set_shuffling_context", Value: value}
+}
+
 // sendActiveDeviceCommand sends to the active device in the user's cluster
 func (p *AppPlayer) sendActiveDeviceCommand(ctx context.Context, cmd connectCommand) error {
 	rs := p.state.remoteState
@@ -1604,6 +1669,12 @@ func (p *AppPlayer) sendDeviceCommand(ctx context.Context, deviceId, deviceName 
 		return fmt.Errorf("send %s to %s: %w", cmd.Endpoint, deviceId, err)
 	}
 	p.app.log.Debugf("observer: sent %s to %s (%s)", cmd.Endpoint, deviceId, deviceName)
+	if cmd.Endpoint == "set_shuffling_context" {
+		// issue #39 spike instrumentation: capture the FULL outgoing envelope
+		// (command-level, not per-poll) so on-device testing can pin down
+		// Spotify's real smart-shuffle encoding and the key it echoes back.
+		p.app.log.Debugf("observer: set_shuffling_context envelope to %s (%s): %s", deviceId, deviceName, string(body))
+	}
 	return nil
 }
 
