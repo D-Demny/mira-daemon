@@ -360,10 +360,10 @@ type ApiRequestDataSaved struct {
 	Saved bool   `json:"saved"`
 }
 
-// ApiRequestDataShuffle is the payload of a set_shuffling_context command: the
-// plain shuffle state plus an optional smart-shuffle flag (issue #39). Smart is
-// nil when the client omitted the field, in which case the daemon sends the
-// legacy bare-bool connect command unchanged.
+// ApiRequestDataShuffle is the payload of a set_options shuffle command: the
+// plain shuffle state plus an optional smart-shuffle flag (issue #39). Smart
+// is nil when the client omitted the field, which maps to plain shuffle
+// (modes.context_enhancement="NONE") instead of smart.
 type ApiRequestDataShuffle struct {
 	Shuffle bool  `json:"shuffle_context"`
 	Smart   *bool `json:"smart_shuffle,omitempty"`
