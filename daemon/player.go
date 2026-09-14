@@ -389,6 +389,7 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 		VolumeDisabled:        volumeDisabled,
 		VolumeSteps:           volumeSteps,
 		ShuffleContext:        ps.Options != nil && ps.Options.ShufflingContext,
+		SmartShuffle:          deriveSmartShuffle(ps.Options),
 		RepeatContext:         ps.Options != nil && ps.Options.RepeatingContext,
 		RepeatTrack:           ps.Options != nil && ps.Options.RepeatingTrack,
 		DisallowSkipPrev:      ps.Restrictions != nil && len(ps.Restrictions.DisallowSkippingPrevReasons) > 0,
@@ -403,6 +404,35 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 	rs.ReceivedAtWallMs = now.UnixMilli()
 	rs.Position = rs.RemotePosition()
 	return rs
+}
+
+// smartShuffleModeKeys are candidate keys inside ContextPlayerOptions.Modes
+// that may carry the smart-shuffle flag. The exact key name is unverified
+// (on-device spike pending, issue #39), so we probe in priority order: the
+// first PRESENT key decides, and it counts as on only for "true"/"1".
+var smartShuffleModeKeys = []string{"smart_shuffle", "smartShuffle", "SMART_SHUFFLE"}
+
+// deriveSmartShuffle reads the smart-shuffle flag from the Connect state.
+// The proto has no explicit smart-shuffle field, so this probes the Modes
+// map defensively and falls back to false when nothing plausible is found.
+func deriveSmartShuffle(options *connectpb.ContextPlayerOptions) bool {
+	if options == nil || len(options.Modes) == 0 {
+		return false
+	}
+	for _, key := range smartShuffleModeKeys {
+		val, ok := options.Modes[key]
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "true", "1":
+			return true
+		default:
+			// first present key is authoritative even when it says off
+			return false
+		}
+	}
+	return false
 }
 
 const clockSyncedFlag = "/run/clock_synced"
@@ -439,6 +469,11 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 	p.noteClusterTiming(rs)
 	if dev, ok := cluster.Device[rs.DeviceId]; ok {
 		rs.DeviceName = p.deviceDisplayName(rs.DeviceId, dev)
+		// issue #39: Modes map says smart shuffle but the active device
+		// doesn't advertise the capability — note it for the on-device spike
+		if rs.SmartShuffle && dev.Capabilities != nil && !dev.Capabilities.SupportsSmartShuffleMode {
+			p.app.log.Debugf("cluster: smart shuffle active on %q but device does not advertise supports_smart_shuffle_mode", rs.DeviceId)
+		}
 	}
 	track := cluster.PlayerState.Track
 	if prev := p.state.remoteState; prev != nil && prev.TrackUri == rs.TrackUri {
@@ -1258,6 +1293,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			"volume_disabled":   rs.VolumeDisabled,
 			"volume_steps":      rs.VolumeSteps,
 			"shuffle":           rs.ShuffleContext,
+			"smart_shuffle":     rs.SmartShuffle,
 			"repeat_context":    rs.RepeatContext,
 			"repeat_track":      rs.RepeatTrack,
 			"disallow_prev":     rs.DisallowSkipPrev,
