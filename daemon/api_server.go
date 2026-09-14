@@ -360,6 +360,15 @@ type ApiRequestDataSaved struct {
 	Saved bool   `json:"saved"`
 }
 
+// ApiRequestDataShuffle is the payload of a set_shuffling_context command: the
+// plain shuffle state plus an optional smart-shuffle flag (issue #39). Smart is
+// nil when the client omitted the field, in which case the daemon sends the
+// legacy bare-bool connect command unchanged.
+type ApiRequestDataShuffle struct {
+	Shuffle bool  `json:"shuffle_context"`
+	Smart   *bool `json:"smart_shuffle,omitempty"`
+}
+
 type apiResponse struct {
 	data any
 	err  error
@@ -1484,14 +1493,15 @@ func (s *ConcreteApiServer) serve() {
 		}
 
 		var data struct {
-			Shuffle bool `json:"shuffle_context"`
+			Shuffle bool  `json:"shuffle_context"`
+			Smart   *bool `json:"smart_shuffle,omitempty"`
 		}
 		if err := jsonDecode(r, &data); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
-		s.handleRequest(ApiRequest{Type: ApiRequestTypeSetShufflingContext, Data: data.Shuffle}, w)
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeSetShufflingContext, Data: ApiRequestDataShuffle{Shuffle: data.Shuffle, Smart: data.Smart}}, w)
 	})
 	m.HandleFunc("/player/add_to_queue", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {

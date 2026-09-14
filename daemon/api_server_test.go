@@ -586,9 +586,138 @@ func TestPlayerShuffleContext_BodyShapeDispatchesBool(t *testing.T) {
 	if got, want := req.Type, ApiRequestTypeSetShufflingContext; got != want {
 		t.Errorf("Type: got %q want %q", got, want)
 	}
-	if got, want := req.Data.(bool), true; got != want {
-		t.Errorf("Data: got %v want %v", got, want)
+	data, ok := req.Data.(ApiRequestDataShuffle)
+	if !ok {
+		t.Fatalf("Data type: got %T want ApiRequestDataShuffle", req.Data)
 	}
+	if got, want := data.Shuffle, true; got != want {
+		t.Errorf("Shuffle: got %v want %v", got, want)
+	}
+	// absent smart_shuffle must stay nil so the handler keeps the legacy bare-bool wire shape
+	if data.Smart != nil {
+		t.Errorf("Smart: got %v want nil for absent field", *data.Smart)
+	}
+}
+
+func TestPlayerShuffleContext_SmartFlagDispatchVariants(t *testing.T) {
+	t.Parallel()
+
+	yes := true
+	no := false
+	cases := []struct {
+		name    string
+		body    string
+		shuffle bool
+		smart   *bool
+	}{
+		{"smart_true", `{"shuffle_context": true, "smart_shuffle": true}`, true, &yes},
+		{"smart_false_explicit", `{"shuffle_context": false, "smart_shuffle": false}`, false, &no},
+		{"smart_absent_stays_nil", `{"shuffle_context": false}`, false, nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv, base := newTestApiServer(t)
+			srv.SetPlayerReady(true)
+			captured := drainOne(t, srv, nil, nil)
+
+			body := strings.NewReader(tc.body)
+			resp, err := testClient.Post(base+"/player/shuffle_context", "application/json", body)
+			if err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("status: got %d want 200", resp.StatusCode)
+			}
+			req := <-captured
+			if got, want := req.Type, ApiRequestTypeSetShufflingContext; got != want {
+				t.Errorf("Type: got %q want %q", got, want)
+			}
+			data, ok := req.Data.(ApiRequestDataShuffle)
+			if !ok {
+				t.Fatalf("Data type: got %T want ApiRequestDataShuffle", req.Data)
+			}
+			if data.Shuffle != tc.shuffle {
+				t.Errorf("Shuffle: got %v want %v", data.Shuffle, tc.shuffle)
+			}
+			if (data.Smart == nil) != (tc.smart == nil) {
+				t.Errorf("Smart presence: got %v want %v", data.Smart, tc.smart)
+			} else if tc.smart != nil && *data.Smart != *tc.smart {
+				t.Errorf("Smart: got %v want %v", *data.Smart, *tc.smart)
+			}
+		})
+	}
+}
+
+func TestPlayerShuffleContext_MalformedBodyReturnsBadRequest(t *testing.T) {
+	t.Parallel()
+
+	srv, base := newTestApiServer(t)
+	srv.SetPlayerReady(true)
+
+	body := strings.NewReader(`{"shuffle_context":`)
+	resp, err := testClient.Post(base+"/player/shuffle_context", "application/json", body)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("malformed body: got %d want 400", resp.StatusCode)
+	}
+}
+
+func TestBuildShuffleCommand_WireShape(t *testing.T) {
+	t.Parallel()
+
+	// legacy: no smart flag -> value stays the bare bool, wire-identical to the
+	// pre-issue-39 envelope
+	legacy := buildShuffleCommand(ApiRequestDataShuffle{Shuffle: true})
+	if got, want := legacy.Value, true; !boolValue(got) || got != want {
+		t.Errorf("legacy Value: got %v (%T) want bare bool %v", got, got, want)
+	}
+
+	// smart flag present -> value becomes the best-guess JSON object carrying
+	// both keys under "value" in the command envelope
+	yes := true
+	cmd := buildShuffleCommand(ApiRequestDataShuffle{Shuffle: true, Smart: &yes})
+	envBody, err := json.Marshal(connectCommandEnvelope{Command: cmd})
+	if err != nil {
+		t.Fatalf("Marshal envelope: %v", err)
+	}
+	var decoded struct {
+		Command struct {
+			Value struct {
+				ShuffleContext bool `json:"shuffle_context"`
+				SmartShuffle   bool `json:"smart_shuffle"`
+			} `json:"value"`
+		} `json:"command"`
+	}
+	if err := json.Unmarshal(envBody, &decoded); err != nil {
+		t.Fatalf("Unmarshal envelope: %v", err)
+	}
+	if !decoded.Command.Value.ShuffleContext || !decoded.Command.Value.SmartShuffle {
+		t.Errorf("smart value object: got %+v want both true", decoded.Command.Value)
+	}
+
+	// explicit smart_shuffle:false must STILL produce the object (presence,
+	// not truthiness, is what switches the wire shape)
+	no := false
+	cmdFalse := buildShuffleCommand(ApiRequestDataShuffle{Shuffle: true, Smart: &no})
+	if _, isObj := cmdFalse.Value.(connectShuffleValue); !isObj {
+		t.Errorf("explicit smart=false Value type: got %T want connectShuffleValue", cmdFalse.Value)
+	}
+}
+
+// boolValue reports whether v is a (non-pointer) bool, distinguishing the
+// legacy bare-bool wire shape from the smart object.
+func boolValue(v any) bool {
+	_, ok := v.(bool)
+	return ok
 }
 
 func TestPlayerPlay_EmptyUriRejected(t *testing.T) {
