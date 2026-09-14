@@ -674,50 +674,60 @@ func TestPlayerShuffleContext_MalformedBodyReturnsBadRequest(t *testing.T) {
 func TestBuildShuffleCommand_WireShape(t *testing.T) {
 	t.Parallel()
 
-	// legacy: no smart flag -> value stays the bare bool, wire-identical to the
-	// pre-issue-39 envelope
-	legacy := buildShuffleCommand(ApiRequestDataShuffle{Shuffle: true})
-	if got, want := legacy.Value, true; !boolValue(got) || got != want {
-		t.Errorf("legacy Value: got %v (%T) want bare bool %v", got, got, want)
+	// issue #39 (verified wire protocol): set_options with shuffling_context
+	// + modes as siblings of "endpoint" inside the command object; both fields
+	// always present.
+	boolTrue := true
+	boolFalse := false
+	tests := []struct {
+		name        string
+		data        ApiRequestDataShuffle
+		shuffling   bool
+		enhancement string
+	}{
+		{"off", ApiRequestDataShuffle{Shuffle: false}, false, "NONE"},
+		{"plain_on_no_smart_flag", ApiRequestDataShuffle{Shuffle: true}, true, "NONE"},
+		{"plain_on_explicit_smart_false", ApiRequestDataShuffle{Shuffle: true, Smart: &boolFalse}, true, "NONE"},
+		{"smart_on", ApiRequestDataShuffle{Shuffle: true, Smart: &boolTrue}, true, "RECOMMENDATION"},
 	}
-
-	// smart flag present -> value becomes the best-guess JSON object carrying
-	// both keys under "value" in the command envelope
-	yes := true
-	cmd := buildShuffleCommand(ApiRequestDataShuffle{Shuffle: true, Smart: &yes})
-	envBody, err := json.Marshal(connectCommandEnvelope{Command: cmd})
-	if err != nil {
-		t.Fatalf("Marshal envelope: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := buildShuffleCommand(tt.data)
+			if cmd.Endpoint != "set_options" {
+				t.Fatalf("Endpoint: got %q want set_options", cmd.Endpoint)
+			}
+			envBody, err := json.Marshal(connectCommandEnvelope{Command: cmd})
+			if err != nil {
+				t.Fatalf("Marshal envelope: %v", err)
+			}
+			var decoded struct {
+				Command struct {
+					ShufflingContext *bool             `json:"shuffling_context"`
+					Modes            map[string]string `json:"modes"`
+				} `json:"command"`
+			}
+			if err := json.Unmarshal(envBody, &decoded); err != nil {
+				t.Fatalf("Unmarshal envelope: %v", err)
+			}
+			var raw map[string]any
+			if err := json.Unmarshal(envBody, &raw); err != nil {
+				t.Fatalf("Unmarshal raw: %v", err)
+			}
+			cmdObj, _ := raw["command"].(map[string]any)
+			if _, ok := cmdObj["shuffling_context"]; !ok {
+				t.Errorf("envelope %s: shuffling_context missing (must always be present): %s", tt.name, envBody)
+			}
+			if _, ok := cmdObj["modes"]; !ok {
+				t.Errorf("envelope %s: modes missing (must always be present): %s", tt.name, envBody)
+			}
+			if decoded.Command.ShufflingContext == nil || *decoded.Command.ShufflingContext != tt.shuffling {
+				t.Errorf("shuffling_context: got %v want %v", decoded.Command.ShufflingContext, tt.shuffling)
+			}
+			if got := decoded.Command.Modes["context_enhancement"]; got != tt.enhancement {
+				t.Errorf("modes.context_enhancement: got %q want %q", got, tt.enhancement)
+			}
+		})
 	}
-	var decoded struct {
-		Command struct {
-			Value struct {
-				ShuffleContext bool `json:"shuffle_context"`
-				SmartShuffle   bool `json:"smart_shuffle"`
-			} `json:"value"`
-		} `json:"command"`
-	}
-	if err := json.Unmarshal(envBody, &decoded); err != nil {
-		t.Fatalf("Unmarshal envelope: %v", err)
-	}
-	if !decoded.Command.Value.ShuffleContext || !decoded.Command.Value.SmartShuffle {
-		t.Errorf("smart value object: got %+v want both true", decoded.Command.Value)
-	}
-
-	// explicit smart_shuffle:false must STILL produce the object (presence,
-	// not truthiness, is what switches the wire shape)
-	no := false
-	cmdFalse := buildShuffleCommand(ApiRequestDataShuffle{Shuffle: true, Smart: &no})
-	if _, isObj := cmdFalse.Value.(connectShuffleValue); !isObj {
-		t.Errorf("explicit smart=false Value type: got %T want connectShuffleValue", cmdFalse.Value)
-	}
-}
-
-// boolValue reports whether v is a (non-pointer) bool, distinguishing the
-// legacy bare-bool wire shape from the smart object.
-func boolValue(v any) bool {
-	_, ok := v.(bool)
-	return ok
 }
 
 func TestPlayerPlay_EmptyUriRejected(t *testing.T) {
