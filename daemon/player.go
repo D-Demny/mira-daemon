@@ -406,33 +406,23 @@ func clusterToRemoteState(cluster *connectpb.Cluster) *RemoteState {
 	return rs
 }
 
-// smartShuffleModeKeys are candidate keys inside ContextPlayerOptions.Modes
-// that may carry the smart-shuffle flag. The exact key name is unverified
-// (on-device spike pending, issue #39), so we probe in priority order: the
-// first PRESENT key decides, and it counts as on only for "true"/"1".
-var smartShuffleModeKeys = []string{"smart_shuffle", "smartShuffle", "SMART_SHUFFLE"}
+// smartShuffleModeKey is the authoritative key inside
+// ContextPlayerOptions.Modes carrying the smart-shuffle state. Wire fact from
+// issue #39 (verified against a live capture of an active smart-shuffle
+// state and the write-side set_options command): while smart shuffle is ON
+// the desktop client publishes modes={context_enhancement:"RECOMMENDATION",
+// jam:"off"}; with it off the same key reads "NONE".
+const smartShuffleModeKey = "context_enhancement"
 
 // deriveSmartShuffle reads the smart-shuffle flag from the Connect state.
-// The proto has no explicit smart-shuffle field, so this probes the Modes
-// map defensively and falls back to false when nothing plausible is found.
+// Only options.Modes["context_enhancement"] == "RECOMMENDATION" counts as on;
+// anything else — "NONE", another value, an absent key, or no Modes map at
+// all — means off.
 func deriveSmartShuffle(options *connectpb.ContextPlayerOptions) bool {
-	if options == nil || len(options.Modes) == 0 {
+	if options == nil {
 		return false
 	}
-	for _, key := range smartShuffleModeKeys {
-		val, ok := options.Modes[key]
-		if !ok {
-			continue
-		}
-		switch strings.ToLower(strings.TrimSpace(val)) {
-		case "true", "1":
-			return true
-		default:
-			// first present key is authoritative even when it says off
-			return false
-		}
-	}
-	return false
+	return options.Modes[smartShuffleModeKey] == "RECOMMENDATION"
 }
 
 const clockSyncedFlag = "/run/clock_synced"
@@ -1513,6 +1503,11 @@ type connectCommand struct {
 	PlayOrigin    *connectOrigin     `json:"play_origin,omitempty"`
 	LoggingParams *connectLogging    `json:"logging_params,omitempty"`
 	Track         *connectQueueTrack `json:"track,omitempty"`
+	// set_options fields (issue #39, verified wire protocol): siblings of
+	// "endpoint" inside the command object, cf. SetOptionsRequest proto
+	// (shuffling_context=3, modes=7 map<string,string>).
+	ShufflingContext *bool             `json:"shuffling_context,omitempty"`
+	Modes            map[string]string `json:"modes,omitempty"`
 }
 
 type connectQueueTrack struct {
@@ -1544,16 +1539,6 @@ type connectOffset struct {
 
 type connectPlayerOptionsOverride struct {
 	ShufflingContext *bool `json:"shuffling_context,omitempty"`
-}
-
-// connectShuffleValue is the best-guess wire encoding of a shuffle command
-// that also carries a smart-shuffle flag (issue #39). The Connect protocol
-// exposes no documented field for smart shuffle yet, so on-device
-// verification (see the set_shuffling_context envelope debug log) must pin
-// down the real shape; until then both flags ship as one JSON object in "value".
-type connectShuffleValue struct {
-	ShuffleContext bool `json:"shuffle_context"`
-	SmartShuffle   bool `json:"smart_shuffle"`
 }
 
 type connectSkipTo struct {
@@ -1625,17 +1610,33 @@ func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
 	return cmd
 }
 
-// buildShuffleCommand assembles the connect set_shuffling_context command.
+// buildShuffleCommand assembles the connect set_options command for the
+// shuffle state (issue #39, verified wire protocol from the official Linux
+// client bundle + production spotiplay — NOT the legacy set_shuffling_context
+// endpoint, which 400s). Both fields are ALWAYS present so the receiver never
+// has to guess which half of the state the sender is talking about:
+//
+//	state        shuffling_context  modes.context_enhancement
+//	off          false              "NONE"
+//	plain on     true               "NONE"
+//	smart on     true               "RECOMMENDATION"
+//
 // Pure function of the request data so the wire contract stays unit-testable
-// without a live cluster (issue #39). When Smart is nil the value stays the
-// legacy bare bool; when present it becomes a {shuffle_context, smart_shuffle}
-// object — best-guess encoding, see connectShuffleValue.
+// without a live cluster.
 func buildShuffleCommand(data ApiRequestDataShuffle) connectCommand {
-	var value any = data.Shuffle
-	if data.Smart != nil {
-		value = connectShuffleValue{ShuffleContext: data.Shuffle, SmartShuffle: *data.Smart}
+	shuffling := false
+	enhancement := "NONE"
+	if data.Shuffle {
+		shuffling = true
+		if data.Smart != nil && *data.Smart {
+			enhancement = "RECOMMENDATION"
+		}
 	}
-	return connectCommand{Endpoint: "set_shuffling_context", Value: value}
+	return connectCommand{
+		Endpoint:         "set_options",
+		ShufflingContext: &shuffling,
+		Modes:            map[string]string{smartShuffleModeKey: enhancement},
+	}
 }
 
 // sendActiveDeviceCommand sends to the active device in the user's cluster
@@ -1669,11 +1670,10 @@ func (p *AppPlayer) sendDeviceCommand(ctx context.Context, deviceId, deviceName 
 		return fmt.Errorf("send %s to %s: %w", cmd.Endpoint, deviceId, err)
 	}
 	p.app.log.Debugf("observer: sent %s to %s (%s)", cmd.Endpoint, deviceId, deviceName)
-	if cmd.Endpoint == "set_shuffling_context" {
-		// issue #39 spike instrumentation: capture the FULL outgoing envelope
-		// (command-level, not per-poll) so on-device testing can pin down
-		// Spotify's real smart-shuffle encoding and the key it echoes back.
-		p.app.log.Debugf("observer: set_shuffling_context envelope to %s (%s): %s", deviceId, deviceName, string(body))
+	if cmd.Endpoint == "set_options" {
+		// issue #39 instrumentation: log the full outgoing shuffle envelope
+		// (command-level, not per-poll) for on-device correlation.
+		p.app.log.Debugf("observer: set_options shuffle envelope to %s (%s): %s", deviceId, deviceName, string(body))
 	}
 	return nil
 }
