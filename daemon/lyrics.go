@@ -1079,11 +1079,9 @@ func (t *tertiaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*Lyri
 		return nil, fmt.Errorf("parsing lrclib response: %w", err)
 	}
 
+	// issue mira-ui#31: an instrumental flag is a "no lyrics" answer, not content — return the standard miss so callers/clients see 404 + negative cache.
 	if lrcResp.Instrumental {
-		return &LyricsResult{
-			SyncType: "UNSYNCED",
-			Lines:    []LyricsLine{{StartTimeMs: "0", Words: "♪ Instrumental ♪"}},
-		}, nil
+		return nil, fmt.Errorf("lrclib: track flagged instrumental, no lyrics: %w", ErrNoLyrics)
 	}
 
 	if lrcResp.SyncedLyrics != "" {
