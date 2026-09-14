@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -288,6 +289,40 @@ func TestFetchLyrics_SecondaryFailsFallsBackToLRCLIB(t *testing.T) {
 	}
 	if result.Lines[0].Words != "LRC line one" {
 		t.Errorf("expected LRCLIB content; got Lines[0]=%q", result.Lines[0].Words)
+	}
+}
+
+// issue mira-ui#31: the lrclib instrumental flag is a "no lyrics" answer, not content
+func TestFetchLyrics_LRCLIBInstrumentalIsErrNoLyrics(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "token.get") {
+			_, _ = w.Write([]byte(`{"message":{"header":{"status_code":200},"body":{"user_token":"t"}}}`))
+			return
+		}
+		_, _ = w.Write(noSyncedLyricsResponse()) // secondary: definitively nothing
+	}))
+	t.Cleanup(srv.Close)
+
+	lrc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"instrumental": true,
+			"syncedLyrics": "",
+			"plainLyrics": ""
+		}`))
+	}))
+	t.Cleanup(lrc.Close)
+
+	sec := newTestSecondaryProviderHTTP()
+	sec.tokenURL = srv.URL + "/token.get"
+	sec.subtitleURL = srv.URL + "/macro.subtitles.get"
+	ter := newTestTertiaryProviderHTTP()
+	ter.url = lrc.URL
+	lp := newTestOrchestrator(sec, ter)
+
+	if _, err := lp.FetchLyrics(context.Background(), "track-instr", "X", "Y", "", 60_000, false); !errors.Is(err, ErrNoLyrics) {
+		t.Fatalf("FetchLyrics: got %v, want ErrNoLyrics for instrumental flag", err)
 	}
 }
 
