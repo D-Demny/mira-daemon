@@ -156,7 +156,7 @@ func TestProjectQueue_RotatedImageKeysMapArtwork(t *testing.T) {
 		{Uri: "spotify:track:c", Metadata: map[string]string{"image_large_url": "spotify:image:ccc"}},
 		{Uri: "spotify:track:d", Metadata: map[string]string{"image_small_url": "spotify:image:ddd"}},
 		{Uri: "spotify:track:e", Metadata: map[string]string{"image_url": ""}}, // empty stays empty
-		{Uri: "spotify:track:f"},                                               // nil metadata
+		{Uri: "spotify:track:f"}, // nil metadata
 	}
 
 	got := projectQueue(tracks, 10)

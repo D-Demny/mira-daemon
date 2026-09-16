@@ -1060,9 +1060,9 @@ func TestWebApiPlaylistsResponse_JSONShape(t *testing.T) {
 	}
 	var ui struct {
 		Items []struct {
-			ID            string `json:"id"`
-			Name          string `json:"name"`
-			Owner         struct {
+			ID    string `json:"id"`
+			Name  string `json:"name"`
+			Owner struct {
 				DisplayName string `json:"display_name"`
 			} `json:"owner"`
 			Images []struct {

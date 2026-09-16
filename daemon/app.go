@@ -841,14 +841,14 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 	appPlayer.prefetchTimer.Stop()
 
 	if appPlayer.sess, err = session.NewSessionFromOptions(ctx, &session.Options{
-		Log:         app.log,
-		DeviceType:  app.deviceType,
-		DeviceId:    app.deviceId,
-		ClientToken: app.clientToken,
-		Resolver:    app.resolver,
-		Client:      app.client,
-		AppState:    app.state,
-		Credentials: creds,
+		Log:               app.log,
+		DeviceType:        app.deviceType,
+		DeviceId:          app.deviceId,
+		ClientToken:       app.clientToken,
+		Resolver:          app.resolver,
+		Client:            app.client,
+		AppState:          app.state,
+		Credentials:       creds,
 		PersistedOAuth:    &app.state.OAuth,
 		OAuthTokenChanged: app.onOAuthTokenChanged,
 		AuthURLCallback: func(url string) {

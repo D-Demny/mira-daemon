@@ -340,10 +340,10 @@ type ApiRequestPlayOffset struct {
 }
 
 type ApiRequestDataPlay struct {
-	Uri       string             `json:"uri"`
-	SkipToUri string             `json:"skip_to_uri"`
-	Paused    bool               `json:"paused"`
-	Shuffle   *bool              `json:"shuffle,omitempty"`
+	Uri       string                `json:"uri"`
+	SkipToUri string                `json:"skip_to_uri"`
+	Paused    bool                  `json:"paused"`
+	Shuffle   *bool                 `json:"shuffle,omitempty"`
 	Offset    *ApiRequestPlayOffset `json:"offset,omitempty"`
 }
 
@@ -719,7 +719,7 @@ func (s *ConcreteApiServer) getSettingsHandler() SettingsHandler {
 }
 
 const (
-	haApiPrefix   = "/ha-api/"
+	haApiPrefix    = "/ha-api/"
 	haProxyTimeout = 8 * time.Second
 )
 
