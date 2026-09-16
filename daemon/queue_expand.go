@@ -49,10 +49,23 @@ func expandableContextUri(uri string) string {
 	if strings.HasPrefix(uri, "spotify:playlist:") {
 		return uri
 	}
-	if uri == "spotify:collection:tracks" {
+	if isLikedCollectionUri(uri) {
 		return uri
 	}
 	return ""
+}
+
+// isLikedCollectionUri matches the liked-songs collection in both of its
+// uri forms: the bare pseudo id the UI requests with, and the user-specific
+// `spotify:user:<id>:collection:tracks` form issue #56 plays through (and
+// the Connect state echo may report). Both hold the same saved-tracks list,
+// which queueExpandPage already pages via fetchLibraryTracks for any
+// non-playlist uri.
+func isLikedCollectionUri(uri string) bool {
+	if uri == likedCollectionUri {
+		return true
+	}
+	return strings.HasPrefix(uri, "spotify:user:") && strings.HasSuffix(uri, ":collection:tracks")
 }
 
 // expandQueue replaces the short Connect preview in rs.NextTracks with the

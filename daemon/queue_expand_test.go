@@ -189,6 +189,10 @@ func TestExpandableContextUri(t *testing.T) {
 	}{
 		{"spotify:playlist:abc123", "spotify:playlist:abc123"},
 		{"spotify:collection:tracks", "spotify:collection:tracks"},
+		// issue #56: the user-specific form played through (and possibly
+		// echoed by connect) must expand like the bare pseudo id
+		{"spotify:user:abc123:collection:tracks", "spotify:user:abc123:collection:tracks"},
+		{"spotify:user:abc123:collection:podcasts", ""},
 		{"spotify:album:abc", ""},
 		{"spotify:track:abc", ""},
 		{"spotify:artist:abc", ""},
@@ -418,6 +422,50 @@ func TestPruneQueueExpandCache(t *testing.T) {
 		if _, ok := cache[fmt.Sprintf("fresh-%d", i)]; ok {
 			t.Errorf("prune: the oldest fresh entry %d survived", i)
 		}
+	}
+}
+
+// issue #56: liked songs now play through spotify:user:<id>:collection:tracks;
+// the connect state echo reports that user-specific context uri, and queue
+// expansion must still trigger off it (invariant b).
+func TestExpandQueue_UserCollectionLikedSongsStillExpands(t *testing.T) {
+	t.Parallel()
+
+	const ctxUri = "spotify:user:user123:collection:tracks"
+	var fetchedFor string
+	p := newTestQueueExpandPlayer(t)
+	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int) ([]any, int, error) {
+		fetchedFor = uri
+		return []any{
+			map[string]any{"is_local": false, "track": map[string]any{"id": "t00", "name": "A", "uri": "spotify:track:t00"}},
+			map[string]any{"is_local": false, "track": map[string]any{"id": "t01", "name": "B", "uri": "spotify:track:t01"}},
+		}, 2, nil
+	}
+
+	rs := &RemoteState{
+		TrackUri:   "spotify:track:t00",
+		ContextUri: ctxUri,
+		NextTracks: []QueueTrack{{Uri: "spotify:track:t01", TrackId: "t01"}},
+	}
+	p.expandQueue(rs)
+
+	select {
+	case res := <-p.queueExpandedCh:
+		if fetchedFor != ctxUri {
+			t.Errorf("fetch keyed off %q, want the echoed user-collection uri %q", fetchedFor, ctxUri)
+		}
+		if len(res.list) != 2 || res.total != 2 {
+			t.Errorf("result: got %d tracks (total %d), want 2 (2)", len(res.list), res.total)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no queue expansion result for the user-collection liked-songs context")
+	}
+
+	// the run loop re-applies the landed cache entry: preview replaced by the
+	// derived upcoming queue (t01)
+	p.expandQueue(rs)
+	if len(rs.NextTracks) != 1 || rs.NextTracks[0].Uri != "spotify:track:t01" {
+		t.Errorf("re-apply: got %+v, want [spotify:track:t01]", rs.NextTracks)
 	}
 }
 

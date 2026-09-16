@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -511,6 +512,71 @@ func TestPlayerPlayCommand_OffsetUriBecomesSkipTo(t *testing.T) {
 	}
 	if got := buildPlayCommand(dataPosOnly).Options.SkipTo.TrackUri; got != "" {
 		t.Errorf("skip_to.track_uri without offset uri: got %q want empty", got)
+	}
+}
+
+// fakeJwt builds a three-segment JWT with the given payload claims (no real
+// signature needed — jwtSubClaim only reads the payload segment)
+func fakeJwt(claims map[string]any) string {
+	b, _ := json.Marshal(claims)
+	return "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString(b) + ".c2ln"
+}
+
+func TestJwtSubClaim(t *testing.T) {
+	t.Parallel()
+
+	if got := jwtSubClaim(fakeJwt(map[string]any{"sub": "abcdef123", "exp": 1893456000})); got != "abcdef123" {
+		t.Errorf("sub claim: got %q want abcdef123", got)
+	}
+	if got := jwtSubClaim(fakeJwt(map[string]any{"exp": 1893456000})); got != "" {
+		t.Errorf("missing sub: got %q want empty", got)
+	}
+	if got := jwtSubClaim("not-a-jwt"); got != "" {
+		t.Errorf("non-jwt: got %q want empty", got)
+	}
+	bad := "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString([]byte("{nope")) + ".c2ln"
+	if got := jwtSubClaim(bad); got != "" {
+		t.Errorf("undecodable payload: got %q want empty", got)
+	}
+}
+
+func TestResolvePlayContextUri(t *testing.T) {
+	t.Parallel()
+
+	p := &AppPlayer{app: &App{
+		log:   &librespot.NullLogger{},
+		state: &librespot.AppState{OAuth: librespot.OAuthState{AccessToken: fakeJwt(map[string]any{"sub": "user123"})}},
+	}}
+
+	// issue #56: the bare liked-songs pseudo id resolves to the user-specific
+	// collection uri the Connect receiver can actually start ...
+	got := p.resolvePlayContextUri(likedCollectionUri)
+	if want := "spotify:user:user123:collection:tracks"; got != want {
+		t.Fatalf("liked songs: got %q want %q", got, want)
+	}
+	// ... and the play envelope carries it as the connect context
+	cmd := buildPlayCommand(ApiRequestDataPlay{Uri: got, SkipToUri: "spotify:track:abc"})
+	if cmd.Context.Uri != got || cmd.Context.Url != "context://"+got {
+		t.Errorf("envelope context: got uri=%q url=%q, want %q", cmd.Context.Uri, cmd.Context.Url, got)
+	}
+
+	// every other context passes through unchanged (byte-for-byte envelope
+	// for real playlists + all other contexts, invariant of the #56 fix)
+	for _, uri := range []string{
+		"spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+		"spotify:album:abc123",
+		"spotify:track:xyz789",
+		"spotify:artist:abc456",
+	} {
+		if res := p.resolvePlayContextUri(uri); res != uri {
+			t.Errorf("passthrough %q: got %q", uri, res)
+		}
+	}
+
+	// no OAuth token (e.g. static-token mode): keep the legacy behavior
+	pNoAuth := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: &librespot.AppState{}}}
+	if got := pNoAuth.resolvePlayContextUri(likedCollectionUri); got != likedCollectionUri {
+		t.Errorf("no account id: got %q want the bare pseudo context (legacy)", got)
 	}
 }
 
