@@ -490,11 +490,19 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 			rs.TrackUri, rs.RemotePosition(), rs.PositionAsOfTimestamp, rs.Timestamp, rs.IsPlaying)
 	}
 
-	// Fill in any cached artist/album for the queue entries
+	// Fill in any cached artist/album for the queue entries (issue #50:
+	// cover art for the first-N cards too — see applyArtBackfill). The art
+	// pass runs first so a card missing both text and cover lands in
+	// artNext: it gets batched for text AND gets the web api fallback when
+	// the batch carries no image (Connect sparse metadata is exactly that).
 	if p.queueResolver != nil {
+		artNext := p.queueResolver.applyArtBackfill(rs.NextTracks, true)
 		needNext := p.queueResolver.applyCache(rs.NextTracks)
 		needPrev := p.queueResolver.applyCache(rs.PrevTracks)
-		p.queueResolver.ResolveAsync(append(needNext, needPrev...))
+		fetch := append(append(append([]string{}, needNext...), needPrev...), artNext...)
+		if len(fetch) > 0 {
+			p.queueResolver.ResolveAsync(fetch, artNext)
+		}
 	}
 
 	// Resolve artist and album from track metadata or spclient.
@@ -930,6 +938,20 @@ func (p *AppPlayer) resolveViaWebApi(ctx context.Context, spotId librespot.Spoti
 	p.app.log.Debugf("observer: web api metadata for %s: name=%q artist=%q, album=%q",
 		spotId.Uri(), meta.name, meta.artist, meta.album)
 	return meta
+}
+
+// issue #50: the queue backfill only needs the album cover, not full track
+// metadata — this is the webArt hook handed to the queueResolver. It reuses
+// resolveViaWebApi (the same /v1/tracks path the active track falls back
+// to), so no new endpoint or token handling is involved. A uri that does not
+// parse as a track id yields no cover, same as a web api failure: empty stays
+// empty, no error propagation into the background pass.
+func (p *AppPlayer) queueWebArt(ctx context.Context, uri string) string {
+	spotId, err := librespot.SpotifyIdFromUri(uri)
+	if err != nil || spotId == nil {
+		return ""
+	}
+	return p.resolveViaWebApi(ctx, *spotId).imageUrl
 }
 
 const (
@@ -1868,7 +1890,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	})
 	p.app.log.Infof("lyrics provider initialized")
 
-	p.queueResolver = newQueueResolver(p.app.log, p.sess.Spclient(), p.queueResolvedCh)
+	p.queueResolver = newQueueResolver(p.app.log, p.sess.Spclient(), p.queueResolvedCh, p.app.cfg.ImageSize, p.queueWebArt)
 	p.metaResolvedCh = make(chan resolvedTrackMeta, 4)
 
 	apRecv := p.sess.Accesspoint().Receive(ap.PacketTypeProductInfo, ap.PacketTypeCountryCode)
@@ -1982,6 +2004,11 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 				updated.PrevTracks = append([]QueueTrack(nil), rs.PrevTracks...)
 				p.queueResolver.applyCache(updated.NextTracks)
 				p.queueResolver.applyCache(updated.PrevTracks)
+				// issue #50: newly resolved covers land in the cache too — apply
+				// them to the first-N cards (schedule=false: everything here was
+				// already scheduled in updateRemoteState, re-scheduling would
+				// just leak stale pending markers)
+				p.queueResolver.applyArtBackfill(updated.NextTracks, false)
 				updated.Position = updated.RemotePosition()
 				p.state.remoteState = &updated
 				p.app.server.Emit(&ApiEvent{
