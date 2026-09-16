@@ -17,6 +17,8 @@ func TestAppState_JSONRoundtripAllFields(t *testing.T) {
 		EventManager:            json.RawMessage(`{"foo":"bar"}`),
 		LastVolume:              &vol,
 		LastBluetoothPanAddress: "AA:BB:CC:DD:EE:FF",
+		OAuth:                   OAuthState{AccessToken: "opaque-token", RefreshToken: "rt-1"},
+		AccountID:               "cached-user-id",
 	}
 	original.Credentials.Username = "user@example.com"
 	original.Credentials.Data = []byte{0x01, 0x02, 0x03}
@@ -48,6 +50,26 @@ func TestAppState_JSONRoundtripAllFields(t *testing.T) {
 	}
 	if got, want := restored.LastBluetoothPanAddress, original.LastBluetoothPanAddress; got != want {
 		t.Errorf("LastBluetoothPanAddress: got %q want %q", got, want)
+	}
+	if got, want := restored.OAuth.AccessToken, original.OAuth.AccessToken; got != want {
+		t.Errorf("OAuth.AccessToken: got %q want %q", got, want)
+	}
+	if got, want := restored.AccountID, original.AccountID; got != want {
+		t.Errorf("AccountID: got %q want %q", got, want)
+	}
+}
+
+func TestAppState_AccountIDMissingInOlderShape(t *testing.T) {
+	t.Parallel()
+
+	olderJSON := `{"device_id": "device-pre-upgrade", "oauth": {"access_token": "opaque"}}`
+
+	var restored AppState
+	if err := json.Unmarshal([]byte(olderJSON), &restored); err != nil {
+		t.Fatalf("Unmarshal of older shape failed: %v", err)
+	}
+	if got := restored.AccountID; got != "" {
+		t.Errorf("AccountID: got %q, want empty string for state written before fix #2", got)
 	}
 }
 

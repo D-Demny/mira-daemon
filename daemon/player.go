@@ -84,6 +84,11 @@ type AppPlayer struct {
 	// swappable in tests (nil = the real (*AppPlayer).queueExpandPage)
 	queueExpandPageFn func(ctx context.Context, contextUri string, offset, limit int) ([]any, int, error)
 
+	// issue #56 fix #2: swappable in tests (nil = the real
+	// (*AppPlayer).webApiMeAccountID) — the one-shot /v1/me lookup that
+	// derives the account id behind the liked-songs collection
+	webMeAccountFn func(ctx context.Context) string
+
 	// async artist/album resolution
 	metaResolvedCh       chan resolvedTrackMeta
 	metaResolveInFlight  string
@@ -1641,35 +1646,122 @@ func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
 // nothing, while every other context (real playlists) carries a resolvable
 // public uri. Each account's liked songs also exist as the user-specific
 // public collection `spotify:user:<userId>:collection:tracks`, which IS
-// resolvable; the id comes from the `sub` claim of the Web API OAuth access
-// token (a JWT) the session already holds — no new endpoint or token.
+// resolvable; the id comes from the Web API GET /v1/me (issue #56 fix #2 —
+// the device-flow access token is opaque, so there is no JWT sub claim to
+// read), cached in the persisted app state.
 
 // resolvePlayContextUri replaces the bare liked-songs pseudo context with
 // the resolvable user-specific collection uri right before the play command
 // envelope is built. Every other context passes through unchanged, and a
-// pseudo id without a known account id keeps the legacy behavior (that mode
-// cannot start liked songs today either — no regression).
+// pseudo id without a resolvable account id keeps the legacy behavior (that
+// mode cannot start liked songs today either — no regression).
 func (p *AppPlayer) resolvePlayContextUri(uri string) string {
 	if uri != likedCollectionUri {
 		return uri
 	}
 	id := p.spotifyAccountId()
 	if id == "" {
-		p.app.log.Warnf("play: liked-songs context unresolvable (no account id in the OAuth token); sending the bare pseudo context")
+		p.app.log.Warnf("play: liked-songs context unresolvable (no account id via web api /v1/me or the OAuth token); sending the bare pseudo context")
 		return uri
 	}
 	return "spotify:user:" + id + ":collection:tracks"
 }
 
-// spotifyAccountId decodes the Spotify account id from the `sub` claim of
-// the Web API OAuth access token held by the app state. No signature
-// verification is needed: the token comes from our own authenticated
-// session, not from user input.
+// likedSongsMeTimeout caps the one-shot /v1/me account-id lookup (issue #56
+// fix #2) — opportunistic work on the play path, same bound as the queue art
+// backfill's web api lookups.
+const likedSongsMeTimeout = 3 * time.Second
+
+// spotifyAccountId resolves the Spotify account id of the paired user.
+// Resolution order (issue #56 fix #2):
+//  1. the cached/persisted account id (set below once, survives restarts)
+//  2. one bounded Web API GET /v1/me with the same token the library and
+//     cover-art lookups already use successfully — the device-flow token is
+//     opaque so nothing can be decoded from it locally; on success the id is
+//     cached + persisted
+//  3. the JWT `sub` claim of the access token (secondary fallback for tokens
+//     that are still JWTs)
 func (p *AppPlayer) spotifyAccountId() string {
+	if id := p.cachedAccountID(); id != "" {
+		return id
+	}
+
+	fetch := p.webMeAccountFn
+	if fetch == nil {
+		fetch = p.webApiMeAccountID
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), likedSongsMeTimeout)
+	id := fetch(ctx)
+	cancel()
+	if id != "" {
+		p.setAccountID(id) // cache + persist for the next play and restart
+		return id
+	}
+
+	// secondary fallback: tokens that are still JWTs (older auth paths)
 	p.app.state.Lock()
 	token := p.app.state.OAuth.AccessToken
 	p.app.state.Unlock()
 	return jwtSubClaim(token)
+}
+
+// cachedAccountID returns the persisted account id or "" when it has not
+// been resolved yet (fresh install, or state written before fix #2)
+func (p *AppPlayer) cachedAccountID() string {
+	p.app.state.Lock()
+	id := p.app.state.AccountID
+	p.app.state.Unlock()
+	return id
+}
+
+// setAccountID caches + persists the resolved account id so the /v1/me
+// lookup happens at most once per paired account. House pattern: mutate
+// under the state lock, persist outside it (cf. onOAuthTokenChanged).
+func (p *AppPlayer) setAccountID(id string) {
+	p.app.state.Lock()
+	p.app.state.AccountID = id
+	p.app.state.Unlock()
+	if err := p.app.persistState(); err != nil {
+		p.app.log.Warnf("play: failed to persist the liked-songs account id: %v", err)
+	}
+}
+
+// webApiMeAccountID performs one Web API GET /v1/me with the session's OAuth
+// token (the same opaque device-flow token the library and cover-art lookups
+// already succeed with) and returns the account id from the response. No new
+// endpoint or token is involved: only our own session token is sent, and only
+// the `id` of our own account is ever read.
+func (p *AppPlayer) webApiMeAccountID(ctx context.Context) string {
+	if p.sess == nil {
+		return ""
+	}
+	p.app.state.Lock()
+	token := p.app.state.OAuth.AccessToken
+	p.app.state.Unlock()
+	if token == "" {
+		return ""
+	}
+
+	resp, err := p.sess.WebApi(ctx, "GET", "/v1/me", nil, nil, nil)
+	if err != nil {
+		p.app.log.Debugf("play: web api /v1/me failed: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		p.app.log.Debugf("play: web api /v1/me returned status %d", resp.StatusCode)
+		return ""
+	}
+
+	var me struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&me); err != nil {
+		p.app.log.Debugf("play: web api /v1/me decode failed: %v", err)
+		return ""
+	}
+	return me.ID
 }
 
 // jwtSubClaim extracts the `sub` claim from a three-segment JWT payload.
