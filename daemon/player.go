@@ -96,9 +96,22 @@ type AppPlayer struct {
 	accountIDResolverRunning atomic.Bool
 
 	// issue #56 fix #4: pacing of the background resolver, swappable in tests
-	// (zero values = the production defaults below)
+	// (zero values = the production defaults below). Kept for compatibility
+	// with the fix-#4 shape; precedence under fix #5: a non-zero
+	// accountIDMaxAttempts still hard-caps the attempt count, and
+	// accountIDRetryDelay is honored as the initial delay fallback when
+	// accountIDInitialDelay is unset.
 	accountIDMaxAttempts int
 	accountIDRetryDelay  time.Duration
+
+	// issue #56 fix #5: duration-budget pacing of the background resolver,
+	// swappable in tests (zero values = the production defaults below). The
+	// budget replaces the legacy attempt cap as the primary bound of the loop;
+	// the retry delay doubles after every consecutive failure, starting at
+	// accountIDInitialDelay and capped by accountIDMaxDelay.
+	accountIDBudget       time.Duration
+	accountIDInitialDelay time.Duration
+	accountIDMaxDelay     time.Duration
 
 	// async artist/album resolution
 	metaResolvedCh       chan resolvedTrackMeta
@@ -1470,9 +1483,16 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if data.Uri == "" {
 			return nil, fmt.Errorf("play requires a context uri")
 		}
-		// issue #56: replace the bare liked-songs pseudo context with the
-		// resolvable user-specific collection uri before it leaves the envelope
-		data.Uri = p.resolvePlayContextUri(data.Uri)
+		// issue #56 fix #2: replace the bare liked-songs pseudo context with
+		// the resolvable user-specific collection uri before it leaves the
+		// envelope; fix #5: while it is still unresolvable, refuse the play —
+		// the bare pseudo context is a dead context on a Connect receiver and
+		// starts nothing (the original #56 symptom)
+		uri, err := p.preparePlayContext(data)
+		if err != nil {
+			return nil, err
+		}
+		data.Uri = uri
 		p.transferIfNeeded(ctx)
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
@@ -1663,19 +1683,36 @@ func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
 
 // resolvePlayContextUri replaces the bare liked-songs pseudo context with
 // the resolvable user-specific collection uri right before the play command
-// envelope is built. Every other context passes through unchanged, and a
-// pseudo id without a resolvable account id keeps the legacy behavior (that
-// mode cannot start liked songs today either — no regression).
+// envelope is built. Every other context passes through unchanged; a pseudo
+// id without a resolvable account id comes back as the bare pseudo uri and it
+// is up to the caller (preparePlayContext) to decide what to do with that.
 func (p *AppPlayer) resolvePlayContextUri(uri string) string {
 	if uri != likedCollectionUri {
 		return uri
 	}
 	id := p.spotifyAccountId()
 	if id == "" {
-		p.app.log.Warnf("play: liked-songs context unresolvable (no account id via web api /v1/me or the OAuth token); sending the bare pseudo context")
+		p.app.log.Debugf("play: liked-songs context unresolved (no account id via web api /v1/me or the OAuth token)")
 		return uri
 	}
 	return "spotify:user:" + id + ":collection:tracks"
+}
+
+// issue #56 fix #5: the play path's choke point for the liked-songs context.
+// Resolves the bare pseudo id to the user-specific collection uri when an
+// account id is available; while it is still unresolvable it refuses the play
+// instead of letting the bare pseudo context leave the envelope — that dead
+// context starts nothing on a Connect receiver (the original #56 symptom).
+// The background account-id resolver keeps retrying /v1/me, so the next play
+// after it lands carries the real collection uri. Every other context passes
+// through byte-for-byte.
+func (p *AppPlayer) preparePlayContext(data ApiRequestDataPlay) (string, error) {
+	data.Uri = p.resolvePlayContextUri(data.Uri)
+	if data.Uri != likedCollectionUri {
+		return data.Uri, nil
+	}
+	p.app.log.Warnf("play: liked-songs context unresolved — background account-id resolver still retrying, skipping playback")
+	return "", fmt.Errorf("liked songs context not resolved yet (background account-id resolver is still retrying)")
 }
 
 // likedSongsMeTimeout caps the one-shot /v1/me account-id lookup (issue #56
@@ -1775,28 +1812,35 @@ func (p *AppPlayer) webApiMeAccountID(ctx context.Context) string {
 	return me.ID
 }
 
-// issue #56 fix #4: pacing of the background account-id resolver. During a
-// Spotify rate-limit window the play path's ~3s /v1/me call deterministically
-// times out (spclient's 429 backoffs are 37-40s each, 5 retries max, a ~7s
-// burst — always longer than the deadline), so the id never persists and every
-// liked-songs play falls back to the bare pseudo context. The resolver below
-// moves that work out of the play path: one generous deadline per attempt (it
-// covers a full retry burst) plus a slow, capped retry loop in the background.
+// issue #56 fix #4 + fix #5: pacing of the background account-id resolver.
+// During a Spotify rate-limit window the play path's ~3s /v1/me call
+// deterministically times out (spclient's 429 backoffs are 37-40s each, 5
+// retries max, a ~7s burst — always longer than the deadline), so the id never
+// persists and every liked-songs play is skipped (fix #5) until an attempt
+// lands after the window closes. The resolver below moves that work out of the
+// play path: one generous deadline per attempt (it covers a full retry burst),
+// a retry delay that doubles per consecutive failure (30s start, 5min cap),
+// and — because chronic rate-limiting can outlast any fixed attempt count —
+// a wall-clock budget instead of the old 20-attempt hard cap (fix #5).
 const (
-	accountIDAttemptTimeout     = 20 * time.Second // > spclient's ~7s worst-case retry burst
-	defaultAccountIDMaxAttempts = 20               // hard cap on /v1/me attempts per run
-	defaultAccountIDRetryDelay  = 30 * time.Second // between attempts, straddles the 429 backoff window
+	accountIDAttemptTimeout      = 20 * time.Second // > spclient's ~7s worst-case retry burst
+	defaultAccountIDBudget       = 24 * time.Hour   // fix #5: wall-clock budget per resolver run (replaces the fix-#4 20-attempt cap)
+	defaultAccountIDInitialDelay = 30 * time.Second // fix #5: first retry delay, doubles per consecutive failure
+	accountIDMaxRetryDelay       = 5 * time.Minute  // fix #5: cap on the doubling retry delay
 )
 
 // resolveAccountIDInBackground fetches the Spotify account id so the play path
-// hits its cache (issue #56 fix #4). Each attempt gets a 20s deadline — long
-// enough for spclient's worst-case ~7s 429 retry burst to finish — and failed
-// attempts are retried every 30s until the id is persisted or the cap is hit.
-// Single-flight: app start (Run) and an OAuth re-pair (onOAuthTokenChanged)
-// may both trigger it, but the guard lets only one loop run; it resets when the
-// loop ends so a later trigger can start again. stop wakes the retry delay at
-// shutdown / player teardown; the loop also exits on the first successful fetch
-// and whenever the id is already cached.
+// hits its cache (issue #56 fix #4, budgeted by fix #5). Each attempt gets a
+// 20s deadline — long enough for spclient's worst-case ~7s 429 retry burst to
+// finish. Failed attempts are retried until the id is persisted: the retry
+// delay doubles per consecutive failure (30s start, 5min cap) inside a
+// wall-clock budget (default 24h); a non-zero legacy attempt cap
+// (accountIDMaxAttempts) still stops the loop as well, whichever bound comes
+// first. Single-flight: app start (Run) and an OAuth re-pair
+// (onOAuthTokenChanged) may both trigger it, but the guard lets only one loop
+// run; it resets when the loop ends so a later trigger can start again. stop
+// wakes the retry delay at shutdown / player teardown; the loop also exits on
+// the first successful fetch and whenever the id is already cached.
 func (p *AppPlayer) resolveAccountIDInBackground(stop <-chan struct{}) {
 	if !p.accountIDResolverRunning.CompareAndSwap(false, true) {
 		return // another loop is already running
@@ -1807,16 +1851,45 @@ func (p *AppPlayer) resolveAccountIDInBackground(stop <-chan struct{}) {
 	if fetch == nil {
 		fetch = p.webApiMeAccountID
 	}
-	maxAttempts := p.accountIDMaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = defaultAccountIDMaxAttempts
+
+	// fix #5: the budget is the primary bound; the legacy attempt cap (fix #4
+	// shape, set only by tests/callers) still applies when non-zero.
+	budget := p.accountIDBudget
+	if budget <= 0 {
+		budget = defaultAccountIDBudget
 	}
-	retryDelay := p.accountIDRetryDelay
-	if retryDelay <= 0 {
-		retryDelay = defaultAccountIDRetryDelay
+	maxAttempts := p.accountIDMaxAttempts
+
+	initialDelay := p.accountIDInitialDelay
+	if initialDelay <= 0 {
+		initialDelay = p.accountIDRetryDelay // fix #4 fallback
+	}
+	if initialDelay <= 0 {
+		initialDelay = defaultAccountIDInitialDelay
+	}
+	maxDelay := p.accountIDMaxDelay
+	if maxDelay <= 0 {
+		maxDelay = accountIDMaxRetryDelay
 	}
 
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	start := time.Now()
+	delay := initialDelay
+	attempt := 0
+	for {
+		gaveUp := ""
+		switch {
+		case maxAttempts > 0 && attempt >= maxAttempts:
+			gaveUp = "attempt cap"
+		case !time.Now().Before(start.Add(budget)):
+			gaveUp = "budget exhausted"
+		}
+		if gaveUp != "" {
+			p.app.log.Warnf("play: background account-id resolution gave up after %d attempts (%s elapsed of the %s budget, %s) (rate limited?)",
+				attempt, time.Since(start).Round(time.Second), budget, gaveUp)
+			return
+		}
+		attempt++
+
 		if id := p.cachedAccountID(); id != "" {
 			return // resolved in the meantime (play path or an earlier run)
 		}
@@ -1830,16 +1903,23 @@ func (p *AppPlayer) resolveAccountIDInBackground(stop <-chan struct{}) {
 			return
 		}
 
-		if attempt == maxAttempts {
-			p.app.log.Warnf("play: background account-id resolution gave up after %d attempts (rate limited?)", maxAttempts)
-			return
+		if attempt%10 == 0 {
+			p.app.log.Infof("play: background account-id attempt %d failed, %s elapsed, retrying in %s",
+				attempt, time.Since(start).Round(time.Second), delay)
+		} else {
+			p.app.log.Debugf("play: background account-id attempt %d failed, retrying in %s", attempt, delay)
 		}
-		p.app.log.Debugf("play: background account-id attempt %d/%d failed, retrying in %s",
-			attempt, maxAttempts, retryDelay)
+
 		select {
 		case <-stop:
 			return
-		case <-time.After(retryDelay):
+		case <-time.After(delay):
+		}
+
+		// ramp the delay per consecutive failure, capped (fix #5)
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
 		}
 	}
 }
