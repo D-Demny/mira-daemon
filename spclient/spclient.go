@@ -192,16 +192,24 @@ func (c *Spclient) innerRequestWithToken(ctx context.Context, method string, req
 	return resp, nil
 }
 
+// webAPIBase is the Spotify Web API base (no /v1 — see webApiURL).
+var webAPIBase, _ = url.Parse("https://api.spotify.com/")
+
+// webApiURL joins a Web API request path onto webAPIBase with exactly one
+// leading v1 segment. Callers may pass the path with or without a leading
+// slash or v1 prefix ("me", "v1/me", "/v1/me"); all join to the same final
+// URL — issue #56 fix #3: "/v1/me" used to land on /v1/v1/me (410 Gone)
+// because the old "already has v1" guard missed paths with a leading slash.
+func webApiURL(path string) *url.URL {
+	p := strings.TrimPrefix(path, "/")
+	if p != "" && !strings.HasPrefix(p, "v1/") && p != "v1" {
+		p = "v1/" + p
+	}
+	return webAPIBase.JoinPath(p)
+}
+
 func (c *Spclient) WebApiRequest(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
-	reqPath, err := url.Parse("https://api.spotify.com/")
-	if err != nil {
-		panic("invalid api base url")
-	}
-	// Spotify Web API requires /v1/ prefix — only add if not already present
-	if path != "" && !strings.HasPrefix(path, "v1/") && path != "v1" {
-		path = "v1/" + path
-	}
-	reqURL := reqPath.JoinPath(path)
+	reqURL := webApiURL(path)
 	// Use OAuth token for Web API (has user scopes like playlist-read)
 	// instead of the Login5 token (Spotify Connect only, no user scopes)
 	// Fall back to Login5 token if OAuth token not available (e.g., BlobCredentials)
