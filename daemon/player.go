@@ -89,6 +89,17 @@ type AppPlayer struct {
 	// derives the account id behind the liked-songs collection
 	webMeAccountFn func(ctx context.Context) string
 
+	// issue #56 fix #4: single-flight guard for the background account-id
+	// resolver — app start and an OAuth re-pair may both trigger it, but only
+	// one loop runs per player; reset when the loop finishes so a later
+	// re-pair can start a fresh one
+	accountIDResolverRunning atomic.Bool
+
+	// issue #56 fix #4: pacing of the background resolver, swappable in tests
+	// (zero values = the production defaults below)
+	accountIDMaxAttempts int
+	accountIDRetryDelay  time.Duration
+
 	// async artist/album resolution
 	metaResolvedCh       chan resolvedTrackMeta
 	metaResolveInFlight  string
@@ -1764,6 +1775,75 @@ func (p *AppPlayer) webApiMeAccountID(ctx context.Context) string {
 	return me.ID
 }
 
+// issue #56 fix #4: pacing of the background account-id resolver. During a
+// Spotify rate-limit window the play path's ~3s /v1/me call deterministically
+// times out (spclient's 429 backoffs are 37-40s each, 5 retries max, a ~7s
+// burst — always longer than the deadline), so the id never persists and every
+// liked-songs play falls back to the bare pseudo context. The resolver below
+// moves that work out of the play path: one generous deadline per attempt (it
+// covers a full retry burst) plus a slow, capped retry loop in the background.
+const (
+	accountIDAttemptTimeout     = 20 * time.Second // > spclient's ~7s worst-case retry burst
+	defaultAccountIDMaxAttempts = 20               // hard cap on /v1/me attempts per run
+	defaultAccountIDRetryDelay  = 30 * time.Second // between attempts, straddles the 429 backoff window
+)
+
+// resolveAccountIDInBackground fetches the Spotify account id so the play path
+// hits its cache (issue #56 fix #4). Each attempt gets a 20s deadline — long
+// enough for spclient's worst-case ~7s 429 retry burst to finish — and failed
+// attempts are retried every 30s until the id is persisted or the cap is hit.
+// Single-flight: app start (Run) and an OAuth re-pair (onOAuthTokenChanged)
+// may both trigger it, but the guard lets only one loop run; it resets when the
+// loop ends so a later trigger can start again. stop wakes the retry delay at
+// shutdown / player teardown; the loop also exits on the first successful fetch
+// and whenever the id is already cached.
+func (p *AppPlayer) resolveAccountIDInBackground(stop <-chan struct{}) {
+	if !p.accountIDResolverRunning.CompareAndSwap(false, true) {
+		return // another loop is already running
+	}
+	defer p.accountIDResolverRunning.Store(false)
+
+	fetch := p.webMeAccountFn
+	if fetch == nil {
+		fetch = p.webApiMeAccountID
+	}
+	maxAttempts := p.accountIDMaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultAccountIDMaxAttempts
+	}
+	retryDelay := p.accountIDRetryDelay
+	if retryDelay <= 0 {
+		retryDelay = defaultAccountIDRetryDelay
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if id := p.cachedAccountID(); id != "" {
+			return // resolved in the meantime (play path or an earlier run)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), accountIDAttemptTimeout)
+		id := fetch(ctx)
+		cancel()
+		if id != "" {
+			p.setAccountID(id)
+			p.app.log.Infof("play: persisted account id %s from web api /v1/me (background)", id)
+			return
+		}
+
+		if attempt == maxAttempts {
+			p.app.log.Warnf("play: background account-id resolution gave up after %d attempts (rate limited?)", maxAttempts)
+			return
+		}
+		p.app.log.Debugf("play: background account-id attempt %d/%d failed, retrying in %s",
+			attempt, maxAttempts, retryDelay)
+		select {
+		case <-stop:
+			return
+		case <-time.After(retryDelay):
+		}
+	}
+}
+
 // jwtSubClaim extracts the `sub` claim from a three-segment JWT payload.
 // Returns "" for anything that is not a decodable JWT with a string sub.
 func jwtSubClaim(token string) string {
@@ -2036,6 +2116,13 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	// expose ourselves to app level actions
 	p.app.currentPlayer.Store(p)
 	defer p.app.currentPlayer.CompareAndSwap(p, nil)
+
+	// issue #56 fix #4: under Spotify rate limiting the play path's ~3s /v1/me
+	// call times out before spclient's 429 backoff can finish, so fetch the
+	// account id in the background — liked-songs plays then hit the cache.
+	if p.cachedAccountID() == "" {
+		go p.resolveAccountIDInBackground(ctx.Done())
+	}
 
 	p.lyricsProvider = NewLyricsProvider(p.app.log, func(ctx context.Context, force bool) (string, error) {
 		return p.sess.Spclient().GetAccessToken(ctx, force)

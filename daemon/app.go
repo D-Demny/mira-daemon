@@ -79,6 +79,11 @@ type App struct {
 
 	retryNowCh chan struct{}
 
+	// issue #56 fix #4: closed in Close() — App has no context of its own, so
+	// this is the shutdown signal for the background account-id resolver that
+	// onOAuthTokenChanged starts (see resolveAccountIDInBackground)
+	accountIDStopCh chan struct{}
+
 	// pre-network attempt sits in DNS resolution for 20-30s. parking here until network is up dodges that
 	onlineMu sync.Mutex
 	isOnline bool
@@ -121,15 +126,16 @@ func New(opts *Options) (*App, error) {
 	}
 
 	app := &App{
-		log:        opts.Logger,
-		cfg:        opts.Config,
-		stateStore: opts.StateStore,
-		logoutCh:   make(chan *AppPlayer),
-		client:     &http.Client{Timeout: 30 * time.Second},
-		retryNowCh: make(chan struct{}, 1),
-		onlineCh:   make(chan struct{}),
-		hashes:     newHashStore(),
-		startedAt:  time.Now(),
+		log:             opts.Logger,
+		cfg:             opts.Config,
+		stateStore:      opts.StateStore,
+		logoutCh:        make(chan *AppPlayer),
+		client:          &http.Client{Timeout: 30 * time.Second},
+		retryNowCh:      make(chan struct{}, 1),
+		onlineCh:        make(chan struct{}),
+		accountIDStopCh: make(chan struct{}),
+		hashes:          newHashStore(),
+		startedAt:       time.Now(),
 	}
 
 	var err error
@@ -442,6 +448,10 @@ func (app *App) Close() error {
 	}
 	app.closed = true
 
+	// issue #56 fix #4: wake any sleeping background account-id resolver; the
+	// closed flag above guarantees this closes exactly once
+	close(app.accountIDStopCh)
+
 	if app.piRecovery != nil {
 		app.piRecovery.Stop()
 	}
@@ -476,15 +486,28 @@ func (app *App) onOAuthTokenChanged(oauth *librespot.OAuthState) {
 	// longer applies and is dropped so the next liked-songs play re-derives
 	// it via /v1/me. Routine hourly refreshes keep the same refresh token
 	// and leave the cache intact.
+	accountIDCleared := false
 	if app.state.OAuth.RefreshToken != "" &&
 		oauth.RefreshToken != "" &&
 		oauth.RefreshToken != app.state.OAuth.RefreshToken {
 		app.state.AccountID = ""
+		accountIDCleared = true
 	}
 	app.state.OAuth = *oauth
 	app.state.Unlock()
 	if err := app.persistState(); err != nil {
 		app.log.WithError(err).Warn("failed to persist OAuth tokens")
+	}
+
+	// issue #56 fix #4: a fresh pairing just dropped the cached account id —
+	// re-resolve it in the background so the next liked-songs play hits the
+	// cache instead of the ~3s /v1/me on the play path (which times out under
+	// Spotify rate limiting). The single-flight guard inside the resolver
+	// keeps this from racing a loop started at app start.
+	if accountIDCleared {
+		if player := app.currentPlayer.Load(); player != nil {
+			go player.resolveAccountIDInBackground(app.accountIDStopCh)
+		}
 	}
 }
 
