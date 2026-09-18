@@ -47,6 +47,13 @@ type AppState struct {
 	// OAuth holds the persisted Web API OAuth tokens (see OAuthState)
 	OAuth OAuthState `json:"oauth,omitempty"`
 
+	// AccountID caches the Spotify account id of the paired user, resolved
+	// once via the Web API GET /v1/me — the device-flow access token is
+	// opaque (no JWT sub claim), so the id cannot be derived from the token
+	// itself and must survive restarts for the liked-songs context
+	// resolution (issue #56, fix #2)
+	AccountID string `json:"account_id,omitempty"`
+
 	// last offset from the check in service
 	UtcOffsetMin *int `json:"utc_offset_min,omitempty"`
 

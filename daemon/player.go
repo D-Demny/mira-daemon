@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -82,6 +83,35 @@ type AppPlayer struct {
 	queueExpandedCh     chan queueExpandResult
 	// swappable in tests (nil = the real (*AppPlayer).queueExpandPage)
 	queueExpandPageFn func(ctx context.Context, contextUri string, offset, limit int) ([]any, int, error)
+
+	// issue #56 fix #2: swappable in tests (nil = the real
+	// (*AppPlayer).webApiMeAccountID) — the one-shot /v1/me lookup that
+	// derives the account id behind the liked-songs collection
+	webMeAccountFn func(ctx context.Context) string
+
+	// issue #56 fix #4: single-flight guard for the background account-id
+	// resolver — app start and an OAuth re-pair may both trigger it, but only
+	// one loop runs per player; reset when the loop finishes so a later
+	// re-pair can start a fresh one
+	accountIDResolverRunning atomic.Bool
+
+	// issue #56 fix #4: pacing of the background resolver, swappable in tests
+	// (zero values = the production defaults below). Kept for compatibility
+	// with the fix-#4 shape; precedence under fix #5: a non-zero
+	// accountIDMaxAttempts still hard-caps the attempt count, and
+	// accountIDRetryDelay is honored as the initial delay fallback when
+	// accountIDInitialDelay is unset.
+	accountIDMaxAttempts int
+	accountIDRetryDelay  time.Duration
+
+	// issue #56 fix #5: duration-budget pacing of the background resolver,
+	// swappable in tests (zero values = the production defaults below). The
+	// budget replaces the legacy attempt cap as the primary bound of the loop;
+	// the retry delay doubles after every consecutive failure, starting at
+	// accountIDInitialDelay and capped by accountIDMaxDelay.
+	accountIDBudget       time.Duration
+	accountIDInitialDelay time.Duration
+	accountIDMaxDelay     time.Duration
 
 	// async artist/album resolution
 	metaResolvedCh       chan resolvedTrackMeta
@@ -1453,6 +1483,16 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if data.Uri == "" {
 			return nil, fmt.Errorf("play requires a context uri")
 		}
+		// issue #56 fix #2: replace the bare liked-songs pseudo context with
+		// the resolvable user-specific collection uri before it leaves the
+		// envelope; fix #5: while it is still unresolvable, refuse the play —
+		// the bare pseudo context is a dead context on a Connect receiver and
+		// starts nothing (the original #56 symptom)
+		uri, err := p.preparePlayContext(data)
+		if err != nil {
+			return nil, err
+		}
+		data.Uri = uri
 		p.transferIfNeeded(ctx)
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
@@ -1630,6 +1670,278 @@ func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
 		cmd.Options.PlayerOptionsOverride.ShufflingContext = data.Shuffle
 	}
 	return cmd
+}
+
+// issue #56: the "Liked Songs" pseudo context id is not resolvable on a
+// Connect receiver — a bare `spotify:collection:tracks` play command starts
+// nothing, while every other context (real playlists) carries a resolvable
+// public uri. Each account's liked songs also exist as the user-specific
+// public collection `spotify:user:<userId>:collection:tracks`, which IS
+// resolvable; the id comes from the Web API GET /v1/me (issue #56 fix #2 —
+// the device-flow access token is opaque, so there is no JWT sub claim to
+// read), cached in the persisted app state.
+
+// resolvePlayContextUri replaces the bare liked-songs pseudo context with
+// the resolvable user-specific collection uri right before the play command
+// envelope is built. Every other context passes through unchanged; a pseudo
+// id without a resolvable account id comes back as the bare pseudo uri and it
+// is up to the caller (preparePlayContext) to decide what to do with that.
+func (p *AppPlayer) resolvePlayContextUri(uri string) string {
+	if uri != likedCollectionUri {
+		return uri
+	}
+	id := p.spotifyAccountId()
+	if id == "" {
+		p.app.log.Debugf("play: liked-songs context unresolved (no account id via web api /v1/me or the OAuth token)")
+		return uri
+	}
+	return "spotify:user:" + id + ":collection:tracks"
+}
+
+// issue #56 fix #5: the play path's choke point for the liked-songs context.
+// Resolves the bare pseudo id to the user-specific collection uri when an
+// account id is available; while it is still unresolvable it refuses the play
+// instead of letting the bare pseudo context leave the envelope — that dead
+// context starts nothing on a Connect receiver (the original #56 symptom).
+// The background account-id resolver keeps retrying /v1/me, so the next play
+// after it lands carries the real collection uri. Every other context passes
+// through byte-for-byte.
+func (p *AppPlayer) preparePlayContext(data ApiRequestDataPlay) (string, error) {
+	data.Uri = p.resolvePlayContextUri(data.Uri)
+	if data.Uri != likedCollectionUri {
+		return data.Uri, nil
+	}
+	p.app.log.Warnf("play: liked-songs context unresolved — background account-id resolver still retrying, skipping playback")
+	return "", fmt.Errorf("liked songs context not resolved yet (background account-id resolver is still retrying)")
+}
+
+// likedSongsMeTimeout caps the one-shot /v1/me account-id lookup (issue #56
+// fix #2) — opportunistic work on the play path, same bound as the queue art
+// backfill's web api lookups.
+const likedSongsMeTimeout = 3 * time.Second
+
+// spotifyAccountId resolves the Spotify account id of the paired user.
+// Resolution order (issue #56 fix #2):
+//  1. the cached/persisted account id (set below once, survives restarts)
+//  2. one bounded Web API GET /v1/me with the same token the library and
+//     cover-art lookups already use successfully — the device-flow token is
+//     opaque so nothing can be decoded from it locally; on success the id is
+//     cached + persisted
+//  3. the JWT `sub` claim of the access token (secondary fallback for tokens
+//     that are still JWTs)
+func (p *AppPlayer) spotifyAccountId() string {
+	if id := p.cachedAccountID(); id != "" {
+		return id
+	}
+
+	fetch := p.webMeAccountFn
+	if fetch == nil {
+		fetch = p.webApiMeAccountID
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), likedSongsMeTimeout)
+	id := fetch(ctx)
+	cancel()
+	if id != "" {
+		p.setAccountID(id) // cache + persist for the next play and restart
+		return id
+	}
+
+	// secondary fallback: tokens that are still JWTs (older auth paths)
+	p.app.state.Lock()
+	token := p.app.state.OAuth.AccessToken
+	p.app.state.Unlock()
+	return jwtSubClaim(token)
+}
+
+// cachedAccountID returns the persisted account id or "" when it has not
+// been resolved yet (fresh install, or state written before fix #2)
+func (p *AppPlayer) cachedAccountID() string {
+	p.app.state.Lock()
+	id := p.app.state.AccountID
+	p.app.state.Unlock()
+	return id
+}
+
+// setAccountID caches + persists the resolved account id so the /v1/me
+// lookup happens at most once per paired account. House pattern: mutate
+// under the state lock, persist outside it (cf. onOAuthTokenChanged).
+func (p *AppPlayer) setAccountID(id string) {
+	p.app.state.Lock()
+	p.app.state.AccountID = id
+	p.app.state.Unlock()
+	if err := p.app.persistState(); err != nil {
+		p.app.log.Warnf("play: failed to persist the liked-songs account id: %v", err)
+	}
+}
+
+// webApiMeAccountID performs one Web API GET /v1/me with the session's OAuth
+// token (the same opaque device-flow token the library and cover-art lookups
+// already succeed with) and returns the account id from the response. No new
+// endpoint or token is involved: only our own session token is sent, and only
+// the `id` of our own account is ever read.
+func (p *AppPlayer) webApiMeAccountID(ctx context.Context) string {
+	if p.sess == nil {
+		return ""
+	}
+	p.app.state.Lock()
+	token := p.app.state.OAuth.AccessToken
+	p.app.state.Unlock()
+	if token == "" {
+		return ""
+	}
+
+	resp, err := p.sess.WebApi(ctx, "GET", "/v1/me", nil, nil, nil)
+	if err != nil {
+		p.app.log.Debugf("play: web api /v1/me failed: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		p.app.log.Debugf("play: web api /v1/me returned status %d", resp.StatusCode)
+		return ""
+	}
+
+	var me struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&me); err != nil {
+		p.app.log.Debugf("play: web api /v1/me decode failed: %v", err)
+		return ""
+	}
+	return me.ID
+}
+
+// issue #56 fix #4 + fix #5: pacing of the background account-id resolver.
+// During a Spotify rate-limit window the play path's ~3s /v1/me call
+// deterministically times out (spclient's 429 backoffs are 37-40s each, 5
+// retries max, a ~7s burst — always longer than the deadline), so the id never
+// persists and every liked-songs play is skipped (fix #5) until an attempt
+// lands after the window closes. The resolver below moves that work out of the
+// play path: one generous deadline per attempt (it covers a full retry burst),
+// a retry delay that doubles per consecutive failure (30s start, 5min cap),
+// and — because chronic rate-limiting can outlast any fixed attempt count —
+// a wall-clock budget instead of the old 20-attempt hard cap (fix #5).
+const (
+	accountIDAttemptTimeout      = 20 * time.Second // > spclient's ~7s worst-case retry burst
+	defaultAccountIDBudget       = 24 * time.Hour   // fix #5: wall-clock budget per resolver run (replaces the fix-#4 20-attempt cap)
+	defaultAccountIDInitialDelay = 30 * time.Second // fix #5: first retry delay, doubles per consecutive failure
+	accountIDMaxRetryDelay       = 5 * time.Minute  // fix #5: cap on the doubling retry delay
+)
+
+// resolveAccountIDInBackground fetches the Spotify account id so the play path
+// hits its cache (issue #56 fix #4, budgeted by fix #5). Each attempt gets a
+// 20s deadline — long enough for spclient's worst-case ~7s 429 retry burst to
+// finish. Failed attempts are retried until the id is persisted: the retry
+// delay doubles per consecutive failure (30s start, 5min cap) inside a
+// wall-clock budget (default 24h); a non-zero legacy attempt cap
+// (accountIDMaxAttempts) still stops the loop as well, whichever bound comes
+// first. Single-flight: app start (Run) and an OAuth re-pair
+// (onOAuthTokenChanged) may both trigger it, but the guard lets only one loop
+// run; it resets when the loop ends so a later trigger can start again. stop
+// wakes the retry delay at shutdown / player teardown; the loop also exits on
+// the first successful fetch and whenever the id is already cached.
+func (p *AppPlayer) resolveAccountIDInBackground(stop <-chan struct{}) {
+	if !p.accountIDResolverRunning.CompareAndSwap(false, true) {
+		return // another loop is already running
+	}
+	defer p.accountIDResolverRunning.Store(false)
+
+	fetch := p.webMeAccountFn
+	if fetch == nil {
+		fetch = p.webApiMeAccountID
+	}
+
+	// fix #5: the budget is the primary bound; the legacy attempt cap (fix #4
+	// shape, set only by tests/callers) still applies when non-zero.
+	budget := p.accountIDBudget
+	if budget <= 0 {
+		budget = defaultAccountIDBudget
+	}
+	maxAttempts := p.accountIDMaxAttempts
+
+	initialDelay := p.accountIDInitialDelay
+	if initialDelay <= 0 {
+		initialDelay = p.accountIDRetryDelay // fix #4 fallback
+	}
+	if initialDelay <= 0 {
+		initialDelay = defaultAccountIDInitialDelay
+	}
+	maxDelay := p.accountIDMaxDelay
+	if maxDelay <= 0 {
+		maxDelay = accountIDMaxRetryDelay
+	}
+
+	start := time.Now()
+	delay := initialDelay
+	attempt := 0
+	for {
+		gaveUp := ""
+		switch {
+		case maxAttempts > 0 && attempt >= maxAttempts:
+			gaveUp = "attempt cap"
+		case !time.Now().Before(start.Add(budget)):
+			gaveUp = "budget exhausted"
+		}
+		if gaveUp != "" {
+			p.app.log.Warnf("play: background account-id resolution gave up after %d attempts (%s elapsed of the %s budget, %s) (rate limited?)",
+				attempt, time.Since(start).Round(time.Second), budget, gaveUp)
+			return
+		}
+		attempt++
+
+		if id := p.cachedAccountID(); id != "" {
+			return // resolved in the meantime (play path or an earlier run)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), accountIDAttemptTimeout)
+		id := fetch(ctx)
+		cancel()
+		if id != "" {
+			p.setAccountID(id)
+			p.app.log.Infof("play: persisted account id %s from web api /v1/me (background)", id)
+			return
+		}
+
+		if attempt%10 == 0 {
+			p.app.log.Infof("play: background account-id attempt %d failed, %s elapsed, retrying in %s",
+				attempt, time.Since(start).Round(time.Second), delay)
+		} else {
+			p.app.log.Debugf("play: background account-id attempt %d failed, retrying in %s", attempt, delay)
+		}
+
+		select {
+		case <-stop:
+			return
+		case <-time.After(delay):
+		}
+
+		// ramp the delay per consecutive failure, capped (fix #5)
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+}
+
+// jwtSubClaim extracts the `sub` claim from a three-segment JWT payload.
+// Returns "" for anything that is not a decodable JWT with a string sub.
+func jwtSubClaim(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.Sub
 }
 
 // buildShuffleCommand assembles the connect set_options command for the
@@ -1884,6 +2196,13 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	// expose ourselves to app level actions
 	p.app.currentPlayer.Store(p)
 	defer p.app.currentPlayer.CompareAndSwap(p, nil)
+
+	// issue #56 fix #4: under Spotify rate limiting the play path's ~3s /v1/me
+	// call times out before spclient's 429 backoff can finish, so fetch the
+	// account id in the background — liked-songs plays then hit the cache.
+	if p.cachedAccountID() == "" {
+		go p.resolveAccountIDInBackground(ctx.Done())
+	}
 
 	p.lyricsProvider = NewLyricsProvider(p.app.log, func(ctx context.Context, force bool) (string, error) {
 		return p.sess.Spclient().GetAccessToken(ctx, force)

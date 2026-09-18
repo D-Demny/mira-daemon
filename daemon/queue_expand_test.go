@@ -189,6 +189,10 @@ func TestExpandableContextUri(t *testing.T) {
 	}{
 		{"spotify:playlist:abc123", "spotify:playlist:abc123"},
 		{"spotify:collection:tracks", "spotify:collection:tracks"},
+		// issue #56: the user-specific form played through (and possibly
+		// echoed by connect) must expand like the bare pseudo id
+		{"spotify:user:abc123:collection:tracks", "spotify:user:abc123:collection:tracks"},
+		{"spotify:user:abc123:collection:podcasts", ""},
 		{"spotify:album:abc", ""},
 		{"spotify:track:abc", ""},
 		{"spotify:artist:abc", ""},
@@ -421,10 +425,105 @@ func TestPruneQueueExpandCache(t *testing.T) {
 	}
 }
 
+// issue #56: liked songs now play through spotify:user:<id>:collection:tracks;
+// the connect state echo reports that user-specific context uri, and queue
+// expansion must still trigger off it (invariant b).
+func TestExpandQueue_UserCollectionLikedSongsStillExpands(t *testing.T) {
+	t.Parallel()
+
+	const ctxUri = "spotify:user:user123:collection:tracks"
+	var fetchedFor string
+	p := newTestQueueExpandPlayer(t)
+	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int) ([]any, int, error) {
+		fetchedFor = uri
+		return []any{
+			map[string]any{"is_local": false, "track": map[string]any{"id": "t00", "name": "A", "uri": "spotify:track:t00"}},
+			map[string]any{"is_local": false, "track": map[string]any{"id": "t01", "name": "B", "uri": "spotify:track:t01"}},
+		}, 2, nil
+	}
+
+	rs := &RemoteState{
+		TrackUri:   "spotify:track:t00",
+		ContextUri: ctxUri,
+		NextTracks: []QueueTrack{{Uri: "spotify:track:t01", TrackId: "t01"}},
+	}
+	p.expandQueue(rs)
+
+	select {
+	case res := <-p.queueExpandedCh:
+		if fetchedFor != ctxUri {
+			t.Errorf("fetch keyed off %q, want the echoed user-collection uri %q", fetchedFor, ctxUri)
+		}
+		if len(res.list) != 2 || res.total != 2 {
+			t.Errorf("result: got %d tracks (total %d), want 2 (2)", len(res.list), res.total)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no queue expansion result for the user-collection liked-songs context")
+	}
+
+	// the run loop re-applies the landed cache entry: preview replaced by the
+	// derived upcoming queue (t01)
+	p.expandQueue(rs)
+	if len(rs.NextTracks) != 1 || rs.NextTracks[0].Uri != "spotify:track:t01" {
+		t.Errorf("re-apply: got %+v, want [spotify:track:t01]", rs.NextTracks)
+	}
+}
+
+// issue #56 fix #2 glue: the uri play-time resolution produces for liked
+// songs (a /v1/me account id folded into spotify:user:<id>:collection:tracks)
+// is exactly the form queue expansion keys off — the resolved context must
+// stay expandable end to end.
+func TestResolvedLikedSongsContextIsQueueExpandable(t *testing.T) {
+	t.Parallel()
+
+	me := &fakeMeFn{id: "user123"}
+	p := newTestQueueExpandPlayer(t)
+	p.webMeAccountFn = me.fn
+
+	resolved := p.resolvePlayContextUri(likedCollectionUri)
+	if want := "spotify:user:user123:collection:tracks"; resolved != want {
+		t.Fatalf("resolve: got %q want %q", resolved, want)
+	}
+	if got := expandableContextUri(resolved); got != resolved {
+		t.Fatalf("expandable: got %q, want the resolved uri %q to stay expandable", got, resolved)
+	}
+
+	var fetchedFor string
+	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int) ([]any, int, error) {
+		fetchedFor = uri
+		return []any{
+			map[string]any{"is_local": false, "track": map[string]any{"id": "t00", "name": "A", "uri": "spotify:track:t00"}},
+			map[string]any{"is_local": false, "track": map[string]any{"id": "t01", "name": "B", "uri": "spotify:track:t01"}},
+		}, 2, nil
+	}
+	rs := &RemoteState{
+		TrackUri:   "spotify:track:t00",
+		ContextUri: resolved,
+		NextTracks: []QueueTrack{{Uri: "spotify:track:t01", TrackId: "t01"}},
+	}
+	p.expandQueue(rs)
+
+	select {
+	case res := <-p.queueExpandedCh:
+		if fetchedFor != resolved {
+			t.Errorf("fetch keyed off %q, want the resolved uri %q", fetchedFor, resolved)
+		}
+		if len(res.list) != 2 || res.total != 2 {
+			t.Errorf("result: got %d tracks (total %d), want 2 (2)", len(res.list), res.total)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no queue expansion result for the resolved liked-songs context")
+	}
+
+	if n := me.calls.Load(); n != 1 {
+		t.Errorf("/v1/me looked up %d times, want exactly 1 (cached after the first resolve)", n)
+	}
+}
+
 func newTestQueueExpandPlayer(t *testing.T) *AppPlayer {
 	t.Helper()
 	return &AppPlayer{
-		app:                 &App{log: &librespot.NullLogger{}},
+		app:                 &App{log: &librespot.NullLogger{}, state: &librespot.AppState{}, stateStore: nopStateStore{}},
 		queueExpandCache:    make(map[string]queueExpandCacheEntry),
 		queueExpandInFlight: make(map[string]struct{}),
 		queueExpandedCh:     make(chan queueExpandResult, 1),

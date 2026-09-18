@@ -449,8 +449,8 @@ type recentsItem struct {
 	artists []any
 	images  []webApiImage
 	// the context the track was played from (album/playlist/...), when known
-	contextURI  string
-	albumName   string
+	contextURI string
+	albumName  string
 }
 
 // parseRecentsItem extracts the identity fields from one raw list entry.
@@ -602,7 +602,7 @@ func mapSavedTracksPage(data []byte, baseOffset int) ([]any, int, error) {
 			Me struct {
 				Library struct {
 					Tracks struct {
-						TotalCount int `json:"totalCount"`
+						TotalCount int   `json:"totalCount"`
 						Items      []any `json:"items"`
 					} `json:"tracks"`
 				} `json:"library"`
