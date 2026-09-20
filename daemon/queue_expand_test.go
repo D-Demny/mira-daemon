@@ -699,3 +699,57 @@ func TestExpandQueue_CacheMissFetchesAndApplies(t *testing.T) {
 		t.Errorf("re-apply: got %d upcoming entries, want the QueueLimit cap (%d)", len(rs.NextTracks), QueueLimit)
 	}
 }
+
+// issue #56 fix #8: the canonical Liked-Songs playlist id echoed by the
+// Connect state routes through the ordinary playlist fetch — same 100-per-page
+// paging as any other playlist, stopped at the 500-entry safety cap even when
+// the context claims more tracks.
+func TestQueueExpand_CanonicalLikedPlaylistPagesWithCap(t *testing.T) {
+	t.Parallel()
+
+	const claimedTotal = 1000 // the context claims more tracks than the cap allows
+	p := newTestQueueExpandPlayer(t)
+	var offsets []int
+	var routes []bool
+	p.queueExpandPageFn = func(_ context.Context, uri string, offset, limit int, asLibrary bool) ([]any, int, error) {
+		if uri != canonicalLikedPlaylistUri {
+			t.Errorf("page uri: got %q want the canonical Liked-Songs playlist id", uri)
+		}
+		offsets = append(offsets, offset)
+		routes = append(routes, asLibrary)
+		items := make([]any, 0, limit)
+		for i := 0; i < limit; i++ {
+			id := fmt.Sprintf("t%03d", offset+i)
+			items = append(items, map[string]any{
+				"is_local": false,
+				"track":    map[string]any{"id": id, "name": "A", "uri": "spotify:track:" + id},
+			})
+		}
+		return items, claimedTotal, nil
+	}
+
+	p.fetchQueueExpand(canonicalLikedPlaylistUri, false)
+
+	select {
+	case res := <-p.queueExpandedCh:
+		if len(res.list) != queueExpandMaxEntries {
+			t.Errorf("fetched %d entries, want the %d-entry safety cap", len(res.list), queueExpandMaxEntries)
+		}
+		if res.total != claimedTotal {
+			t.Errorf("result total: got %d want %d (the context's claimed length)", res.total, claimedTotal)
+		}
+		if want := []int{0, 100, 200, 300, 400}; fmt.Sprintf("%v", offsets) != fmt.Sprintf("%v", want) {
+			t.Errorf("page offsets: got %v want %v (queueExpandPageLimit per page up to the cap)", offsets, want)
+		}
+		for i, asLibrary := range routes {
+			if asLibrary {
+				t.Errorf("page %d routed to library tracks; the canonical id is a playlist", i)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no queue expansion result for the canonical liked playlist")
+	}
+	if p.likedViaUserForm.Load() {
+		t.Error("an unflagged canonical-echo session must not set the library-route flag")
+	}
+}

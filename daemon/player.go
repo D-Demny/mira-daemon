@@ -114,14 +114,15 @@ type AppPlayer struct {
 	accountIDInitialDelay time.Duration
 	accountIDMaxDelay     time.Duration
 
-	// issue #56 fix #7: escape hatch for the bare liked-songs pseudo context.
-	// The primary play path passes `spotify:collection:tracks` to the Connect
-	// receiver verbatim; if the receiver does not start anything — no active
-	// playback state change within likedPlayRetryDelay after the command was
-	// issued — handleLikedPlayRetry re-sends the same play with the resolved
-	// user-specific collection uri, once. All fields are touched only from
-	// the run loop (the armed timer lands on its own select case), so no
-	// locking is needed.
+	// issue #56 fix #7/#8: escape hatch for the liked-songs context. The
+	// primary play path sends Spotify's canonical Liked-Songs playlist id;
+	// if nothing actually starts — no POSITIVE active-state transition and no
+	// NEGATIVE clear observed, and still none when likedPlayRetryDelay has
+	// passed — handleLikedPlayRetry re-sends the play with the resolved
+	// user-specific collection uri, once. A positive transition disarms the
+	// pending retry, a negative clear fires it immediately (both via
+	// observeLikedRetryTransition on every state update). All fields are
+	// touched only from the run loop, so no locking is needed.
 	playRetryPending *playRetryPending
 	playRetryTimerCh <-chan time.Time
 
@@ -607,6 +608,11 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 		p.state.lastActiveDeviceId = rs.DeviceId
 		p.state.lastActiveDeviceName = rs.DeviceName
 	}
+
+	// issue #56 fix #8: an armed liked-songs escape hatch observes every
+	// active-state update — a positive transition disarms the pending retry,
+	// a negative clear fires it immediately.
+	p.observeLikedRetryTransition(ctx)
 
 	if v := p.app.voice; v != nil {
 		v.notifyPlayback(rs.IsPlaying && !rs.IsPaused)
@@ -1499,11 +1505,12 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		return nil, p.sendActiveDeviceVolume(ctx, target)
 
 	case ApiRequestTypePlay:
-		// tell the target device to start a context. issue #56: every context —
-		// including the bare liked-songs pseudo id — goes out verbatim (the
-		// primary wire contract; preparePlayContext/resolvePlayContextUri are
-		// kept for the escape hatch below, which repairs an ignored play after
-		// the fact instead of mutating or refusing it up front)
+		// tell the target device to start a context. issue #56 fix #8: the
+		// bare liked-songs pseudo id is NOT resolvable on a Connect receiver —
+		// the primary play sends Spotify's canonical Liked-Songs playlist id
+		// instead (the receiver resolves it per account); offset/skipTo pass
+		// through unchanged. The escape hatch below still repairs a liked play
+		// that starts nothing, with the user-specific collection uri.
 		data, _ := req.Data.(ApiRequestDataPlay)
 		if data.Uri == "" {
 			return nil, fmt.Errorf("play requires a context uri")
@@ -1513,7 +1520,12 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if targetId == "" {
 			return nil, fmt.Errorf("no target device for play")
 		}
-		cmd := buildPlayCommand(data)
+		isLiked := data.Uri == likedCollectionUri
+		sendData := data
+		if isLiked {
+			sendData.Uri = canonicalLikedPlaylistUri
+		}
+		cmd := buildPlayCommand(sendData)
 		shuf := "inherit"
 		if data.Shuffle != nil {
 			shuf = fmt.Sprintf("%v", *data.Shuffle)
@@ -1523,16 +1535,21 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if data.Offset != nil {
 			offsetStr = fmt.Sprintf(" offset={uri:%q pos:%d}", data.Offset.Uri, data.Offset.Position)
 		}
-		p.app.log.Infof("play: context=%s skipTo=%q shuffle=%s%s -> %s", data.Uri, data.SkipToUri, shuf, offsetStr, targetName)
+		reqStr := ""
+		if isLiked {
+			reqStr = fmt.Sprintf(" (requested %s)", likedCollectionUri)
+		}
+		p.app.log.Infof("play: context=%s%s skipTo=%q shuffle=%s%s -> %s", sendData.Uri, reqStr, data.SkipToUri, shuf, offsetStr, targetName)
 		if err := p.sendDeviceCommand(ctx, targetId, targetName, cmd); err != nil {
 			return nil, err
 		}
-		// issue #56 fix #7: every new play supersedes the previous session's
-		// escape-hatch state; a bare liked-songs play arms the one-shot retry
-		// (no active state change within likedPlayRetryDelay -> re-send with
-		// the resolved user-specific collection uri)
+		// issue #56 fix #7/#8: every new play supersedes the previous session's
+		// escape-hatch state; a liked-songs play arms the one-shot retry — the
+		// pending copy keeps the bare pseudo id as its retry source, which
+		// resolvePlayContextUri turns into the user-specific collection uri
+		// when the account id is known.
 		p.resetLikedSession()
-		if data.Uri == likedCollectionUri {
+		if isLiked {
 			p.armLikedPlayRetry(targetId, targetName, data)
 		}
 		return nil, nil
@@ -1707,6 +1724,14 @@ func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
 // the device-flow access token is opaque, so there is no JWT sub claim to
 // read), cached in the persisted app state.
 
+// canonicalLikedPlaylistUri is Spotify's public canonical "Liked Songs"
+// playlist id (issue #56 fix #8). Unlike the bare likedCollectionUri pseudo
+// id — which a Connect receiver cannot resolve at all — the receiver
+// resolves this real playlist per account, so the primary play path sends
+// it; the one-shot escape hatch falls back to the user-specific collection
+// uri only when nothing actually started.
+const canonicalLikedPlaylistUri = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"
+
 // resolvePlayContextUri replaces the bare liked-songs pseudo context with
 // the resolvable user-specific collection uri right before the play command
 // envelope is built. Every other context passes through unchanged; a pseudo
@@ -1748,11 +1773,12 @@ func (p *AppPlayer) preparePlayContext(data ApiRequestDataPlay) (string, error) 
 // healthy session; a dead context leaves the active state untouched.
 const likedPlayRetryDelay = 10 * time.Second
 
-// playRetryPending is the armed escape-hatch state of one issued play: the
-// command's target + payload plus a snapshot of the active playback state at
-// arm time. The retry fires only when that snapshot is unchanged — any state
-// movement means the receiver took the command (or the user did something
-// else) and the retry must not double-issue.
+// playRetryPending is the armed escape-hatch state of one issued liked-songs
+// play: the command's target + payload (with the bare pseudo id kept as the
+// retry source) plus a snapshot of the active playback state at arm time.
+// classifyLikedRetryTransition decides what each state movement means: a
+// POSITIVE transition disarms the retry, a NEGATIVE clear fires it
+// immediately, and an unchanged state defers the decision to the timer.
 type playRetryPending struct {
 	targetId      string
 	targetName    string
@@ -1797,11 +1823,71 @@ func (p *AppPlayer) armLikedPlayRetry(targetId, targetName string, data ApiReque
 	p.playRetryTimerCh = time.After(likedPlayRetryDelay)
 }
 
-// handleLikedPlayRetry is the armed retry's firing (run loop): re-send the
-// play with the resolved user-specific collection uri when — and only when —
-// the active state never moved after the command was issued. One shot: the
-// armed state is consumed by this call, so a second firing (or a firing after
-// a superseding play) is a no-op.
+// likedRetryOutcome classifies how the active playback state moved since the
+// liked-songs play command was issued (issue #56 fix #8).
+type likedRetryOutcome int
+
+const (
+	// likedRetryNoChange: the state is identical to the pre-snapshot — the
+	// receiver has acknowledged nothing so far; the armed timer decides.
+	likedRetryNoChange likedRetryOutcome = iota
+	// likedRetryNegative: the state moved into a cleared/stopped shape (empty
+	// track uri and not playing) — the receiver rejected the context; the
+	// user-form retry fires immediately.
+	likedRetryNegative
+	// likedRetryPositive: the state moved into any other shape (a track is
+	// active, playback started or resumed, the context switched) — the
+	// receiver took the command; the retry must not double-issue.
+	likedRetryPositive
+)
+
+// classifyLikedRetryTransition compares the current active state with the
+// pre-snapshot taken at arm time (issue #56 fix #8). Only a POSITIVE
+// transition (a non-empty track uri and/or playback running) suppresses the
+// escape-hatch retry; a NEGATIVE clear counts as "the receiver did not take
+// the command" and triggers it immediately, while an unchanged state defers
+// the decision to the timer.
+func classifyLikedRetryTransition(pd *playRetryPending, trackUri, contextUri string, playing bool) likedRetryOutcome {
+	if trackUri == pd.preTrackUri && contextUri == pd.preContextUri && playing == pd.preIsPlaying {
+		return likedRetryNoChange
+	}
+	if trackUri == "" && !playing {
+		return likedRetryNegative
+	}
+	return likedRetryPositive
+}
+
+// observeLikedRetryTransition feeds one active-state update into the armed
+// escape hatch (issue #56 fix #8): a POSITIVE transition disarms the pending
+// retry (the receiver took the command), a NEGATIVE clear fires the user-form
+// retry immediately instead of waiting for the timer, and an unchanged state
+// leaves the armed session untouched. Called from updateRemoteState — same
+// run loop as arm/handle, so no locking is needed.
+func (p *AppPlayer) observeLikedRetryTransition(ctx context.Context) {
+	pd := p.playRetryPending
+	if pd == nil {
+		return
+	}
+	trackUri, contextUri, playing := activePlaybackState(p)
+	switch classifyLikedRetryTransition(pd, trackUri, contextUri, playing) {
+	case likedRetryPositive:
+		p.playRetryPending = nil
+		p.playRetryTimerCh = nil
+		p.app.log.Debugf("play: liked-songs retry suppressed — playback started after the command")
+	case likedRetryNegative:
+		p.app.log.Debugf("play: liked-songs retry firing early — the receiver stopped or cleared the context")
+		p.handleLikedPlayRetry(ctx)
+	}
+}
+
+// handleLikedPlayRetry re-sends the play with the resolved user-specific
+// collection uri (issue #56 fix #7/#8). It runs either on the armed timer's
+// firing or directly from observeLikedRetryTransition when a negative clear
+// transition is observed. Either way it first classifies the current state:
+// if a POSITIVE transition happened in between (the receiver took the command
+// after all), the retry is suppressed so it never double-issues. One shot:
+// the armed state is consumed by this call, so a second firing — or a firing
+// after a superseding play — is a no-op.
 func (p *AppPlayer) handleLikedPlayRetry(ctx context.Context) {
 	p.playRetryTimerCh = nil
 	pd := p.playRetryPending
@@ -1811,10 +1897,13 @@ func (p *AppPlayer) handleLikedPlayRetry(ctx context.Context) {
 	p.playRetryPending = nil
 
 	trackUri, contextUri, playing := activePlaybackState(p)
-	if trackUri != pd.preTrackUri || contextUri != pd.preContextUri || playing != pd.preIsPlaying {
-		p.app.log.Debugf("play: liked-songs retry skipped — active state changed since the command")
+	if classifyLikedRetryTransition(pd, trackUri, contextUri, playing) == likedRetryPositive {
+		p.app.log.Debugf("play: liked-songs retry suppressed — the active state shows playback started")
 		return
 	}
+	// NoChange (timer path: nothing moved for the full window) or Negative
+	// (the receiver stopped/cleared): the context did not take, re-send with
+	// the resolved user-specific collection uri.
 
 	data := pd.data
 	data.Uri = p.resolvePlayContextUri(data.Uri)
@@ -1823,10 +1912,10 @@ func (p *AppPlayer) handleLikedPlayRetry(ctx context.Context) {
 		return
 	}
 
-	// the bare pseudo context started nothing; the user-specific collection
-	// is this session's real context. Queue expansion of this session must
-	// page library tracks even if the Connect state reports a playlist-shaped
-	// id for it (the daemon never pages a canonical playlist id on its behalf).
+	// the primary context started nothing; the user-specific collection is
+	// this session's real context. Queue expansion of this session must page
+	// library tracks even if the Connect state reports a playlist-shaped id
+	// for it (the daemon never pages a canonical playlist id on its behalf).
 	p.likedViaUserForm.Store(true)
 	p.app.log.Infof("play: liked-songs retry with %s -> %s", data.Uri, pd.targetName)
 	if err := p.sendDeviceCommand(ctx, pd.targetId, pd.targetName, buildPlayCommand(data)); err != nil {
