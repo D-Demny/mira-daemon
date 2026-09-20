@@ -17,7 +17,7 @@ report_url: "https://mira-reports.mira-thing.workers.dev/"
 
 homeassistant:
   url: "http://10.10.1.104:8123"
-  token: "[REDACTED-ROTATED-HA-TOKEN]"
+  token: "" # injected by CI from repo secret HA_TOKEN; committed default intentionally empty (prior value leaked and was revoked 2026-09-18)
 
 checkin: true
 checkin_url: "https://mira-checkin.mira-thing.workers.dev"
