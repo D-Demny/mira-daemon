@@ -434,7 +434,7 @@ func TestExpandQueue_UserCollectionLikedSongsStillExpands(t *testing.T) {
 	const ctxUri = "spotify:user:user123:collection:tracks"
 	var fetchedFor string
 	p := newTestQueueExpandPlayer(t)
-	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int) ([]any, int, error) {
+	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int, asLibrary bool) ([]any, int, error) {
 		fetchedFor = uri
 		return []any{
 			map[string]any{"is_local": false, "track": map[string]any{"id": "t00", "name": "A", "uri": "spotify:track:t00"}},
@@ -489,7 +489,7 @@ func TestResolvedLikedSongsContextIsQueueExpandable(t *testing.T) {
 	}
 
 	var fetchedFor string
-	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int) ([]any, int, error) {
+	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int, asLibrary bool) ([]any, int, error) {
 		fetchedFor = uri
 		return []any{
 			map[string]any{"is_local": false, "track": map[string]any{"id": "t00", "name": "A", "uri": "spotify:track:t00"}},
@@ -610,7 +610,7 @@ func TestExpandQueue_StaleCacheIsIgnored(t *testing.T) {
 
 	// a stale entry must not be applied; the cache-miss path starts a
 	// background fetch (stubbed here to an empty page, which writes no cache)
-	p.queueExpandPageFn = func(_ context.Context, _ string, _, _ int) ([]any, int, error) {
+	p.queueExpandPageFn = func(_ context.Context, _ string, _, _ int, _ bool) ([]any, int, error) {
 		return nil, 0, nil
 	}
 	preview := []QueueTrack{{Uri: "spotify:track:next", TrackId: "next"}}
@@ -648,7 +648,7 @@ func TestExpandQueue_CacheMissFetchesAndApplies(t *testing.T) {
 	}
 	var pages int
 	p := newTestQueueExpandPlayer(t)
-	p.queueExpandPageFn = func(_ context.Context, _ string, offset, limit int) ([]any, int, error) {
+	p.queueExpandPageFn = func(_ context.Context, _ string, offset, limit int, _ bool) ([]any, int, error) {
 		pages++
 		end := offset + limit
 		if end > total {
