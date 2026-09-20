@@ -1692,7 +1692,7 @@ func (p *AppPlayer) resolvePlayContextUri(uri string) string {
 	}
 	id := p.spotifyAccountId()
 	if id == "" {
-		p.app.log.Debugf("play: liked-songs context unresolved (no account id via web api /v1/me or the OAuth token)")
+		p.app.log.Debugf("play: liked-songs context unresolved (no account id via web api /v1/me, the OAuth token, or the stored credentials)")
 		return uri
 	}
 	return "spotify:user:" + id + ":collection:tracks"
@@ -1721,7 +1721,7 @@ func (p *AppPlayer) preparePlayContext(data ApiRequestDataPlay) (string, error) 
 const likedSongsMeTimeout = 3 * time.Second
 
 // spotifyAccountId resolves the Spotify account id of the paired user.
-// Resolution order (issue #56 fix #2):
+// Resolution order (issue #56 fix #2, last-resort tier added by fix #6):
 //  1. the cached/persisted account id (set below once, survives restarts)
 //  2. one bounded Web API GET /v1/me with the same token the library and
 //     cover-art lookups already use successfully — the device-flow token is
@@ -1729,6 +1729,8 @@ const likedSongsMeTimeout = 3 * time.Second
 //     cached + persisted
 //  3. the JWT `sub` claim of the access token (secondary fallback for tokens
 //     that are still JWTs)
+//  4. the paired account's stored credentials username (last resort while
+//     /v1/me stays rate-limited; see credentialsAccountID)
 func (p *AppPlayer) spotifyAccountId() string {
 	if id := p.cachedAccountID(); id != "" {
 		return id
@@ -1750,7 +1752,41 @@ func (p *AppPlayer) spotifyAccountId() string {
 	p.app.state.Lock()
 	token := p.app.state.OAuth.AccessToken
 	p.app.state.Unlock()
-	return jwtSubClaim(token)
+	if id := jwtSubClaim(token); id != "" {
+		return id
+	}
+
+	// last resort (issue #56 fix #6): the paired account's stored credentials
+	// username, valid while /v1/me stays rate-limited and no other source
+	// produced an id
+	if id := p.credentialsAccountID(); id != "" {
+		p.app.log.Debugf("play: using credentials username %s as the liked-songs account id (web api /v1/me unresolved)", id)
+		return id
+	}
+
+	return ""
+}
+
+// credentialsAccountID returns the paired account's username as stored at
+// pairing time (app.go withCredentials copies sess.Username() into
+// state.Credentials). That value is the accesspoint's CanonicalUsername —
+// filled in server-side by Spotify's APWelcome packet for every token-based
+// flow this daemon supports (device-flow QR, stored-credential replay), never
+// typed by the user — and on the paired devices it IS the Spotify account id
+// that spotify:user:<id>:collection accepts. We therefore treat it as a
+// valid id unless it is empty or email-shaped ("@" present, cf.
+// ObfuscateUsername's own heuristic). It is deliberately NOT persisted into
+// state.AccountID: that field marks an authoritative /v1/me resolution and
+// also stops the background resolver's retries, which should keep running so
+// a later successful lookup still lands.
+func (p *AppPlayer) credentialsAccountID() string {
+	p.app.state.Lock()
+	user := strings.TrimSpace(p.app.state.Credentials.Username)
+	p.app.state.Unlock()
+	if user == "" || strings.Contains(user, "@") {
+		return ""
+	}
+	return user
 }
 
 // cachedAccountID returns the persisted account id or "" when it has not
