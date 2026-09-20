@@ -17,7 +17,7 @@ report_url: "https://mira-reports.mira-thing.workers.dev/"
 
 homeassistant:
   url: "http://10.10.1.104:8123"
-  token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiI0Mjg5YTRmMWQyZmU0NDMwYWI1YzdmYjBkZTFjMWQzNyIsImlhdCI6MTc4NjcxNzk2NSwiZXhwIjoyMTAyMDc3OTY1fQ.6MkEjuL8Km9fJnTx-Uwnl9AChwOlDf4h28Dd2tQ8HAI"
+  token: "" # injected by CI from repo secret HA_TOKEN; committed default intentionally empty (prior value leaked and was revoked 2026-09-18)
 
 checkin: true
 checkin_url: "https://mira-checkin.mira-thing.workers.dev"
