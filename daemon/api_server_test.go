@@ -641,7 +641,7 @@ func TestResolvePlayContextUri_WebApiFailureFallsBackToJwtSub(t *testing.T) {
 	// every other context passes through unchanged (byte-for-byte envelope
 	// for real playlists + all other contexts, invariant of the #56 fix)
 	for _, uri := range []string{
-		"spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+		"spotify:playlist:abc123",
 		"spotify:album:abc123",
 		"spotify:track:xyz789",
 		"spotify:artist:abc456",

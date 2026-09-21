@@ -5,13 +5,12 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	librespot "github.com/devgianlu/go-librespot"
 )
 
 // issue #56 fix #5 — duration-budgeted background account-id resolution
-// (24h budget, 30s→5min doubling retry ramp) + the dead-context gate on the
-// play path. Reuses the existing webMeAccountFn seam (fakeMeFn,
+// (24h budget, 30s→5min doubling retry ramp) feeding the liked-songs play
+// path's user-specific collection uri (the play-path itself is covered by
+// fix7_test.go). Reuses the existing webMeAccountFn seam (fakeMeFn,
 // recordingStateStore from api_server_test.go; newBGResolverPlayer from
 // fix4_test.go). All injected durations are tiny — no real sleeps of the
 // production shape.
@@ -219,66 +218,5 @@ func TestResolveAccountIDBackground_StopChannelExits(t *testing.T) {
 	}
 	if p.accountIDResolverRunning.Load() {
 		t.Error("single-flight guard still set after stop — a re-pair trigger would be starved")
-	}
-}
-
-// (e) play path gate: while the liked-collection pseudo id is unresolved the
-// play must be refused with NO context uri — the dead bare context never leaves
-// the envelope. Every other context passes through byte-for-byte.
-func TestPreparePlayContext_LikedSongsUnresolvedSendsNoContext(t *testing.T) {
-	t.Parallel()
-
-	store := &recordingStateStore{}
-	me := &fakeMeFn{id: ""} // chronic-429 shape: /v1/me keeps failing
-	state := &librespot.AppState{OAuth: librespot.OAuthState{AccessToken: "opaque-token-no-dots"}}
-	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: store}, webMeAccountFn: me.fn}
-
-	uri, err := p.preparePlayContext(ApiRequestDataPlay{Uri: likedCollectionUri})
-	if err == nil {
-		t.Fatal("unresolved liked-songs play must be refused, not sent")
-	}
-	if uri != "" {
-		t.Errorf("refused play must carry no context uri, got %q", uri)
-	}
-	if state.AccountID != "" {
-		t.Errorf("state.AccountID must stay empty while unresolved: got %q", state.AccountID)
-	}
-	if n := store.saves.Load(); n != 0 {
-		t.Errorf("persist saves: got %d want 0 (nothing resolved)", n)
-	}
-
-	// real playlist contexts still pass through byte-for-byte and never touch /v1/me
-	for _, u := range []string{
-		"spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
-		"spotify:album:abc123",
-	} {
-		got, err := p.preparePlayContext(ApiRequestDataPlay{Uri: u})
-		if err != nil || got != u {
-			t.Errorf("passthrough %q: got %q err %v, want unchanged and no error", u, got, err)
-		}
-	}
-}
-
-// (f) once an account id is cached the gate sends the resolvable user-specific
-// collection uri — and the fast path never re-fetches /v1/me.
-func TestPreparePlayContext_ResolvedLikedSongsCarryUserCollection(t *testing.T) {
-	t.Parallel()
-
-	me := &fakeMeFn{} // must NOT be called — the cached id short-circuits
-	state := &librespot.AppState{
-		OAuth:     librespot.OAuthState{AccessToken: "opaque-token-no-dots"},
-		AccountID: "cached-user",
-	}
-	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}, webMeAccountFn: me.fn}
-
-	got, err := p.preparePlayContext(ApiRequestDataPlay{Uri: likedCollectionUri})
-	if err != nil {
-		t.Fatalf("resolved liked-songs play must not be refused: %v", err)
-	}
-	if want := "spotify:user:cached-user:collection:tracks"; got != want {
-		t.Errorf("resolved context: got %q want %q", got, want)
-	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me lookups with a cached id: got %d want 0", n)
 	}
 }

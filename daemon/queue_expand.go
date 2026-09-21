@@ -73,12 +73,12 @@ func isLikedCollectionUri(uri string) bool {
 }
 
 // queueExpandFetchOp picks the pathfinder operation that pages a context's
-// track list: fetchPlaylist for ordinary playlists, fetchLibraryTracks for
-// the liked-songs collection in both uri forms (the bare pseudo id the UI
-// requests with and the user-specific collection). asLibrary forces the
-// library route for a playlist-shaped id when the active liked-songs session
-// was started through the user-specific collection (issue #56 fix #7 escape
-// hatch — the daemon never pages a canonical playlist id on its behalf).
+// track list: fetchPlaylist for ordinary playlists, fetchLibraryTracks for the
+// liked-songs collection in both uri forms (the bare pseudo id the UI requests
+// with and the user-specific collection). asLibrary forces the library route
+// for a playlist-shaped id while the current session is a liked-songs context
+// (issue #56 — the Connect state may echo an internal playlist id for it, but
+// the track list must still come from the saved-tracks route).
 func queueExpandFetchOp(contextUri string, asLibrary bool) string {
 	if strings.HasPrefix(contextUri, "spotify:playlist:") && !asLibrary {
 		return "fetchPlaylist"
@@ -103,11 +103,11 @@ func (p *AppPlayer) expandQueue(rs *RemoteState) {
 
 	activeId := trackIdFromUri(rs.TrackUri)
 
-	// issue #56 fix #7: a liked-songs session started through the user-
-	// specific collection may be reported back by the Connect state with a
-	// playlist-shaped context id — force the library-tracks fetch route for
-	// it instead of paging the (canonical) playlist.
-	neededAsLibrary := p.likedViaUserForm.Load() && strings.HasPrefix(contextUri, "spotify:playlist:")
+	// issue #56: a liked-songs session may be reported back by the Connect
+	// state with a playlist-shaped context id — force the library-tracks fetch
+	// route for it instead of paging whatever internal playlist the receiver
+	// chose to echo.
+	neededAsLibrary := p.likedSessionActive.Load() && strings.HasPrefix(contextUri, "spotify:playlist:")
 
 	p.queueExpandMu.Lock()
 	entry, ok := p.queueExpandCache[contextUri]

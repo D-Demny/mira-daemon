@@ -8,7 +8,8 @@ import (
 // Web API GET /v1/me stays rate-limited and no cached/JWT id exists, the
 // paired account's stored credentials username (state.Credentials.Username,
 // the Spotify-issued APWelcome canonical username captured at pairing) builds
-// the user-specific liked-songs collection uri. Reuses the existing seams
+// the user-specific liked-songs collection uri; when even that is unusable
+// the play falls back to the bare pseudo context. Reuses the existing seams
 // (fakeMeFn + recordingStateStore from api_server_test.go;
 // newBGResolverPlayer from fix4_test.go).
 
@@ -39,15 +40,12 @@ func TestSpotifyAccountId_WebMeSuccessWinsOverCredentials(t *testing.T) {
 // the liked-songs context builds, and nothing is persisted — state.AccountID
 // stays reserved for an authoritative /v1/me resolution (the background
 // resolver must keep retrying).
-func TestPreparePlayContext_WebMeFailureFallsBackToCredentials(t *testing.T) {
+func TestResolvePlayContextUri_WebMeFailureFallsBackToCredentials(t *testing.T) {
 	t.Parallel()
 	p, state, store, me := newBGResolverPlayer(t) // me.id == "" — chronic-429 shape
 	state.Credentials.Username = "1234567890"
 
-	uri, err := p.preparePlayContext(ApiRequestDataPlay{Uri: likedCollectionUri})
-	if err != nil {
-		t.Fatalf("play with a stored credentials username must not be refused: %v", err)
-	}
+	uri := p.resolvePlayContextUri(likedCollectionUri)
 	if want := "spotify:user:1234567890:collection:tracks"; uri != want {
 		t.Errorf("liked-songs context: got %q want %q", uri, want)
 	}
@@ -61,15 +59,22 @@ func TestPreparePlayContext_WebMeFailureFallsBackToCredentials(t *testing.T) {
 		t.Errorf("persist saves: got %d want 0", n)
 	}
 
-	// the fallback is stable across plays on the same player
-	if uri2, err := p.preparePlayContext(ApiRequestDataPlay{Uri: likedCollectionUri}); err != nil || uri2 != uri {
-		t.Errorf("repeat play: got %q err %v, want %q", uri2, err, uri)
+	// the fallback is stable across plays on the same player (every play
+	// re-tries the bounded /v1/me lookup — the credentials fallback is
+	// deliberately not cached)
+	if uri2 := p.resolvePlayContextUri(likedCollectionUri); uri2 != uri {
+		t.Errorf("repeat play: got %q, want %q", uri2, uri)
+	}
+	if n := me.calls.Load(); n != 2 {
+		t.Errorf("/v1/me lookups over two resolves: got %d want exactly 2 (no caching of the credentials fallback)", n)
 	}
 }
 
 // (c) both /v1/me and the credentials username unavailable (or email-shaped):
-// the original refusal path is preserved — no context leaves the envelope.
-func TestPreparePlayContext_WebMeFailureAndNoCredentialsStillRefused(t *testing.T) {
+// nothing is refused — the play falls back to the bare pseudo context as a
+// documented legacy best effort, and state.AccountID stays reserved for an
+// authoritative resolution.
+func TestResolvePlayContextUri_NoUsableIdKeepsBareFallback(t *testing.T) {
 	t.Parallel()
 
 	// (c1) genuinely empty credentials username
@@ -77,22 +82,19 @@ func TestPreparePlayContext_WebMeFailureAndNoCredentialsStillRefused(t *testing.
 	if state.Credentials.Username != "" {
 		t.Fatal("test precondition: credentials username must be empty")
 	}
-	uri, err := p.preparePlayContext(ApiRequestDataPlay{Uri: likedCollectionUri})
-	if err == nil {
-		t.Error("unresolved liked-songs play must still be refused when every source is empty")
-	}
-	if uri != "" {
-		t.Errorf("refused play must carry no context uri, got %q", uri)
+	uri := p.resolvePlayContextUri(likedCollectionUri)
+	if uri != likedCollectionUri {
+		t.Errorf("no usable id: got %q, want the bare pseudo context as best-effort fallback", uri)
 	}
 	if n := me.calls.Load(); n != 1 {
-		t.Errorf("/v1/me lookups: got %d want exactly 1 (still tried before refusing)", n)
+		t.Errorf("/v1/me lookups: got %d want exactly 1 (still tried before falling back)", n)
 	}
 
 	// (c2) an email-shaped credentials value is not a usable account id
 	p2, state2, _, me2 := newBGResolverPlayer(t) // me2.id == ""
 	state2.Credentials.Username = "user@example.com"
-	if uri, err := p2.preparePlayContext(ApiRequestDataPlay{Uri: likedCollectionUri}); err == nil {
-		t.Errorf("email-shaped credentials username must not build a context, got %q", uri)
+	if uri := p2.resolvePlayContextUri(likedCollectionUri); uri != likedCollectionUri {
+		t.Errorf("email-shaped credentials username must not build a user-form context, got %q", uri)
 	} else if me2.calls.Load() != 1 {
 		t.Errorf("/v1/me lookups: got %d want exactly 1", me2.calls.Load())
 	}
