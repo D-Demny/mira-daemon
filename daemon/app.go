@@ -79,11 +79,6 @@ type App struct {
 
 	retryNowCh chan struct{}
 
-	// issue #56 fix #4: closed in Close() — App has no context of its own, so
-	// this is the shutdown signal for the background account-id resolver that
-	// onOAuthTokenChanged starts (see resolveAccountIDInBackground)
-	accountIDStopCh chan struct{}
-
 	// issue #56: shutdown signal for the background liked-songs playlist-uri
 	// resolver started from Run / the me/playlists scan / re-pair (see
 	// resolveLikedPlaylistURIInBackground)
@@ -131,16 +126,15 @@ func New(opts *Options) (*App, error) {
 	}
 
 	app := &App{
-		log:             opts.Logger,
-		cfg:             opts.Config,
-		stateStore:      opts.StateStore,
-		logoutCh:        make(chan *AppPlayer),
-		client:          &http.Client{Timeout: 30 * time.Second},
-		retryNowCh:      make(chan struct{}, 1),
-		onlineCh:        make(chan struct{}),
-		accountIDStopCh: make(chan struct{}),
+		log:        opts.Logger,
+		cfg:        opts.Config,
+		stateStore: opts.StateStore,
+		logoutCh:   make(chan *AppPlayer),
+		client:     &http.Client{Timeout: 30 * time.Second},
+		retryNowCh: make(chan struct{}, 1),
+		onlineCh:   make(chan struct{}),
 		// issue #56: persistent stop for the background liked-songs playlist-uri
-		// resolver (App has no context of its own, cf. accountIDStopCh)
+		// resolver (App has no context of its own)
 		likedPlaylistStopCh: make(chan struct{}),
 		hashes:              newHashStore(),
 		startedAt:           time.Now(),
@@ -456,10 +450,8 @@ func (app *App) Close() error {
 	}
 	app.closed = true
 
-	// issue #56 fix #4: wake any sleeping background account-id resolver; the
+	// issue #56: shutdown signal for the liked-songs playlist-uri resolver; the
 	// closed flag above guarantees this closes exactly once
-	close(app.accountIDStopCh)
-	// issue #56: same shutdown signal for the liked-songs playlist-uri resolver
 	close(app.likedPlaylistStopCh)
 
 	if app.piRecovery != nil {
@@ -491,20 +483,17 @@ func (app *App) persistState() error {
 // daemon restarts (the StoredCredentials path restores it from app state)
 func (app *App) onOAuthTokenChanged(oauth *librespot.OAuthState) {
 	app.state.Lock()
-	// issue #56 fix #2: a different refresh token means the account was
-	// (re-)authenticated — a cached account id from a previous pairing no
-	// longer applies and is dropped so the next liked-songs play re-derives
-	// it via /v1/me. Routine hourly refreshes keep the same refresh token
-	// and leave the cache intact. issue #56: the real per-user liked-songs
-	// playlist uri belongs to the same account, so a re-pairing drops it as
-	// well — the background resolver re-derives it from me/playlists.
-	accountIDCleared := false
+	// issue #56: a different refresh token means the account was (re-)paired —
+	// the real per-user liked-songs playlist uri belongs to the previous
+	// account, so it is dropped and the background resolver re-derives it from
+	// me/playlists. Routine hourly refreshes keep the same refresh token and
+	// leave the cached uri intact.
+	repaired := false
 	if app.state.OAuth.RefreshToken != "" &&
 		oauth.RefreshToken != "" &&
 		oauth.RefreshToken != app.state.OAuth.RefreshToken {
-		app.state.AccountID = ""
 		app.state.LikedPlaylistURI = ""
-		accountIDCleared = true
+		repaired = true
 	}
 	app.state.OAuth = *oauth
 	app.state.Unlock()
@@ -512,16 +501,13 @@ func (app *App) onOAuthTokenChanged(oauth *librespot.OAuthState) {
 		app.log.WithError(err).Warn("failed to persist OAuth tokens")
 	}
 
-	// issue #56 fix #4: a fresh pairing just dropped the cached account id —
-	// re-resolve it in the background so the next liked-songs play hits the
-	// cache instead of the ~3s /v1/me on the play path (which times out under
-	// Spotify rate limiting). The single-flight guard inside the resolver
-	// keeps this from racing a loop started at app start. issue #56: the
-	// same re-pairing dropped the liked-songs playlist uri too — restart its
-	// background resolver as well (single-flight likewise).
-	if accountIDCleared {
+	// issue #56: a fresh pairing just dropped the cached liked-songs playlist
+	// uri — restart its background resolver so the next liked-songs play hits
+	// the resolved context instead of the standalone fallback. The single-flight
+	// guard inside the resolver keeps this from racing a loop started at app
+	// start.
+	if repaired {
 		if player := app.currentPlayer.Load(); player != nil {
-			go player.resolveAccountIDInBackground(app.accountIDStopCh)
 			go player.resolveLikedPlaylistURIInBackground(app.likedPlaylistStopCh)
 		}
 	}

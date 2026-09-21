@@ -20,21 +20,18 @@ import (
 // carries one, otherwise the first library track via a bounded fetch — and
 // NEVER sends the bare pseudo id or the legacy user-specific collection form
 // (Connect receivers reject both and clear playback). A taken liked-songs play
-// marks the session as liked (queue expansion pages library tracks even for a
-// playlist-shaped Connect echo) and arms NO escape-hatch retry: the real
-// context starts reliably on-device. The retained retry machinery
-// (arm/observe/handle — wired for the follow-up cleanup pass, not armed from
-// the play path anymore) is exercised below by arming it manually; its guard
-// sends only a REAL resolved uri — a still-unresolved retry skips the re-send
-// entirely instead of emitting a rejected context. Spotify's global "Today's
-// Top Hits" playlist is NOT a liked-songs context and is never sent here.
-// Reuses the existing seams (fakeMeFn + nopStateStore from api_server_test.go)
-// plus the sendDeviceCommandFn transport seam; fallback tests use the
-// libraryFirstTrackFn seam instead of touching a session.
+// marks the session as liked so queue expansion pages library tracks even for
+// a playlist-shaped Connect echo. There is no escape-hatch retry: the real
+// context starts reliably on-device and nothing is re-sent after it. Spotify's
+// global "Today's Top Hits" playlist is NOT a liked-songs context and is never
+// sent here.
+// Reuses the nopStateStore fixture plus the sendDeviceCommandFn transport
+// seam; fallback tests use the libraryFirstTrackFn seam instead of touching a
+// session.
 
 // sentCommands records the connect commands a stubbed sendDeviceCommand saw
-// (single-goroutine: tests drive handleApiRequest/handleLikedPlayRetry
-// directly, no Run loop involved).
+// (single-goroutine: tests drive handleApiRequest directly, no Run loop
+// involved).
 type sentCommands struct {
 	mu   sync.Mutex
 	cmds []connectCommand
@@ -55,26 +52,23 @@ func (r *sentCommands) take() []connectCommand {
 	return out
 }
 
-// newFix7Player wires a minimal AppPlayer for the play path + escape hatch:
-// stubbed transport (sendDeviceCommandFn), fake /v1/me (webMeAccountFn), and
-// an active target device in the observer state so resolveTargetDevice has
-// somewhere to send. The fixture state carries no cached account id, no
-// credentials username, an opaque (non-JWT) access token — AND no persisted
-// liked-songs playlist uri: every resolution source is empty by design until a
-// test seeds one. No session exists: any code path that would hit the network
-// must go through a seam (webMeAccountFn / libraryFirstTrackFn).
-func newFix7Player(t *testing.T, meID string) (*AppPlayer, *fakeMeFn, *sentCommands) {
+// newFix7Player wires a minimal AppPlayer for the play path: stubbed
+// transport (sendDeviceCommandFn) and an active target device in the observer
+// state so resolveTargetDevice has somewhere to send. The fixture state
+// carries no credentials username, an opaque access token — AND no persisted
+// liked-songs playlist uri: the only resolution source is empty by design
+// until a test seeds one. No session exists: any code path that would hit the
+// network must go through a seam (libraryFirstTrackFn).
+func newFix7Player(t *testing.T) (*AppPlayer, *sentCommands) {
 	t.Helper()
-	me := &fakeMeFn{id: meID}
 	rec := &sentCommands{}
 	state := &librespot.AppState{OAuth: librespot.OAuthState{AccessToken: "opaque-token-no-dots"}}
 	p := &AppPlayer{
 		app:                 &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}},
 		state:               &State{remoteState: &RemoteState{DeviceId: "target-dev", DeviceName: "Target Dev"}},
-		webMeAccountFn:      me.fn,
 		sendDeviceCommandFn: rec.send,
 	}
-	return p, me, rec
+	return p, rec
 }
 
 // playLikedSongs issues the UI's actual request shape: the bare pseudo id with
@@ -94,7 +88,7 @@ func playLikedSongs(t *testing.T, p *AppPlayer) {
 // byte-for-byte.
 func TestPlay_LikedSongsResolvedSendsRealPlaylistContext(t *testing.T) {
 	t.Parallel()
-	p, me, rec := newFix7Player(t, "me-user")
+	p, rec := newFix7Player(t)
 	const realLiked = "spotify:playlist:liked-real"
 	p.app.state.LikedPlaylistURI = realLiked
 
@@ -122,14 +116,8 @@ func TestPlay_LikedSongsResolvedSendsRealPlaylistContext(t *testing.T) {
 	if got := cmds[0].Options.SkipTo.TrackUri; got != "spotify:track:first" {
 		t.Errorf("skip_to: got %q, want the offset track uri (bug29 mirroring)", got)
 	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me looked up %d times on a resolved play, want 0 (the real context needs no account id)", n)
-	}
 	if !p.likedSessionActive.Load() {
 		t.Error("a taken liked-songs play must mark the session for library-track queue expansion")
-	}
-	if p.playRetryPending != nil || p.playRetryTimerCh != nil {
-		t.Error("a reliable real-playlist context arms no escape-hatch retry")
 	}
 
 	// the pure builder still passes every other context through untouched
@@ -151,7 +139,7 @@ func TestPlay_LikedSongsResolvedSendsRealPlaylistContext(t *testing.T) {
 // A subsequent non-liked play leaves all state clean.
 func TestPlay_LikedSongsUnresolvedFallsBackToTappedTrack(t *testing.T) {
 	t.Parallel()
-	p, me, rec := newFix7Player(t, "") // fresh install: no persisted playlist uri
+	p, rec := newFix7Player(t) // fresh install: no persisted playlist uri
 
 	req, _ := NewApiRequest(ApiRequestTypePlay, ApiRequestDataPlay{
 		Uri:    likedCollectionUri,
@@ -168,22 +156,16 @@ func TestPlay_LikedSongsUnresolvedFallsBackToTappedTrack(t *testing.T) {
 	if got := cmds[0].Context.Uri; got != "spotify:track:first" {
 		t.Errorf("unresolved fallback: got %q want the tapped track played standalone", got)
 	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me looked up %d times on the fallback path, want 0 (a track play does no account-id work)", n)
-	}
 	if p.likedSessionActive.Load() {
 		t.Error("the standalone fallback is a plain track play and must not mark the session as liked")
-	}
-	if p.playRetryPending != nil || p.playRetryTimerCh != nil {
-		t.Error("the standalone fallback arms no escape-hatch retry")
 	}
 
 	req2, _ := NewApiRequest(ApiRequestTypePlay, ApiRequestDataPlay{Uri: "spotify:playlist:pl"})
 	if _, err := p.handleApiRequest(context.Background(), req2); err != nil {
 		t.Fatalf("play (playlist): %v", err)
 	}
-	if p.playRetryPending != nil || p.likedSessionActive.Load() {
-		t.Error("a playlist play must leave all liked-session state clear")
+	if p.likedSessionActive.Load() {
+		t.Error("a playlist play must clear the liked-session flag")
 	}
 	if len(rec.take()) != 2 {
 		t.Errorf("sent %d commands, want 2 (one per play)", len(rec.take()))
@@ -194,7 +176,7 @@ func TestPlay_LikedSongsUnresolvedFallsBackToTappedTrack(t *testing.T) {
 // the bounded fetch seam and plays it standalone.
 func TestPlay_LikedSongsUnresolvedFallsBackToFirstLibraryTrack(t *testing.T) {
 	t.Parallel()
-	p, me, rec := newFix7Player(t, "")
+	p, rec := newFix7Player(t)
 	p.libraryFirstTrackFn = func(context.Context) (string, error) {
 		return "spotify:track:first-lib", nil
 	}
@@ -208,16 +190,13 @@ func TestPlay_LikedSongsUnresolvedFallsBackToFirstLibraryTrack(t *testing.T) {
 	if got := cmds[0].Context.Uri; got != "spotify:track:first-lib" {
 		t.Errorf("unresolved fallback without offset: got %q want the first library track", got)
 	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me looked up %d times, want 0", n)
-	}
 }
 
 // (b) the first-library-track fetch fails too — the tap is refused with a
 // rate-limit-friendly message and NOTHING goes out on the wire.
 func TestPlay_LikedSongsUnresolvedFallbackSurfacesFetchFailure(t *testing.T) {
 	t.Parallel()
-	p, me, rec := newFix7Player(t, "")
+	p, rec := newFix7Player(t)
 	p.libraryFirstTrackFn = func(context.Context) (string, error) {
 		return "", errors.New("library query rate-limited")
 	}
@@ -232,222 +211,6 @@ func TestPlay_LikedSongsUnresolvedFallbackSurfacesFetchFailure(t *testing.T) {
 	}
 	if len(rec.take()) != 0 {
 		t.Errorf("sent %d commands on a failed fallback, want 0", len(rec.take()))
-	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me looked up %d times, want 0", n)
-	}
-}
-
-// armManualRetrySnapshot wires a positive pre-state and manually arms the
-// retained escape hatch with the bare pseudo context — the shape the follow-up
-// cleanup pass will restore in production. No command is sent by this helper:
-// these tests exercise the machinery itself, not the (now un-armed) play path.
-func armManualRetrySnapshot(t *testing.T, p *AppPlayer) {
-	t.Helper()
-	p.state.remoteState = &RemoteState{
-		DeviceId:   "target-dev",
-		DeviceName: "Target Dev",
-		TrackUri:   "spotify:track:prev",
-		ContextUri: "spotify:playlist:pl",
-		IsPlaying:  true,
-	}
-	p.armLikedPlayRetry("target-dev", "Target Dev", ApiRequestDataPlay{Uri: likedCollectionUri})
-	if p.playRetryPending == nil || p.playRetryTimerCh == nil {
-		t.Fatal("precondition: the manual arm must snapshot and arm")
-	}
-}
-
-// clearReceiverState moves the active state to the cleared/stopped shape a
-// receiver reports when it rejects a context (negative transition).
-func clearReceiverState(p *AppPlayer) {
-	p.state.remoteState = &RemoteState{DeviceId: "target-dev", DeviceName: "Target Dev"}
-}
-
-// markReceiverPlaying moves the active state to a positive shape (a track is
-// active and playback runs — the receiver took the command).
-func markReceiverPlaying(p *AppPlayer) {
-	p.state.remoteState = &RemoteState{
-		DeviceId:   "target-dev",
-		DeviceName: "Target Dev",
-		TrackUri:   "spotify:track:first-liked",
-		ContextUri: "spotify:playlist:7EL2aPD9U3qbjggALcJ7IV", // the internal echo a receiver reports
-		IsPlaying:  true,
-	}
-}
-
-// (c) a resolved liked-songs play arms NO escape hatch: the real per-user
-// context starts reliably on-device, so there is nothing to re-send. A stale
-// invocation of the retained machinery stays a no-op.
-func TestPlay_LikedSongsResolvedArmsNoRetry(t *testing.T) {
-	t.Parallel()
-	p, me, rec := newFix7Player(t, "me-user")
-	const realLiked = "spotify:playlist:liked-real"
-	p.app.state.LikedPlaylistURI = realLiked
-
-	playLikedSongs(t, p)
-	if p.playRetryPending != nil || p.playRetryTimerCh != nil {
-		t.Fatal("a resolved liked-songs play must not arm the escape-hatch retry")
-	}
-
-	p.handleLikedPlayRetry(context.Background()) // stale firing: nothing armed
-	p.observeLikedRetryTransition(context.Background())
-	if len(rec.take()) != 1 {
-		t.Errorf("sent %d commands, want exactly 1 (the primary play)", len(rec.take()))
-	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me looked up %d times, want 0", n)
-	}
-}
-
-// (c) the retained escape hatch, manually armed while nothing is resolved: a
-// NEGATIVE clear observed on the next state update fires the one-shot retry
-// early — but the guard must keep the wire clean. There is no real context to
-// send yet and the bare pseudo id must never go out; the armed state is
-// consumed either way.
-func TestRetry_UnresolvedNegativeClearSkipsResend(t *testing.T) {
-	t.Parallel()
-	p, me, rec := newFix7Player(t, "")
-
-	armManualRetrySnapshot(t, p)
-	clearReceiverState(p) // receiver rejected the context
-	p.observeLikedRetryTransition(context.Background())
-
-	if len(rec.take()) != 0 {
-		t.Errorf("unresolved retry: got %d commands, want 0 (no real context to resend)", len(rec.take()))
-	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me looked up %d times, want 0 (resolution is a state read, no web traffic)", n)
-	}
-	if p.playRetryPending != nil || p.playRetryTimerCh != nil {
-		t.Error("the one-shot retry must be consumed even when the guard skips the re-send")
-	}
-	if p.likedSessionActive.Load() {
-		t.Error("a skipped retry must not mark the session as liked")
-	}
-}
-
-// (c) a real per-user playlist uri that lands between arming and the early
-// fire upgrades the retry: it re-sends the REAL context and re-marks the
-// session as liked for library-track queue expansion — no /v1/me traffic on
-// the way (the persisted uri is read straight from state).
-func TestRetry_UpgradesToRealContextWhenItLands(t *testing.T) {
-	t.Parallel()
-	p, me, rec := newFix7Player(t, "")
-
-	armManualRetrySnapshot(t, p)
-	const lateLiked = "spotify:playlist:late-real"
-	p.app.state.LikedPlaylistURI = lateLiked // the background resolver lands before the fire
-	clearReceiverState(p)
-	p.observeLikedRetryTransition(context.Background())
-
-	cmds := rec.take()
-	if len(cmds) != 1 {
-		t.Fatalf("upgraded retry: got %d commands, want 1 (the re-send)", len(cmds))
-	}
-	if got, want := cmds[0].Context.Uri, lateLiked; got != want {
-		t.Errorf("retry context: got %q want the late-resolved per-user playlist uri %q", got, want)
-	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me looked up %d times, want 0 (the persisted uri needs no account lookup)", n)
-	}
-	if !p.likedSessionActive.Load() {
-		t.Error("a fired retry must re-mark the session as liked-songs for queue expansion")
-	}
-	if p.playRetryPending != nil || p.playRetryTimerCh != nil {
-		t.Error("the retry is one-shot: the armed state must be consumed")
-	}
-}
-
-// (c) the timer path with everything still unresolved — no state change
-// through the full window, nothing resolvable at firing time either: the
-// retry is skipped, the wire stays clean, and the armed state is consumed.
-func TestRetry_TimerPathUnresolvedSkips(t *testing.T) {
-	t.Parallel()
-	p, me, rec := newFix7Player(t, "") // every source stays empty
-
-	armManualRetrySnapshot(t, p)
-	p.handleLikedPlayRetry(context.Background()) // the armed timer fires after the full window
-
-	if len(rec.take()) != 0 {
-		t.Errorf("unresolved timer retry: got %d commands, want 0", len(rec.take()))
-	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me looked up %d times, want 0", n)
-	}
-	if p.playRetryPending != nil || p.playRetryTimerCh != nil {
-		t.Error("the one-shot retry must be consumed even when the guard skips")
-	}
-}
-
-// (c) defense in depth: the active state moved to a positive shape without an
-// observer pass in between, and only then does the timer value arrive — the
-// retry classifies the current state first and suppresses itself.
-func TestRetry_SuppressedWhenStatePositiveBeforeFiring(t *testing.T) {
-	t.Parallel()
-	p, me, rec := newFix7Player(t, "me-user")
-
-	armManualRetrySnapshot(t, p)
-	markReceiverPlaying(p) // playback started; the observer hook did not run first
-	p.handleLikedPlayRetry(context.Background())
-
-	if len(rec.take()) != 0 {
-		t.Errorf("state moved: got %d commands, want 0 (no retry after a positive transition)", len(rec.take()))
-	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me looked up %d times, want 0", n)
-	}
-	if p.playRetryPending != nil || p.playRetryTimerCh != nil {
-		t.Error("the suppressed retry must still consume the armed state")
-	}
-	if p.likedSessionActive.Load() {
-		t.Error("a suppressed retry must not mark the session as liked")
-	}
-}
-
-// (c) a new play supersedes an armed retry: even if the stale timer fires
-// afterwards, there is nothing to re-send and all escape-hatch state is gone.
-func TestPlay_NewPlaySupersedesArmedRetry(t *testing.T) {
-	t.Parallel()
-	p, _, rec := newFix7Player(t, "me-user")
-
-	armManualRetrySnapshot(t, p)
-	req, _ := NewApiRequest(ApiRequestTypePlay, ApiRequestDataPlay{Uri: "spotify:playlist:pl"})
-	if _, err := p.handleApiRequest(context.Background(), req); err != nil {
-		t.Fatalf("play (playlist): %v", err)
-	}
-
-	if p.playRetryPending != nil || p.playRetryTimerCh != nil || p.likedSessionActive.Load() {
-		t.Error("a superseding play must clear all escape-hatch state")
-	}
-	p.handleLikedPlayRetry(context.Background()) // stale firing: must be a no-op
-	if len(rec.take()) != 1 {
-		t.Errorf("sent %d commands, want exactly 1 (the new play, no stale retry)", len(rec.take()))
-	}
-}
-
-// (d) a POSITIVE transition observed on the state update path — a track is
-// active and playback is running — disarms the armed retry without firing; a
-// stale timer value afterwards is a no-op, so the retry never double-issues.
-func TestRetry_PositiveTransitionDisarmsArmedRetry(t *testing.T) {
-	t.Parallel()
-	p, me, rec := newFix7Player(t, "me-user")
-
-	armManualRetrySnapshot(t, p)
-	markReceiverPlaying(p) // the receiver started playback of the context
-	p.observeLikedRetryTransition(context.Background())
-
-	if p.playRetryPending != nil || p.playRetryTimerCh != nil {
-		t.Error("a positive transition must disarm the armed retry and its timer")
-	}
-	p.handleLikedPlayRetry(context.Background()) // stale timer firing: no-op
-	if len(rec.take()) != 0 {
-		t.Errorf("positive transition: got %d commands, want 0 (no retry after the receiver took the command)", len(rec.take()))
-	}
-	if n := me.calls.Load(); n != 0 {
-		t.Errorf("/v1/me looked up %d times, want 0", n)
-	}
-	if p.likedSessionActive.Load() {
-		t.Error("a disarmed retry must not mark the session as liked")
 	}
 }
 

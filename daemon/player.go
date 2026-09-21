@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -85,35 +84,6 @@ type AppPlayer struct {
 	// asLibrary selects the fetch route (see queueExpandFetchOp)
 	queueExpandPageFn func(ctx context.Context, contextUri string, offset, limit int, asLibrary bool) ([]any, int, error)
 
-	// issue #56 fix #2: swappable in tests (nil = the real
-	// (*AppPlayer).webApiMeAccountID) — the one-shot /v1/me lookup that
-	// derives the account id behind the liked-songs collection
-	webMeAccountFn func(ctx context.Context) string
-
-	// issue #56 fix #4: single-flight guard for the background account-id
-	// resolver — app start and an OAuth re-pair may both trigger it, but only
-	// one loop runs per player; reset when the loop finishes so a later
-	// re-pair can start a fresh one
-	accountIDResolverRunning atomic.Bool
-
-	// issue #56 fix #4: pacing of the background resolver, swappable in tests
-	// (zero values = the production defaults below). Kept for compatibility
-	// with the fix-#4 shape; precedence under fix #5: a non-zero
-	// accountIDMaxAttempts still hard-caps the attempt count, and
-	// accountIDRetryDelay is honored as the initial delay fallback when
-	// accountIDInitialDelay is unset.
-	accountIDMaxAttempts int
-	accountIDRetryDelay  time.Duration
-
-	// issue #56 fix #5: duration-budget pacing of the background resolver,
-	// swappable in tests (zero values = the production defaults below). The
-	// budget replaces the legacy attempt cap as the primary bound of the loop;
-	// the retry delay doubles after every consecutive failure, starting at
-	// accountIDInitialDelay and capped by accountIDMaxDelay.
-	accountIDBudget       time.Duration
-	accountIDInitialDelay time.Duration
-	accountIDMaxDelay     time.Duration
-
 	// issue #56 (real playlist context): single-flight guard for the background
 	// liked-songs playlist-URI resolver — app start (Run), an OAuth re-pair and
 	// the opportunistic me/playlists scan may all trigger it, but only one loop
@@ -131,21 +101,6 @@ type AppPlayer struct {
 	// behind the standalone-playback fallback, swappable in tests
 	// (nil = the real libraryTracksPage(0, 1))
 	libraryFirstTrackFn func(ctx context.Context) (string, error)
-
-	// issue #56: escape hatch for the liked-songs context. The primary play
-	// sends the user-specific collection uri when the account id is
-	// resolvable, and the bare pseudo id as a documented best-effort fallback
-	// otherwise. If nothing actually starts — no POSITIVE active-state
-	// transition and no NEGATIVE clear observed, and still none when
-	// likedPlayRetryDelay has passed — handleLikedPlayRetry re-sends the same
-	// last-sent context once (upgrading a bare fallback to the user-specific
-	// uri if the account id becomes resolvable in the meantime). A positive
-	// transition disarms the pending retry, a negative clear fires it
-	// immediately (both via observeLikedRetryTransition on every state
-	// update). All fields are touched only from the run loop, so no locking
-	// is needed.
-	playRetryPending *playRetryPending
-	playRetryTimerCh <-chan time.Time
 
 	// issue #56: set while the current session is a liked-songs context —
 	// queue expansion of that session pages library tracks even if the
@@ -629,11 +584,6 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 		p.state.lastActiveDeviceId = rs.DeviceId
 		p.state.lastActiveDeviceName = rs.DeviceName
 	}
-
-	// issue #56 fix #8: an armed liked-songs escape hatch observes every
-	// active-state update — a positive transition disarms the pending retry,
-	// a negative clear fires it immediately.
-	p.observeLikedRetryTransition(ctx)
 
 	if v := p.app.voice; v != nil {
 		v.notifyPlayback(rs.IsPlaying && !rs.IsPaused)
@@ -1572,16 +1522,10 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if err := p.sendDeviceCommand(ctx, targetId, targetName, cmd); err != nil {
 			return nil, err
 		}
-		// issue #56: every new play supersedes the previous session's
-		// escape-hatch state. A liked-songs play marks the current session as
-		// a liked-songs context (queue expansion pages library tracks even for
-		// a playlist-shaped Connect echo). The real playlist context starts
-		// reliably on-device, so no escape-hatch retry is armed for it (the
-		// standalone fallback below arms nothing either).
-		p.resetLikedSession()
-		if isLiked {
-			p.likedSessionActive.Store(true)
-		}
+		// issue #56: the liked-session flag (queue expansion pages library
+		// tracks even for a playlist-shaped Connect echo) describes the
+		// current session only — every new play supersedes it.
+		p.likedSessionActive.Store(isLiked)
 		return nil, nil
 
 	case ApiRequestTypeSearch:
@@ -1760,9 +1704,7 @@ func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
 // built. Every other context passes through unchanged; the pseudo id without
 // a resolved playlist uri comes back empty — callers must treat empty as
 // "context unavailable" (sending it, or the bare pseudo id, would clear
-// playback). The legacy user-form synthesis via spotifyAccountId is no longer
-// used by this path; its source functions stay in place until the follow-up
-// cleanup pass.
+// playback).
 func (p *AppPlayer) resolvePlayContextUri(uri string) string {
 	if uri != likedCollectionUri {
 		return uri
@@ -1776,7 +1718,9 @@ func (p *AppPlayer) resolvePlayContextUri(uri string) string {
 // track via a bounded fetch. It never sends the pseudo/user-form collection
 // contexts and never marks the session as liked — it is a plain track play.
 func (p *AppPlayer) playLikedSongsFallback(ctx context.Context, targetId, targetName string, data ApiRequestDataPlay) error {
-	p.resetLikedSession()
+	// the standalone fallback is a plain track play: the previous session's
+	// liked flag does not carry over
+	p.likedSessionActive.Store(false)
 
 	trackUri := ""
 	if data.Offset != nil {
@@ -1822,260 +1766,6 @@ func (p *AppPlayer) playLikedSongsFallback(ctx context.Context, targetId, target
 	return nil
 }
 
-// likedPlayRetryDelay is how long the escape hatch waits for the Connect
-// receiver to acknowledge a liked-songs play before re-sending the same
-// last-sent context (issue #56). Cluster pushes for a freshly started context
-// land well inside this window on a healthy session; a dead context leaves the
-// active state untouched.
-const likedPlayRetryDelay = 10 * time.Second
-
-// playRetryPending is the armed escape-hatch state of one issued liked-songs
-// play: the command's target + exact payload that went out on the wire, plus a
-// snapshot of the active playback state at arm time.
-// classifyLikedRetryTransition decides what each state movement means: a
-// POSITIVE transition disarms the retry, a NEGATIVE clear fires it
-// immediately, and an unchanged state defers the decision to the timer.
-type playRetryPending struct {
-	targetId      string
-	targetName    string
-	data          ApiRequestDataPlay
-	preTrackUri   string
-	preContextUri string
-	preIsPlaying  bool
-}
-
-func activePlaybackState(p *AppPlayer) (trackUri, contextUri string, playing bool) {
-	rs := p.state.remoteState
-	if rs == nil {
-		return "", "", false
-	}
-	return rs.TrackUri, rs.ContextUri, rs.IsPlaying && !rs.IsPaused
-}
-
-// resetLikedSession clears escape-hatch state before a new play request: a
-// fresh play supersedes any armed retry (its timeout must not fire against the
-// new session's pre-snapshot) and likedSessionActive describes the current
-// session only. Run-loop only.
-func (p *AppPlayer) resetLikedSession() {
-	p.playRetryPending = nil
-	p.playRetryTimerCh = nil
-	p.likedSessionActive.Store(false)
-}
-
-// armLikedPlayRetry snapshots the current active state and arms the one-shot
-// escape-hatch retry for an issued liked-songs play. Called from the run loop
-// (handleApiRequest); the timer value lands on playRetryTimerCh in the same
-// select, so no locking is involved.
-func (p *AppPlayer) armLikedPlayRetry(targetId, targetName string, data ApiRequestDataPlay) {
-	preTrack, preCtx, prePlaying := activePlaybackState(p)
-	p.playRetryPending = &playRetryPending{
-		targetId:      targetId,
-		targetName:    targetName,
-		data:          data,
-		preTrackUri:   preTrack,
-		preContextUri: preCtx,
-		preIsPlaying:  prePlaying,
-	}
-	p.playRetryTimerCh = time.After(likedPlayRetryDelay)
-}
-
-// likedRetryOutcome classifies how the active playback state moved since the
-// liked-songs play command was issued (issue #56 fix #8).
-type likedRetryOutcome int
-
-const (
-	// likedRetryNoChange: the state is identical to the pre-snapshot — the
-	// receiver has acknowledged nothing so far; the armed timer decides.
-	likedRetryNoChange likedRetryOutcome = iota
-	// likedRetryNegative: the state moved into a cleared/stopped shape (empty
-	// track uri and not playing) — the receiver rejected the context; the
-	// one-shot retry fires immediately.
-	likedRetryNegative
-	// likedRetryPositive: the state moved into any other shape (a track is
-	// active, playback started or resumed, the context switched) — the
-	// receiver took the command; the retry must not double-issue.
-	likedRetryPositive
-)
-
-// classifyLikedRetryTransition compares the current active state with the
-// pre-snapshot taken at arm time (issue #56 fix #8). Only a POSITIVE
-// transition (a non-empty track uri and/or playback running) suppresses the
-// escape-hatch retry; a NEGATIVE clear counts as "the receiver did not take
-// the command" and triggers it immediately, while an unchanged state defers
-// the decision to the timer.
-func classifyLikedRetryTransition(pd *playRetryPending, trackUri, contextUri string, playing bool) likedRetryOutcome {
-	if trackUri == pd.preTrackUri && contextUri == pd.preContextUri && playing == pd.preIsPlaying {
-		return likedRetryNoChange
-	}
-	if trackUri == "" && !playing {
-		return likedRetryNegative
-	}
-	return likedRetryPositive
-}
-
-// observeLikedRetryTransition feeds one active-state update into the armed
-// escape hatch (issue #56): a POSITIVE transition disarms the pending retry
-// (the receiver took the command), a NEGATIVE clear fires the one-shot retry
-// immediately instead of waiting for the timer, and an unchanged state leaves
-// the armed session untouched. Called from updateRemoteState — same run loop
-// as arm/handle, so no locking is needed.
-func (p *AppPlayer) observeLikedRetryTransition(ctx context.Context) {
-	pd := p.playRetryPending
-	if pd == nil {
-		return
-	}
-	trackUri, contextUri, playing := activePlaybackState(p)
-	switch classifyLikedRetryTransition(pd, trackUri, contextUri, playing) {
-	case likedRetryPositive:
-		p.playRetryPending = nil
-		p.playRetryTimerCh = nil
-		p.app.log.Debugf("play: liked-songs retry suppressed — playback started after the command")
-	case likedRetryNegative:
-		p.app.log.Debugf("play: liked-songs retry firing early — the receiver stopped or cleared the context")
-		p.handleLikedPlayRetry(ctx)
-	}
-}
-
-// handleLikedPlayRetry re-sends the same last-sent liked-songs context once
-// (issue #56). It runs either on the armed timer's firing or directly from
-// observeLikedRetryTransition when a negative clear transition is observed.
-// Either way it first classifies the current state: if a POSITIVE transition
-// happened in between (the receiver took the command after all), the retry is
-// suppressed so it never double-issues. A bare-fallback context is re-resolved
-// here, so an account id that lands between the primary send and the retry
-// upgrades the retry to the user-specific uri; otherwise the exact last-sent
-// context goes out again. One shot: the armed state is consumed by this call,
-// so a second firing — or a firing after a superseding play — is a no-op.
-func (p *AppPlayer) handleLikedPlayRetry(ctx context.Context) {
-	p.playRetryTimerCh = nil
-	pd := p.playRetryPending
-	if pd == nil {
-		return
-	}
-	p.playRetryPending = nil
-
-	trackUri, contextUri, playing := activePlaybackState(p)
-	if classifyLikedRetryTransition(pd, trackUri, contextUri, playing) == likedRetryPositive {
-		p.app.log.Debugf("play: liked-songs retry suppressed — the active state shows playback started")
-		return
-	}
-	// NoChange (timer path: nothing moved for the full window) or Negative
-	// (the receiver stopped/cleared): the context did not take.
-
-	data := pd.data
-	if data.Uri == likedCollectionUri {
-		resolved := p.resolvePlayContextUri(data.Uri)
-		if resolved == "" || resolved == likedCollectionUri {
-			p.app.log.Warnf("play: liked-songs retry skipped — no real per-user playlist context is resolved yet and the bare pseudo context must not be sent")
-			return
-		}
-		data.Uri = resolved
-	}
-
-	// This is still a liked-songs session: queue expansion must page library
-	// tracks even if the Connect state reports a playlist-shaped id for it.
-	p.likedSessionActive.Store(true)
-	p.app.log.Infof("play: liked-songs retry with %s -> %s", data.Uri, pd.targetName)
-	if err := p.sendDeviceCommand(ctx, pd.targetId, pd.targetName, buildPlayCommand(data)); err != nil {
-		p.app.log.Warnf("play: liked-songs retry failed: %v", err)
-	}
-}
-
-// likedSongsMeTimeout caps the one-shot /v1/me account-id lookup (issue #56
-// fix #2) — opportunistic work on the play path, same bound as the queue art
-// backfill's web api lookups.
-const likedSongsMeTimeout = 3 * time.Second
-
-// spotifyAccountId resolves the Spotify account id of the paired user.
-// Resolution order (issue #56 fix #2, last-resort tier added by fix #6):
-//  1. the cached/persisted account id (set below once, survives restarts)
-//  2. one bounded Web API GET /v1/me with the same token the library and
-//     cover-art lookups already use successfully — the device-flow token is
-//     opaque so nothing can be decoded from it locally; on success the id is
-//     cached + persisted
-//  3. the JWT `sub` claim of the access token (secondary fallback for tokens
-//     that are still JWTs)
-//  4. the paired account's stored credentials username (last resort while
-//     /v1/me stays rate-limited; see credentialsAccountID)
-func (p *AppPlayer) spotifyAccountId() string {
-	if id := p.cachedAccountID(); id != "" {
-		return id
-	}
-
-	fetch := p.webMeAccountFn
-	if fetch == nil {
-		fetch = p.webApiMeAccountID
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), likedSongsMeTimeout)
-	id := fetch(ctx)
-	cancel()
-	if id != "" {
-		p.setAccountID(id) // cache + persist for the next play and restart
-		return id
-	}
-
-	// secondary fallback: tokens that are still JWTs (older auth paths)
-	p.app.state.Lock()
-	token := p.app.state.OAuth.AccessToken
-	p.app.state.Unlock()
-	if id := jwtSubClaim(token); id != "" {
-		return id
-	}
-
-	// last resort (issue #56 fix #6): the paired account's stored credentials
-	// username, valid while /v1/me stays rate-limited and no other source
-	// produced an id
-	if id := p.credentialsAccountID(); id != "" {
-		p.app.log.Debugf("play: using credentials username %s as the liked-songs account id (web api /v1/me unresolved)", id)
-		return id
-	}
-
-	return ""
-}
-
-// credentialsAccountID returns the paired account's username as stored at
-// pairing time (app.go withCredentials copies sess.Username() into
-// state.Credentials). That value is the accesspoint's CanonicalUsername —
-// filled in server-side by Spotify's APWelcome packet for every token-based
-// flow this daemon supports (device-flow QR, stored-credential replay), never
-// typed by the user — and on the paired devices it IS the Spotify account id
-// that spotify:user:<id>:collection accepts. We therefore treat it as a
-// valid id unless it is empty or email-shaped ("@" present, cf.
-// ObfuscateUsername's own heuristic). It is deliberately NOT persisted into
-// state.AccountID: that field marks an authoritative /v1/me resolution and
-// also stops the background resolver's retries, which should keep running so
-// a later successful lookup still lands.
-func (p *AppPlayer) credentialsAccountID() string {
-	p.app.state.Lock()
-	user := strings.TrimSpace(p.app.state.Credentials.Username)
-	p.app.state.Unlock()
-	if user == "" || strings.Contains(user, "@") {
-		return ""
-	}
-	return user
-}
-
-// cachedAccountID returns the persisted account id or "" when it has not
-// been resolved yet (fresh install, or state written before fix #2)
-func (p *AppPlayer) cachedAccountID() string {
-	p.app.state.Lock()
-	id := p.app.state.AccountID
-	p.app.state.Unlock()
-	return id
-}
-
-// setAccountID caches + persists the resolved account id so the /v1/me
-// lookup happens at most once per paired account. House pattern: mutate
-// under the state lock, persist outside it (cf. onOAuthTokenChanged).
-func (p *AppPlayer) setAccountID(id string) {
-	p.app.state.Lock()
-	p.app.state.AccountID = id
-	p.app.state.Unlock()
-	if err := p.app.persistState(); err != nil {
-		p.app.log.Warnf("play: failed to persist the liked-songs account id: %v", err)
-	}
-}
-
 // cachedLikedPlaylistURI returns the persisted real per-user liked-songs
 // playlist uri or "" when it has not been resolved yet (fresh install, or
 // state written before the real-playlist-context fix)
@@ -2095,156 +1785,6 @@ func (p *AppPlayer) setLikedPlaylistURI(uri string) {
 	p.app.state.Unlock()
 	if err := p.app.persistState(); err != nil {
 		p.app.log.Warnf("play: failed to persist the liked-songs playlist uri: %v", err)
-	}
-}
-
-// webApiMeAccountID performs one Web API GET /v1/me with the session's OAuth
-// token (the same opaque device-flow token the library and cover-art lookups
-// already succeed with) and returns the account id from the response. No new
-// endpoint or token is involved: only our own session token is sent, and only
-// the `id` of our own account is ever read.
-func (p *AppPlayer) webApiMeAccountID(ctx context.Context) string {
-	if p.sess == nil {
-		return ""
-	}
-	p.app.state.Lock()
-	token := p.app.state.OAuth.AccessToken
-	p.app.state.Unlock()
-	if token == "" {
-		return ""
-	}
-
-	resp, err := p.sess.WebApi(ctx, "GET", "/v1/me", nil, nil, nil)
-	if err != nil {
-		p.app.log.Debugf("play: web api /v1/me failed: %v", err)
-		return ""
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		p.app.log.Debugf("play: web api /v1/me returned status %d", resp.StatusCode)
-		return ""
-	}
-
-	var me struct {
-		ID string `json:"id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&me); err != nil {
-		p.app.log.Debugf("play: web api /v1/me decode failed: %v", err)
-		return ""
-	}
-	return me.ID
-}
-
-// issue #56 fix #4 + fix #5: pacing of the background account-id resolver.
-// During a Spotify rate-limit window the play path's ~3s /v1/me call
-// deterministically times out (spclient's 429 backoffs are 37-40s each, 5
-// retries max, a ~7s burst — always longer than the deadline), so the id never
-// persists and every liked-songs play is skipped (fix #5) until an attempt
-// lands after the window closes. The resolver below moves that work out of the
-// play path: one generous deadline per attempt (it covers a full retry burst),
-// a retry delay that doubles per consecutive failure (30s start, 5min cap),
-// and — because chronic rate-limiting can outlast any fixed attempt count —
-// a wall-clock budget instead of the old 20-attempt hard cap (fix #5).
-const (
-	accountIDAttemptTimeout      = 20 * time.Second // > spclient's ~7s worst-case retry burst
-	defaultAccountIDBudget       = 24 * time.Hour   // fix #5: wall-clock budget per resolver run (replaces the fix-#4 20-attempt cap)
-	defaultAccountIDInitialDelay = 30 * time.Second // fix #5: first retry delay, doubles per consecutive failure
-	accountIDMaxRetryDelay       = 5 * time.Minute  // fix #5: cap on the doubling retry delay
-)
-
-// resolveAccountIDInBackground fetches the Spotify account id so the play path
-// hits its cache (issue #56 fix #4, budgeted by fix #5). Each attempt gets a
-// 20s deadline — long enough for spclient's worst-case ~7s 429 retry burst to
-// finish. Failed attempts are retried until the id is persisted: the retry
-// delay doubles per consecutive failure (30s start, 5min cap) inside a
-// wall-clock budget (default 24h); a non-zero legacy attempt cap
-// (accountIDMaxAttempts) still stops the loop as well, whichever bound comes
-// first. Single-flight: app start (Run) and an OAuth re-pair
-// (onOAuthTokenChanged) may both trigger it, but the guard lets only one loop
-// run; it resets when the loop ends so a later trigger can start again. stop
-// wakes the retry delay at shutdown / player teardown; the loop also exits on
-// the first successful fetch and whenever the id is already cached.
-func (p *AppPlayer) resolveAccountIDInBackground(stop <-chan struct{}) {
-	if !p.accountIDResolverRunning.CompareAndSwap(false, true) {
-		return // another loop is already running
-	}
-	defer p.accountIDResolverRunning.Store(false)
-
-	fetch := p.webMeAccountFn
-	if fetch == nil {
-		fetch = p.webApiMeAccountID
-	}
-
-	// fix #5: the budget is the primary bound; the legacy attempt cap (fix #4
-	// shape, set only by tests/callers) still applies when non-zero.
-	budget := p.accountIDBudget
-	if budget <= 0 {
-		budget = defaultAccountIDBudget
-	}
-	maxAttempts := p.accountIDMaxAttempts
-
-	initialDelay := p.accountIDInitialDelay
-	if initialDelay <= 0 {
-		initialDelay = p.accountIDRetryDelay // fix #4 fallback
-	}
-	if initialDelay <= 0 {
-		initialDelay = defaultAccountIDInitialDelay
-	}
-	maxDelay := p.accountIDMaxDelay
-	if maxDelay <= 0 {
-		maxDelay = accountIDMaxRetryDelay
-	}
-
-	start := time.Now()
-	delay := initialDelay
-	attempt := 0
-	for {
-		gaveUp := ""
-		switch {
-		case maxAttempts > 0 && attempt >= maxAttempts:
-			gaveUp = "attempt cap"
-		case !time.Now().Before(start.Add(budget)):
-			gaveUp = "budget exhausted"
-		}
-		if gaveUp != "" {
-			p.app.log.Warnf("play: background account-id resolution gave up after %d attempts (%s elapsed of the %s budget, %s) (rate limited?)",
-				attempt, time.Since(start).Round(time.Second), budget, gaveUp)
-			return
-		}
-		attempt++
-
-		if id := p.cachedAccountID(); id != "" {
-			return // resolved in the meantime (play path or an earlier run)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), accountIDAttemptTimeout)
-		id := fetch(ctx)
-		cancel()
-		if id != "" {
-			p.setAccountID(id)
-			p.app.log.Infof("play: persisted account id %s from web api /v1/me (background)", id)
-			return
-		}
-
-		if attempt%10 == 0 {
-			p.app.log.Infof("play: background account-id attempt %d failed, %s elapsed, retrying in %s",
-				attempt, time.Since(start).Round(time.Second), delay)
-		} else {
-			p.app.log.Debugf("play: background account-id attempt %d failed, retrying in %s", attempt, delay)
-		}
-
-		select {
-		case <-stop:
-			return
-		case <-time.After(delay):
-		}
-
-		// ramp the delay per consecutive failure, capped (fix #5)
-		delay *= 2
-		if delay > maxDelay {
-			delay = maxDelay
-		}
 	}
 }
 
@@ -2376,26 +1916,6 @@ func (p *AppPlayer) fetchAndValidateLikedPlaylistURI(ctx context.Context) string
 		return ""
 	}
 	return uri
-}
-
-// jwtSubClaim extracts the `sub` claim from a three-segment JWT payload.
-// Returns "" for anything that is not a decodable JWT with a string sub.
-func jwtSubClaim(token string) string {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return ""
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return ""
-	}
-	var claims struct {
-		Sub string `json:"sub"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return ""
-	}
-	return claims.Sub
 }
 
 // buildShuffleCommand assembles the connect set_options command for the
@@ -2654,13 +2174,6 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	p.app.currentPlayer.Store(p)
 	defer p.app.currentPlayer.CompareAndSwap(p, nil)
 
-	// issue #56 fix #4: under Spotify rate limiting the play path's ~3s /v1/me
-	// call times out before spclient's 429 backoff can finish, so fetch the
-	// account id in the background — liked-songs plays then hit the cache.
-	if p.cachedAccountID() == "" {
-		go p.resolveAccountIDInBackground(ctx.Done())
-	}
-
 	// issue #56: the play path needs the REAL per-user liked-songs playlist uri
 	// (the bare pseudo context is rejected by Connect receivers), so resolve +
 	// persist it in the background once per app start when unknown. Single-
@@ -2743,11 +2256,6 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			}
 			data, err := p.handleApiRequest(ctx, req)
 			req.Reply(data, err)
-		case <-p.playRetryTimerCh:
-			// issue #56 fix #7: the armed escape-hatch retry for an issued
-			// bare liked-songs play is due (no active state change since the
-			// command — re-send with the resolved user-specific collection uri)
-			p.handleLikedPlayRetry(ctx)
 		case meta := <-p.metaResolvedCh:
 			// background current track metadata
 			if p.metaResolveInFlight == meta.uri {

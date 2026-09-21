@@ -34,10 +34,8 @@ func TestFileStateStoreSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
-// issue #56: setAccountID persists via persistState -> Save, so the resolved
-// liked-songs account id must actually land in state.json (as "account_id")
-// and survive a restart — otherwise every fresh daemon run would re-send the
-// dead pseudo context until /v1/me succeeds again.
+// issue #56: AppState.AccountID is a persisted field — whatever writes it must
+// land in state.json (as "account_id") and survive a restart via Save/Load.
 func TestFileStateStoreSavePersistsAccountID(t *testing.T) {
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "state.json")
