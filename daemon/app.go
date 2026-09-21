@@ -84,6 +84,11 @@ type App struct {
 	// onOAuthTokenChanged starts (see resolveAccountIDInBackground)
 	accountIDStopCh chan struct{}
 
+	// issue #56: shutdown signal for the background liked-songs playlist-uri
+	// resolver started from Run / the me/playlists scan / re-pair (see
+	// resolveLikedPlaylistURIInBackground)
+	likedPlaylistStopCh chan struct{}
+
 	// pre-network attempt sits in DNS resolution for 20-30s. parking here until network is up dodges that
 	onlineMu sync.Mutex
 	isOnline bool
@@ -134,8 +139,11 @@ func New(opts *Options) (*App, error) {
 		retryNowCh:      make(chan struct{}, 1),
 		onlineCh:        make(chan struct{}),
 		accountIDStopCh: make(chan struct{}),
-		hashes:          newHashStore(),
-		startedAt:       time.Now(),
+		// issue #56: persistent stop for the background liked-songs playlist-uri
+		// resolver (App has no context of its own, cf. accountIDStopCh)
+		likedPlaylistStopCh: make(chan struct{}),
+		hashes:              newHashStore(),
+		startedAt:           time.Now(),
 	}
 
 	var err error
@@ -451,6 +459,8 @@ func (app *App) Close() error {
 	// issue #56 fix #4: wake any sleeping background account-id resolver; the
 	// closed flag above guarantees this closes exactly once
 	close(app.accountIDStopCh)
+	// issue #56: same shutdown signal for the liked-songs playlist-uri resolver
+	close(app.likedPlaylistStopCh)
 
 	if app.piRecovery != nil {
 		app.piRecovery.Stop()
@@ -485,12 +495,15 @@ func (app *App) onOAuthTokenChanged(oauth *librespot.OAuthState) {
 	// (re-)authenticated — a cached account id from a previous pairing no
 	// longer applies and is dropped so the next liked-songs play re-derives
 	// it via /v1/me. Routine hourly refreshes keep the same refresh token
-	// and leave the cache intact.
+	// and leave the cache intact. issue #56: the real per-user liked-songs
+	// playlist uri belongs to the same account, so a re-pairing drops it as
+	// well — the background resolver re-derives it from me/playlists.
 	accountIDCleared := false
 	if app.state.OAuth.RefreshToken != "" &&
 		oauth.RefreshToken != "" &&
 		oauth.RefreshToken != app.state.OAuth.RefreshToken {
 		app.state.AccountID = ""
+		app.state.LikedPlaylistURI = ""
 		accountIDCleared = true
 	}
 	app.state.OAuth = *oauth
@@ -503,10 +516,13 @@ func (app *App) onOAuthTokenChanged(oauth *librespot.OAuthState) {
 	// re-resolve it in the background so the next liked-songs play hits the
 	// cache instead of the ~3s /v1/me on the play path (which times out under
 	// Spotify rate limiting). The single-flight guard inside the resolver
-	// keeps this from racing a loop started at app start.
+	// keeps this from racing a loop started at app start. issue #56: the
+	// same re-pairing dropped the liked-songs playlist uri too — restart its
+	// background resolver as well (single-flight likewise).
 	if accountIDCleared {
 		if player := app.currentPlayer.Load(); player != nil {
 			go player.resolveAccountIDInBackground(app.accountIDStopCh)
+			go player.resolveLikedPlaylistURIInBackground(app.likedPlaylistStopCh)
 		}
 	}
 }

@@ -114,6 +114,24 @@ type AppPlayer struct {
 	accountIDInitialDelay time.Duration
 	accountIDMaxDelay     time.Duration
 
+	// issue #56 (real playlist context): single-flight guard for the background
+	// liked-songs playlist-URI resolver — app start (Run), an OAuth re-pair and
+	// the opportunistic me/playlists scan may all trigger it, but only one loop
+	// runs per player; reset when the loop finishes so a later trigger can start
+	// a fresh one.
+	likedPlaylistURIRunning atomic.Bool
+
+	// issue #56 (real playlist context): pacing of the background resolver,
+	// swappable in tests (zero values = the production defaults below)
+	likedPlaylistBudget       time.Duration
+	likedPlaylistInitialDelay time.Duration
+	likedPlaylistMaxDelay     time.Duration
+
+	// issue #56 (real playlist context): the bounded first-library-track fetch
+	// behind the standalone-playback fallback, swappable in tests
+	// (nil = the real libraryTracksPage(0, 1))
+	libraryFirstTrackFn func(ctx context.Context) (string, error)
+
 	// issue #56: escape hatch for the liked-songs context. The primary play
 	// sends the user-specific collection uri when the account id is
 	// resolvable, and the bare pseudo id as a documented best-effort fallback
@@ -1508,13 +1526,13 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		return nil, p.sendActiveDeviceVolume(ctx, target)
 
 	case ApiRequestTypePlay:
-		// tell the target device to start a context. issue #56: the primary
-		// liked-songs play sends the user-specific collection uri (the form
-		// proven to start playback on the device); when no account id source
-		// resolves, the bare pseudo id is sent as a documented legacy
-		// best-effort fallback. offset/skipTo pass through unchanged, and the
-		// escape hatch below re-sends the same last-sent context once if the
-		// receiver does not actually start playback.
+		// tell the target device to start a context. issue #56: liked songs
+		// play through the REAL per-user playlist uri (spotify:playlist:<id>,
+		// resolved in the background and persisted) — the bare pseudo id AND
+		// the user-specific collection form before it are both rejected by
+		// Connect receivers and clear playback, so neither is ever sent. Until
+		// a real uri has resolved, a liked-songs tap falls back to standalone
+		// track playback (the tapped track, or the first library track).
 		data, _ := req.Data.(ApiRequestDataPlay)
 		if data.Uri == "" {
 			return nil, fmt.Errorf("play requires a context uri")
@@ -1527,10 +1545,14 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		isLiked := data.Uri == likedCollectionUri
 		sendData := data
 		if isLiked {
-			sendData.Uri = p.resolvePlayContextUri(data.Uri)
-			if sendData.Uri == likedCollectionUri {
-				p.app.log.Warnf("play: liked-songs account id unresolved — sending the bare pseudo context as a best-effort fallback")
+			resolved := p.cachedLikedPlaylistURI()
+			if resolved == "" {
+				// the real context is not available yet — never send the
+				// pseudo/user-form collection contexts (the receiver rejects
+				// them), play the track standalone instead
+				return nil, p.playLikedSongsFallback(ctx, targetId, targetName, data)
 			}
+			sendData.Uri = resolved
 		}
 		cmd := buildPlayCommand(sendData)
 		shuf := "inherit"
@@ -1552,13 +1574,13 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		// issue #56: every new play supersedes the previous session's
 		// escape-hatch state. A liked-songs play marks the current session as
-		// a liked-songs context (queue expansion pages library tracks even
-		// for a playlist-shaped Connect echo) and arms the one-shot retry with
-		// the exact context that just went out on the wire.
+		// a liked-songs context (queue expansion pages library tracks even for
+		// a playlist-shaped Connect echo). The real playlist context starts
+		// reliably on-device, so no escape-hatch retry is armed for it (the
+		// standalone fallback below arms nothing either).
 		p.resetLikedSession()
 		if isLiked {
 			p.likedSessionActive.Store(true)
-			p.armLikedPlayRetry(targetId, targetName, sendData)
 		}
 		return nil, nil
 
@@ -1723,31 +1745,81 @@ func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
 	return cmd
 }
 
-// issue #56: the bare "Liked Songs" pseudo context id is not reliably
-// resolvable on a Connect receiver, while each account's liked songs are
-// addressed by the user-specific public collection
-// `spotify:user:<userId>:collection:tracks`. The play path uses that
-// user-specific form whenever spotifyAccountId can resolve <id> (cached /v1/me
-// result, bounded /v1/me lookup, JWT sub claim, or stored credentials username)
-// and falls back to the bare pseudo id only when no source does — a documented
-// legacy best effort. Spotify's global "Today's Top Hits" playlist is NOT an
+// issue #56: the bare "Liked Songs" pseudo context id AND the user-specific
+// `spotify:user:<id>:collection:tracks` form are both rejected by Connect
+// receivers (proven on-device: playback is cleared). The only liked-songs
+// context that reliably starts is the REAL per-user playlist uri
+// (spotify:playlist:<id>), which the background resolver / the opportunistic
+// me/playlists scan persist in state.LikedPlaylistURI. Until it resolves, a
+// liked-songs tap uses the standalone-track fallback instead of sending an
+// unusable context. Spotify's global "Today's Top Hits" playlist is NOT an
 // account-scoped liked-songs context and must not be sent here.
 
-// resolvePlayContextUri replaces the bare liked-songs pseudo context with the
-// resolvable user-specific collection uri right before the play command
-// envelope is built. Every other context passes through unchanged; a pseudo id
-// without a resolvable account id comes back as the bare pseudo uri (the
-// documented best-effort fallback).
+// resolvePlayContextUri maps the bare liked-songs pseudo context to the
+// persisted real per-user playlist uri before the play command envelope is
+// built. Every other context passes through unchanged; the pseudo id without
+// a resolved playlist uri comes back empty — callers must treat empty as
+// "context unavailable" (sending it, or the bare pseudo id, would clear
+// playback). The legacy user-form synthesis via spotifyAccountId is no longer
+// used by this path; its source functions stay in place until the follow-up
+// cleanup pass.
 func (p *AppPlayer) resolvePlayContextUri(uri string) string {
 	if uri != likedCollectionUri {
 		return uri
 	}
-	id := p.spotifyAccountId()
-	if id == "" {
-		p.app.log.Debugf("play: liked-songs context unresolved (no account id via web api /v1/me, the OAuth token, or the stored credentials)")
-		return uri
+	return p.cachedLikedPlaylistURI()
+}
+
+// playLikedSongsFallback serves a liked-songs tap while the real per-user
+// playlist uri has not resolved yet (issue #56): standalone playback of the
+// tapped track when the offset carries one, otherwise of the first library
+// track via a bounded fetch. It never sends the pseudo/user-form collection
+// contexts and never marks the session as liked — it is a plain track play.
+func (p *AppPlayer) playLikedSongsFallback(ctx context.Context, targetId, targetName string, data ApiRequestDataPlay) error {
+	p.resetLikedSession()
+
+	trackUri := ""
+	if data.Offset != nil {
+		trackUri = data.Offset.Uri
 	}
-	return "spotify:user:" + id + ":collection:tracks"
+	if trackUri == "" {
+		fetch := p.libraryFirstTrackFn
+		if fetch == nil {
+			fetch = func(c context.Context) (string, error) {
+				items, _, err := p.libraryTracksPage(c, 0, 1, false)
+				if err != nil {
+					return "", err
+				}
+				if len(items) == 0 || items[0].Uri == "" {
+					return "", fmt.Errorf("library has no tracks")
+				}
+				return items[0].Uri, nil
+			}
+		}
+		boundedCtx, cancel := context.WithTimeout(ctx, likedFallbackFetchTimeout)
+		defer cancel()
+		fetched, err := fetch(boundedCtx)
+		if err != nil {
+			p.app.log.Warnf("play: liked-songs fallback could not resolve a first library track (%v)", err)
+			return fmt.Errorf("liked songs are still being set up, please try again shortly")
+		}
+		trackUri = fetched
+		p.app.log.Infof("play: liked-songs context unresolved, falling back to first library track %s", trackUri)
+	} else {
+		p.app.log.Infof("play: liked-songs context unresolved, falling back to standalone track %s", trackUri)
+	}
+
+	if trackUri == "" {
+		// an empty offset uri or an empty fetch result would send a context
+		// the receiver cannot honor — refuse like any other setup failure
+		return fmt.Errorf("liked songs are still being set up, please try again shortly")
+	}
+
+	cmd := buildPlayCommand(ApiRequestDataPlay{Uri: trackUri, Shuffle: data.Shuffle})
+	if err := p.sendDeviceCommand(ctx, targetId, targetName, cmd); err != nil {
+		return fmt.Errorf("liked-songs fallback play failed: %w", err)
+	}
+	return nil
 }
 
 // likedPlayRetryDelay is how long the escape hatch waits for the Connect
@@ -1892,10 +1964,12 @@ func (p *AppPlayer) handleLikedPlayRetry(ctx context.Context) {
 
 	data := pd.data
 	if data.Uri == likedCollectionUri {
-		data.Uri = p.resolvePlayContextUri(data.Uri)
-		if data.Uri == likedCollectionUri {
-			p.app.log.Warnf("play: liked-songs retry still unresolved — re-sending the bare pseudo context as a best-effort fallback")
+		resolved := p.resolvePlayContextUri(data.Uri)
+		if resolved == "" || resolved == likedCollectionUri {
+			p.app.log.Warnf("play: liked-songs retry skipped — no real per-user playlist context is resolved yet and the bare pseudo context must not be sent")
+			return
 		}
+		data.Uri = resolved
 	}
 
 	// This is still a liked-songs session: queue expansion must page library
@@ -1999,6 +2073,28 @@ func (p *AppPlayer) setAccountID(id string) {
 	p.app.state.Unlock()
 	if err := p.app.persistState(); err != nil {
 		p.app.log.Warnf("play: failed to persist the liked-songs account id: %v", err)
+	}
+}
+
+// cachedLikedPlaylistURI returns the persisted real per-user liked-songs
+// playlist uri or "" when it has not been resolved yet (fresh install, or
+// state written before the real-playlist-context fix)
+func (p *AppPlayer) cachedLikedPlaylistURI() string {
+	p.app.state.Lock()
+	uri := p.app.state.LikedPlaylistURI
+	p.app.state.Unlock()
+	return uri
+}
+
+// setLikedPlaylistURI caches + persists the resolved liked-songs playlist uri
+// so every later play goes out with the real context directly. House pattern:
+// mutate under the state lock, persist outside it (cf. onOAuthTokenChanged).
+func (p *AppPlayer) setLikedPlaylistURI(uri string) {
+	p.app.state.Lock()
+	p.app.state.LikedPlaylistURI = uri
+	p.app.state.Unlock()
+	if err := p.app.persistState(); err != nil {
+		p.app.log.Warnf("play: failed to persist the liked-songs playlist uri: %v", err)
 	}
 }
 
@@ -2150,6 +2246,136 @@ func (p *AppPlayer) resolveAccountIDInBackground(stop <-chan struct{}) {
 			delay = maxDelay
 		}
 	}
+}
+
+// issue #56 (real playlist context): pacing of the background liked-songs
+// playlist-URI resolver — the same shape as the account-id resolver: one
+// generous deadline per attempt, a retry delay that doubles per consecutive
+// failure (30s start, 5min cap), and a wall-clock budget instead of an
+// attempt count (chronic Spotify rate-limiting can outlast any fixed count).
+const (
+	likedPlaylistAttemptTimeout      = 20 * time.Second // > spclient's ~7s worst-case retry burst
+	defaultLikedPlaylistBudget       = 24 * time.Hour   // wall-clock budget per resolver run
+	defaultLikedPlaylistInitialDelay = 30 * time.Second // first retry delay, doubles per consecutive failure
+	likedPlaylistMaxRetryDelay       = 5 * time.Minute  // cap on the doubling retry delay
+
+	// likedFallbackFetchTimeout bounds the opportunistic first-library-track
+	// fetch of the standalone-playback fallback — it must stay well inside the
+	// UI's patience for a play tap even under Spotify rate limiting.
+	likedFallbackFetchTimeout = 3 * time.Second
+)
+
+// resolveLikedPlaylistURIInBackground resolves the REAL per-user liked-songs
+// playlist uri (spotify:playlist:<id>) so the play path can send a context
+// Connect receivers actually accept (issue #56). Each attempt issues one
+// libraryV3 pathfinder query — the same persisted query me/playlists serves —
+// scans its Liked-Songs pseudo item for a nested playlist uri, and validates
+// the candidate with one fetchPlaylist count query (a 200 with tracks is the
+// acceptance bar). Failed attempts are retried until the uri is persisted:
+// the retry delay doubles per consecutive failure (30s start, 5min cap)
+// inside a wall-clock budget (default 24h). Single-flight: app start (Run),
+// an OAuth re-pair (onOAuthTokenChanged) and the opportunistic me/playlists
+// scan may all trigger it, but the guard lets only one loop run; it resets
+// when the loop ends so a later trigger can start again. stop wakes the retry
+// delay at shutdown / player teardown; the loop also exits on the first
+// successful resolution and whenever the uri is already persisted.
+func (p *AppPlayer) resolveLikedPlaylistURIInBackground(stop <-chan struct{}) {
+	if !p.likedPlaylistURIRunning.CompareAndSwap(false, true) {
+		return // another loop is already running
+	}
+	defer p.likedPlaylistURIRunning.Store(false)
+
+	budget := p.likedPlaylistBudget
+	if budget <= 0 {
+		budget = defaultLikedPlaylistBudget
+	}
+	initialDelay := p.likedPlaylistInitialDelay
+	if initialDelay <= 0 {
+		initialDelay = defaultLikedPlaylistInitialDelay
+	}
+	maxDelay := p.likedPlaylistMaxDelay
+	if maxDelay <= 0 {
+		maxDelay = likedPlaylistMaxRetryDelay
+	}
+
+	start := time.Now()
+	delay := initialDelay
+	attempt := 0
+	for {
+		if !time.Now().Before(start.Add(budget)) {
+			p.app.log.Warnf("play: background liked-playlist-uri resolution gave up after %d attempts (%s of the %s budget) (rate limited?)",
+				attempt, time.Since(start).Round(time.Second), budget)
+			return
+		}
+		attempt++
+
+		if p.cachedLikedPlaylistURI() != "" {
+			return // resolved in the meantime (play path or an earlier run)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), likedPlaylistAttemptTimeout)
+		uri := p.fetchAndValidateLikedPlaylistURI(ctx)
+		cancel()
+		if uri != "" {
+			p.setLikedPlaylistURI(uri)
+			p.app.log.Infof("play: persisted liked-songs playlist uri %s (background)", uri)
+			return
+		}
+
+		if attempt%10 == 0 {
+			p.app.log.Infof("play: background liked-playlist-uri attempt %d failed, %s elapsed, retrying in %s",
+				attempt, time.Since(start).Round(time.Second), delay)
+		} else {
+			p.app.log.Debugf("play: background liked-playlist-uri attempt %d failed, retrying in %s", attempt, delay)
+		}
+
+		select {
+		case <-stop:
+			return
+		case <-time.After(delay):
+		}
+
+		// ramp the delay per consecutive failure, capped
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+}
+
+// fetchAndValidateLikedPlaylistURI runs one resolution attempt: one libraryV3
+// pathfinder query (the same shape me/playlists sends), a scoped scan of its
+// Liked-Songs pseudo item for the nested real playlist uri, and a validating
+// count query that accepts the candidate only with tracks. Returns "" when any
+// step fails or finds nothing.
+func (p *AppPlayer) fetchAndValidateLikedPlaylistURI(ctx context.Context) string {
+	body := p.pfBody("libraryV3", map[string]any{
+		"filters":                      []string{"Playlists"},
+		"order":                        nil,
+		"textFilter":                   "",
+		"features":                     []string{"LIKED_SONGS", "YOUR_EPISODES_V2", "PRERELEASES", "EVENTS"},
+		"limit":                        50, // me/playlists' default page — the pseudo item rides it
+		"offset":                       0,
+		"flatten":                      true,
+		"expandedFolders":              []string{},
+		"folderUri":                    nil,
+		"includeFoldersWhenFlattening": false,
+	})
+	data, err := p.pathfinderQueryEx(ctx, body, false)
+	if err != nil {
+		p.app.log.Debugf("play: liked-playlist libraryV3 query failed: %v", err)
+		return ""
+	}
+	uri := p.scanLikedPlaylistURI(data)
+	if uri == "" {
+		return "" // the scan logged the raw item at debug level for pinning
+	}
+	total, ok := p.fetchPlaylistCount(ctx, uri)
+	if !ok || total <= 0 {
+		p.app.log.Debugf("play: liked-playlist candidate %s failed validation (total=%d ok=%v)", uri, total, ok)
+		return ""
+	}
+	return uri
 }
 
 // jwtSubClaim extracts the `sub` claim from a three-segment JWT payload.
@@ -2433,6 +2659,15 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	// account id in the background — liked-songs plays then hit the cache.
 	if p.cachedAccountID() == "" {
 		go p.resolveAccountIDInBackground(ctx.Done())
+	}
+
+	// issue #56: the play path needs the REAL per-user liked-songs playlist uri
+	// (the bare pseudo context is rejected by Connect receivers), so resolve +
+	// persist it in the background once per app start when unknown. Single-
+	// flight inside the resolver: a second trigger (me/playlists scan, re-pair)
+	// is a no-op while it runs.
+	if p.cachedLikedPlaylistURI() == "" {
+		go p.resolveLikedPlaylistURIInBackground(ctx.Done())
 	}
 
 	p.lyricsProvider = NewLyricsProvider(p.app.log, func(ctx context.Context, force bool) (string, error) {

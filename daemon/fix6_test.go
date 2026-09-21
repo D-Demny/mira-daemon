@@ -4,14 +4,16 @@ import (
 	"testing"
 )
 
-// issue #56 fix #6 — the play path's last-resort account-id tier: while the
-// Web API GET /v1/me stays rate-limited and no cached/JWT id exists, the
-// paired account's stored credentials username (state.Credentials.Username,
-// the Spotify-issued APWelcome canonical username captured at pairing) builds
-// the user-specific liked-songs collection uri; when even that is unusable
-// the play falls back to the bare pseudo context. Reuses the existing seams
-// (fakeMeFn + recordingStateStore from api_server_test.go;
-// newBGResolverPlayer from fix4_test.go).
+// issue #56 fix #6 — the account-id resolution chain's last-resort tier: while
+// the Web API GET /v1/me stays rate-limited and no cached/JWT id exists, the
+// paired account's stored credentials username (state.Credentials.Username)
+// supplies the id. The chain itself is untouched by the playlist-uri rework —
+// but the play path now resolves liked songs through the persisted per-user
+// PLAYLIST uri instead of an account id, so the resolve tests below pin that
+// no credentials tier ever synthesizes a context: while nothing is resolved,
+// resolvePlayContextUri yields "" and the play path owns the standalone-track
+// fallback. Reuses the existing seams (fakeMeFn + recordingStateStore from
+// api_server_test.go; newBGResolverPlayer from fix4_test.go).
 
 // (a) /v1/me success: the fetched id wins and is cached + persisted exactly
 // once — a pre-existing credentials username must not shadow it.
@@ -36,45 +38,42 @@ func TestSpotifyAccountId_WebMeSuccessWinsOverCredentials(t *testing.T) {
 	}
 }
 
-// (b) /v1/me failure + credentials username present: the fallback id is used,
-// the liked-songs context builds, and nothing is persisted — state.AccountID
-// stays reserved for an authoritative /v1/me resolution (the background
-// resolver must keep retrying).
-func TestResolvePlayContextUri_WebMeFailureFallsBackToCredentials(t *testing.T) {
+// (b) /v1/me failing + credentials username present: the playlist-uri rework
+// no longer synthesizes a liked-songs context from an account id — resolve
+// yields "" (the play path owns the standalone-track fallback), no /v1/me
+// traffic happens, and nothing is persisted. Once a playlist uri IS persisted
+// it short-circuits everything regardless of credentials.
+func TestResolvePlayContextUri_IgnoresCredentialsUsername(t *testing.T) {
 	t.Parallel()
 	p, state, store, me := newBGResolverPlayer(t) // me.id == "" — chronic-429 shape
 	state.Credentials.Username = "1234567890"
 
 	uri := p.resolvePlayContextUri(likedCollectionUri)
-	if want := "spotify:user:1234567890:collection:tracks"; uri != want {
-		t.Errorf("liked-songs context: got %q want %q", uri, want)
+	if uri != "" {
+		t.Errorf("unresolved liked context: got %q want empty (no user-form synthesis from credentials)", uri)
 	}
-	if n := me.calls.Load(); n != 1 {
-		t.Errorf("/v1/me lookups: got %d want exactly 1 (the fallback is tried only after a failed lookup)", n)
+	if n := me.calls.Load(); n != 0 {
+		t.Errorf("/v1/me lookups: got %d want 0 (the play path does no account-id work)", n)
 	}
 	if state.AccountID != "" {
-		t.Errorf("state.AccountID: got %q want empty (the credentials fallback must not be persisted)", state.AccountID)
+		t.Errorf("state.AccountID: got %q want empty", state.AccountID)
 	}
 	if n := store.saves.Load(); n != 0 {
 		t.Errorf("persist saves: got %d want 0", n)
 	}
 
-	// the fallback is stable across plays on the same player (every play
-	// re-tries the bounded /v1/me lookup — the credentials fallback is
-	// deliberately not cached)
-	if uri2 := p.resolvePlayContextUri(likedCollectionUri); uri2 != uri {
-		t.Errorf("repeat play: got %q, want %q", uri2, uri)
-	}
-	if n := me.calls.Load(); n != 2 {
-		t.Errorf("/v1/me lookups over two resolves: got %d want exactly 2 (no caching of the credentials fallback)", n)
+	// a persisted playlist uri wins outright — no credentials tier in sight
+	p.app.state.LikedPlaylistURI = "spotify:playlist:late-real"
+	if got := p.resolvePlayContextUri(likedCollectionUri); got != "spotify:playlist:late-real" {
+		t.Errorf("resolved liked context: got %q want the persisted playlist uri", got)
 	}
 }
 
-// (c) both /v1/me and the credentials username unavailable (or email-shaped):
-// nothing is refused — the play falls back to the bare pseudo context as a
-// documented legacy best effort, and state.AccountID stays reserved for an
-// authoritative resolution.
-func TestResolvePlayContextUri_NoUsableIdKeepsBareFallback(t *testing.T) {
+// (c) nothing persisted and the credentials username unusable (empty or
+// email-shaped): resolve yields "" — nothing is refused and no rejected
+// context goes out; state.AccountID stays reserved for an authoritative
+// resolution.
+func TestResolvePlayContextUri_UnresolvedYieldsEmpty(t *testing.T) {
 	t.Parallel()
 
 	// (c1) genuinely empty credentials username
@@ -82,21 +81,20 @@ func TestResolvePlayContextUri_NoUsableIdKeepsBareFallback(t *testing.T) {
 	if state.Credentials.Username != "" {
 		t.Fatal("test precondition: credentials username must be empty")
 	}
-	uri := p.resolvePlayContextUri(likedCollectionUri)
-	if uri != likedCollectionUri {
-		t.Errorf("no usable id: got %q, want the bare pseudo context as best-effort fallback", uri)
+	if uri := p.resolvePlayContextUri(likedCollectionUri); uri != "" {
+		t.Errorf("no persisted uri: got %q, want empty (the play path owns the fallback)", uri)
 	}
-	if n := me.calls.Load(); n != 1 {
-		t.Errorf("/v1/me lookups: got %d want exactly 1 (still tried before falling back)", n)
+	if n := me.calls.Load(); n != 0 {
+		t.Errorf("/v1/me lookups: got %d want 0", n)
 	}
 
-	// (c2) an email-shaped credentials value is not a usable account id
+	// (c2) an email-shaped credentials value never builds a context
 	p2, state2, _, me2 := newBGResolverPlayer(t) // me2.id == ""
 	state2.Credentials.Username = "user@example.com"
-	if uri := p2.resolvePlayContextUri(likedCollectionUri); uri != likedCollectionUri {
-		t.Errorf("email-shaped credentials username must not build a user-form context, got %q", uri)
-	} else if me2.calls.Load() != 1 {
-		t.Errorf("/v1/me lookups: got %d want exactly 1", me2.calls.Load())
+	if uri := p2.resolvePlayContextUri(likedCollectionUri); uri != "" {
+		t.Errorf("email-shaped credentials must not build a liked-songs context, got %q", uri)
+	} else if me2.calls.Load() != 0 {
+		t.Errorf("/v1/me lookups: got %d want 0", me2.calls.Load())
 	}
 	if state2.AccountID != "" {
 		t.Errorf("state.AccountID must stay empty: got %q", state2.AccountID)

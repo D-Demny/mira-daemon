@@ -560,87 +560,47 @@ type fakeMeFn struct {
 
 func (f *fakeMeFn) fn(ctx context.Context) string { f.calls.Add(1); return f.id }
 
-func TestResolvePlayContextUri_CachedAccountIDIsFastPath(t *testing.T) {
+// issue #56: liked-songs context resolution no longer does any account-id
+// work — it returns the persisted real per-user playlist uri when one has been
+// resolved (background resolver / opportunistic me/playlists scan), and ""
+// otherwise so the play path can fall back to standalone track playback. The
+// bare pseudo id and the legacy user-specific collection form are never
+// synthesized here; they are rejected by Connect receivers.
+func TestResolvePlayContextUri_ReturnsPersistedPlaylistUri(t *testing.T) {
 	t.Parallel()
 
-	me := &fakeMeFn{} // must NOT be called — the cached id short-circuits
+	me := &fakeMeFn{id: "webapi-user"} // must NOT be called — resolution is a state read
 	state := &librespot.AppState{
-		OAuth:     librespot.OAuthState{AccessToken: "opaque-token-no-dots"},
-		AccountID: "cached-user",
+		OAuth:            librespot.OAuthState{AccessToken: "opaque-token-no-dots"},
+		LikedPlaylistURI: "spotify:playlist:37i9dQZF1F5p3rmiWPIYgZ",
 	}
 	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}, webMeAccountFn: me.fn}
 
 	got := p.resolvePlayContextUri(likedCollectionUri)
-	if want := "spotify:user:cached-user:collection:tracks"; got != want {
-		t.Fatalf("cached fast path: got %q want %q", got, want)
+	if want := "spotify:playlist:37i9dQZF1F5p3rmiWPIYgZ"; got != want {
+		t.Fatalf("persisted uri: got %q want %q", got, want)
 	}
 	if n := me.calls.Load(); n != 0 {
-		t.Errorf("web api /v1/me looked up %d times with a cached id, want 0", n)
+		t.Errorf("web api /v1/me looked up %d times on the resolve path, want 0 (no account-id work)", n)
 	}
 }
 
-func TestResolvePlayContextUri_WebApiMeFetchCachesAndPersists(t *testing.T) {
+// nothing persisted yet: the pseudo id resolves to "" — the caller treats
+// empty as "context unavailable" and owns the fallback. No /v1/me traffic on
+// the way, and every other context passes through byte-for-byte (including
+// the legacy user-form an older session may still echo).
+func TestResolvePlayContextUri_UnresolvedYieldsEmptyWithNoWebTraffic(t *testing.T) {
 	t.Parallel()
 
-	store := &recordingStateStore{}
-	me := &fakeMeFn{id: "webapi-user"} // the live device token is opaque — no JWT sub
+	me := &fakeMeFn{id: "webapi-user"} // must NOT be called
 	state := &librespot.AppState{OAuth: librespot.OAuthState{AccessToken: "opaque-token-no-dots"}}
-	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: store}, webMeAccountFn: me.fn}
-
-	// first play: fetches /v1/me, resolves, caches + persists
-	got := p.resolvePlayContextUri(likedCollectionUri)
-	if want := "spotify:user:webapi-user:collection:tracks"; got != want {
-		t.Fatalf("first resolve: got %q want %q", got, want)
-	}
-	if state.AccountID != "webapi-user" {
-		t.Errorf("state.AccountID after resolve: got %q want webapi-user", state.AccountID)
-	}
-	if n := store.saves.Load(); n != 1 {
-		t.Errorf("persistence saves after first resolve: got %d want 1", n)
-	}
-
-	// second play: cached id, no further /v1/me traffic
-	got = p.resolvePlayContextUri(likedCollectionUri)
-	if want := "spotify:user:webapi-user:collection:tracks"; got != want {
-		t.Fatalf("second resolve: got %q want %q", got, want)
-	}
-	if n := me.calls.Load(); n != 1 {
-		t.Errorf("/v1/me looked up %d times over two resolves, want exactly 1", n)
-	}
-	if n := store.saves.Load(); n != 1 {
-		t.Errorf("persistence saves after second resolve: got %d want 1 (already persisted)", n)
-	}
-
-	// the play envelope carries the resolved context as its connect uri
-	cmd := buildPlayCommand(ApiRequestDataPlay{Uri: got, SkipToUri: "spotify:track:abc"})
-	if cmd.Context.Uri != got || cmd.Context.Url != "context://"+got {
-		t.Errorf("envelope context: got uri=%q url=%q, want %q", cmd.Context.Uri, cmd.Context.Url, got)
-	}
-}
-
-func TestResolvePlayContextUri_WebApiFailureFallsBackToJwtSub(t *testing.T) {
-	t.Parallel()
-
-	me := &fakeMeFn{id: ""} // /v1/me unreachable (rate limit, offline, ...)
-	state := &librespot.AppState{OAuth: librespot.OAuthState{AccessToken: fakeJwt(map[string]any{"sub": "user123"})}}
 	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}, webMeAccountFn: me.fn}
 
-	// issue #56 fix #2 resolution order (3): a failed /v1/me must fall back
-	// to the JWT sub claim of tokens that are still JWTs ...
-	got := p.resolvePlayContextUri(likedCollectionUri)
-	if want := "spotify:user:user123:collection:tracks"; got != want {
-		t.Fatalf("jwt fallback: got %q want %q", got, want)
+	if got := p.resolvePlayContextUri(likedCollectionUri); got != "" {
+		t.Errorf("unresolved liked context: got %q want empty (the play path owns the fallback)", got)
 	}
-	if n := me.calls.Load(); n != 1 {
-		t.Errorf("/v1/me looked up %d times before the jwt fallback, want 1", n)
-	}
-	if state.AccountID != "" {
-		t.Errorf("state.AccountID must stay empty when only the jwt fallback resolved: got %q", state.AccountID)
-	}
-
-	// every other context passes through unchanged (byte-for-byte envelope
-	// for real playlists + all other contexts, invariant of the #56 fix)
 	for _, uri := range []string{
+		"spotify:user:u1:collection:tracks", // legacy echo form passes through untouched
 		"spotify:playlist:abc123",
 		"spotify:album:abc123",
 		"spotify:track:xyz789",
@@ -650,29 +610,29 @@ func TestResolvePlayContextUri_WebApiFailureFallsBackToJwtSub(t *testing.T) {
 			t.Errorf("passthrough %q: got %q", uri, res)
 		}
 	}
+	if n := me.calls.Load(); n != 0 {
+		t.Errorf("web api /v1/me looked up %d times, want 0 (nothing account-id-related on this path)", n)
+	}
 }
 
-func TestResolvePlayContextUri_OpaqueTokenWithoutIdKeepsLegacyBareContext(t *testing.T) {
+// the resolved context rides the play envelope as its connect uri/url, with
+// any skip-to riding along.
+func TestResolvePlayContextUri_EnvelopeCarriesResolvedContext(t *testing.T) {
 	t.Parallel()
 
-	me := &fakeMeFn{id: ""} // /v1/me failed AND the token is opaque (live device shape)
-	state := &librespot.AppState{OAuth: librespot.OAuthState{AccessToken: "opaque-token-no-dots"}}
-	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}, webMeAccountFn: me.fn}
-
-	// issue #56 fix #2 resolution order (4): nothing resolvable keeps the
-	// legacy behavior — the bare pseudo context goes out as before (that
-	// mode cannot start liked songs either way; no regression)
-	if got := p.resolvePlayContextUri(likedCollectionUri); got != likedCollectionUri {
-		t.Errorf("no resolvable id: got %q want the bare pseudo context (legacy)", got)
+	state := &librespot.AppState{
+		OAuth:            librespot.OAuthState{AccessToken: "opaque-token-no-dots"},
+		LikedPlaylistURI: "spotify:playlist:liked-real",
 	}
+	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}}
 
-	// no OAuth token at all (e.g. static-token mode) stays legacy as well
-	pNoAuth := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: &librespot.AppState{}, stateStore: nopStateStore{}}, webMeAccountFn: me.fn}
-	if got := pNoAuth.resolvePlayContextUri(likedCollectionUri); got != likedCollectionUri {
-		t.Errorf("no token: got %q want the bare pseudo context (legacy)", got)
+	resolved := p.resolvePlayContextUri(likedCollectionUri)
+	cmd := buildPlayCommand(ApiRequestDataPlay{Uri: resolved, SkipToUri: "spotify:track:abc"})
+	if cmd.Context.Uri != resolved || cmd.Context.Url != "context://"+resolved {
+		t.Errorf("envelope context: got uri=%q url=%q, want %q", cmd.Context.Uri, cmd.Context.Url, resolved)
 	}
-	if n := me.calls.Load(); n != 2 {
-		t.Errorf("/v1/me looked up %d times, want one per unresolvable play", n)
+	if cmd.Options.SkipTo.TrackUri != "spotify:track:abc" {
+		t.Errorf("skip_to: got %q want spotify:track:abc", cmd.Options.SkipTo.TrackUri)
 	}
 }
 

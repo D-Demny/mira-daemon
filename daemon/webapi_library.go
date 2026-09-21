@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -784,7 +785,100 @@ func (p *AppPlayer) webApiPlaylists(ctx context.Context, q url.Values) (any, err
 	if len(targets) > 0 {
 		p.fillPlaylistCounts(ctx, targets, &resp)
 	}
+
+	// issue #56: while the real per-user liked-songs playlist uri is still
+	// unknown, opportunistically scan for it in this very payload — the pseudo
+	// "Liked Songs" item may carry the real spotify:playlist:<id> alongside
+	// its collection uri. The background resolver validates + persists it
+	// (fetchPlaylistCount), and its single-flight guard makes duplicate
+	// triggers no-ops.
+	if p.cachedLikedPlaylistURI() == "" {
+		if candidate := p.scanLikedPlaylistURI(data); candidate != "" {
+			p.app.log.Infof("web-api: me/playlists payload carries the liked-songs playlist uri %s — starting background validation", candidate)
+			if ch := p.app.likedPlaylistStopCh; ch != nil {
+				go p.resolveLikedPlaylistURIInBackground(ch)
+			}
+		}
+	}
 	return resp, nil
+}
+
+// scanLikedPlaylistURI looks for the REAL spotify:playlist:<id> uri inside the
+// pseudo "Liked Songs" item of a raw libraryV3 Pathfinder payload (issue #56).
+// The pseudo item is identified like mapLibraryV3Page does (data.uri / _uri ==
+// spotify:collection:tracks); as a secondary signal for payload variants that
+// keep the real uri but drop the collection uri, a PseudoPlaylist item named
+// "Liked Songs" qualifies. Within that ONE item object only, the first string
+// value with the spotify:playlist: prefix in document order is returned —
+// real playlist items elsewhere on the page are deliberately ignored (their
+// ids belong to user playlists, not the liked-songs context). Returns "" when
+// the payload carries no uri; the raw item is logged at debug level so the
+// carrying field can be pinned from a device log.
+func (p *AppPlayer) scanLikedPlaylistURI(data []byte) string {
+	var env struct {
+		Data struct {
+			Me struct {
+				LibraryV3 struct {
+					Items []struct {
+						Item json.RawMessage `json:"item"`
+					} `json:"items"`
+				} `json:"libraryV3"`
+			} `json:"me"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
+		return ""
+	}
+
+	type ident struct {
+		Data struct {
+			Typename string `json:"__typename"`
+			URI      string `json:"uri"`
+			Name     string `json:"name"`
+		} `json:"data"`
+		URI string `json:"_uri"`
+	}
+
+	var secondary json.RawMessage
+	for i := range env.Data.Me.LibraryV3.Items {
+		raw := env.Data.Me.LibraryV3.Items[i].Item
+		var id ident
+		if err := json.Unmarshal(raw, &id); err != nil {
+			continue
+		}
+		if id.Data.URI == likedCollectionUri || id.URI == likedCollectionUri {
+			// the explicit pseudo uri is the canonical signal: report whatever
+			// this item embeds ("" when the variant carries no real uri) and do
+			// NOT fall through to a same-named user playlist
+			uri := firstPlaylistURInItem(raw)
+			if uri == "" {
+				p.app.log.Debugf("play: liked-songs pseudo item carries no spotify:playlist uri — raw item for pinning: %s", string(raw))
+			}
+			return uri
+		}
+		if secondary == nil && id.Data.Typename == "PseudoPlaylist" && strings.EqualFold(id.Data.Name, "Liked Songs") {
+			secondary = raw
+		}
+	}
+	if secondary != nil {
+		return firstPlaylistURInItem(secondary)
+	}
+	return ""
+}
+
+// firstPlaylistURInItem returns the first spotify:playlist:* string value in
+// document order inside one libraryV3 item object ("" when absent).
+func firstPlaylistURInItem(raw json.RawMessage) string {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if s, ok := tok.(string); ok && strings.HasPrefix(s, "spotify:playlist:") {
+			return s
+		}
+	}
 }
 
 // parseWebApiPaging clamps the limit/offset query params to Web API bounds.

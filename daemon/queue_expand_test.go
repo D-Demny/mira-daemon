@@ -425,9 +425,11 @@ func TestPruneQueueExpandCache(t *testing.T) {
 	}
 }
 
-// issue #56: liked songs now play through spotify:user:<id>:collection:tracks;
-// the connect state echo reports that user-specific context uri, and queue
-// expansion must still trigger off it (invariant b).
+// issue #56: sessions that STARTED on the legacy user-specific collection
+// form (older daemon builds still sent spotify:user:<id>:collection:tracks)
+// may echo that context uri from the connect state — queue expansion must
+// keep triggering off it and page library tracks (invariant b). New plays no
+// longer produce this form, but in-flight sessions do.
 func TestExpandQueue_UserCollectionLikedSongsStillExpands(t *testing.T) {
 	t.Parallel()
 
@@ -469,36 +471,41 @@ func TestExpandQueue_UserCollectionLikedSongsStillExpands(t *testing.T) {
 	}
 }
 
-// issue #56 fix #2 glue: the uri play-time resolution produces for liked
-// songs (a /v1/me account id folded into spotify:user:<id>:collection:tracks)
-// is exactly the form queue expansion keys off — the resolved context must
-// stay expandable end to end.
+// issue #56 glue: the uri play-time resolution produces for liked songs (the
+// persisted REAL per-user playlist uri spotify:playlist:<id>) is exactly the
+// context queue expansion keys off — and while the session is marked as
+// liked, a playlist-shaped echo must still page LIBRARY tracks instead of
+// paging whatever internal playlist the receiver chose to report.
 func TestResolvedLikedSongsContextIsQueueExpandable(t *testing.T) {
 	t.Parallel()
 
-	me := &fakeMeFn{id: "user123"}
+	const realLiked = "spotify:playlist:37i9dQZF1F5p3rmiWPIYgZ" // observed on-device liked-songs id
 	p := newTestQueueExpandPlayer(t)
-	p.webMeAccountFn = me.fn
+	p.app.state.LikedPlaylistURI = realLiked
 
 	resolved := p.resolvePlayContextUri(likedCollectionUri)
-	if want := "spotify:user:user123:collection:tracks"; resolved != want {
-		t.Fatalf("resolve: got %q want %q", resolved, want)
+	if resolved != realLiked {
+		t.Fatalf("resolve: got %q want the persisted per-user playlist uri %q", resolved, realLiked)
 	}
 	if got := expandableContextUri(resolved); got != resolved {
 		t.Fatalf("expandable: got %q, want the resolved uri %q to stay expandable", got, resolved)
 	}
 
 	var fetchedFor string
+	var asLibraries []bool
 	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int, asLibrary bool) ([]any, int, error) {
-		fetchedFor = uri
+		fetchedFor = uri // ordered before the channel send
+		asLibraries = append(asLibraries, asLibrary)
 		return []any{
 			map[string]any{"is_local": false, "track": map[string]any{"id": "t00", "name": "A", "uri": "spotify:track:t00"}},
 			map[string]any{"is_local": false, "track": map[string]any{"id": "t01", "name": "B", "uri": "spotify:track:t01"}},
 		}, 2, nil
 	}
+	p.likedSessionActive.Store(true) // a taken liked-songs play marks the session
+
 	rs := &RemoteState{
 		TrackUri:   "spotify:track:t00",
-		ContextUri: resolved,
+		ContextUri: resolved, // the receiver echoes the real playlist uri
 		NextTracks: []QueueTrack{{Uri: "spotify:track:t01", TrackId: "t01"}},
 	}
 	p.expandQueue(rs)
@@ -508,15 +515,14 @@ func TestResolvedLikedSongsContextIsQueueExpandable(t *testing.T) {
 		if fetchedFor != resolved {
 			t.Errorf("fetch keyed off %q, want the resolved uri %q", fetchedFor, resolved)
 		}
+		if len(asLibraries) != 1 || !asLibraries[0] {
+			t.Errorf("page called with asLibrary=%v, want [true] (liked session forces the library route)", asLibraries)
+		}
 		if len(res.list) != 2 || res.total != 2 {
 			t.Errorf("result: got %d tracks (total %d), want 2 (2)", len(res.list), res.total)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no queue expansion result for the resolved liked-songs context")
-	}
-
-	if n := me.calls.Load(); n != 1 {
-		t.Errorf("/v1/me looked up %d times, want exactly 1 (cached after the first resolve)", n)
 	}
 }
 
