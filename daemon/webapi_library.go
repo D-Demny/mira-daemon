@@ -881,6 +881,51 @@ func firstPlaylistURInItem(raw json.RawMessage) string {
 	}
 }
 
+// playlistURIsInText returns every literal spotify:playlist:<id> token present
+// in s, de-duplicated and in order of appearance (issue #56). A token ends at
+// the first path/quote/space/comma/brace boundary or end of string; nothing is
+// parsed beyond that — dealer push URIs and payload text are opaque strings here.
+func playlistURIsInText(s string) []string {
+	const prefix = "spotify:playlist:"
+
+	isBoundary := func(b byte) bool {
+		switch b {
+		case '/', '"', '\'', ' ', ',', '{', '}':
+			return true
+		}
+		return false
+	}
+
+	var out []string
+	seen := make(map[string]struct{})
+	for rest := s; ; {
+		i := strings.Index(rest, prefix)
+		if i < 0 {
+			break
+		}
+		j := i + len(prefix)
+		end := len(rest)
+		for k := j; k < len(rest); k++ {
+			if isBoundary(rest[k]) {
+				end = k
+				break
+			}
+		}
+		if id := rest[j:end]; id != "" {
+			uri := prefix + id
+			if _, dup := seen[uri]; !dup {
+				seen[uri] = struct{}{}
+				out = append(out, uri)
+			}
+		}
+		if end == len(rest) {
+			break
+		}
+		rest = rest[end+1:]
+	}
+	return out
+}
+
 // parseWebApiPaging clamps the limit/offset query params to Web API bounds.
 func parseWebApiPaging(q url.Values) (limit, offset int) {
 	limit, _ = strconv.Atoi(q.Get("limit"))

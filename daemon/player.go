@@ -102,6 +102,11 @@ type AppPlayer struct {
 	// (nil = the real libraryTracksPage(0, 1))
 	libraryFirstTrackFn func(ctx context.Context) (string, error)
 
+	// likedPlaylistCountFn validates a candidate liked-playlist uri with the
+	// pathfinder count query; nil in production (→ fetchPlaylistCount), swapped
+	// by the dealer-push tests for the seam.
+	likedPlaylistCountFn func(ctx context.Context, uri string) (int, bool)
+
 	// issue #56: set while the current session is a liked-songs context —
 	// queue expansion of that session pages library tracks even if the
 	// Connect state reports a playlist-shaped context id for it. Cleared on
@@ -291,6 +296,17 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
 		}
 
 		p.handleCluster(ctx, clusterUpdate.Cluster)
+		return nil
+	} else if strings.HasPrefix(msg.Uri, "hm://playlist/") {
+		payloadLog := string(msg.Payload)
+		if len(payloadLog) > 300 {
+			payloadLog = payloadLog[:300] + "... (truncated)"
+		}
+		p.app.log.Debugf("dealer playlist push, uri: %s, payload: %s", msg.Uri, payloadLog)
+
+		if uri := p.resolveLikedPlaylistFromDealerPush(ctx, msg); uri != "" {
+			p.app.log.Infof("play: liked-playlist uri obtained from dealer push %s (uri=%s)", uri, msg.Uri)
+		}
 		return nil
 	}
 
@@ -1788,6 +1804,58 @@ func (p *AppPlayer) setLikedPlaylistURI(uri string) {
 	}
 }
 
+// resolveLikedPlaylistFromDealerPush opportunistically resolves the liked-songs
+// playlist uri from an hm://playlist/ dealer push (issue #56). The receiver
+// sees a fully decoded payload — base64 and gzip already stripped by
+// dealer/recv.go — plus the raw push URI; both are scanned for literal
+// spotify:playlist:<id> tokens. Candidates are validated in order with the
+// pathfinder count query (acceptance bar: total > 0) and the first one that
+// passes is persisted via setLikedPlaylistURI. Only fills state.LikedPlaylistURI
+// when it is still empty — a value resolved elsewhere (background resolver,
+// me/playlists scan) is never overwritten. Returns "" when nothing resolves.
+func (p *AppPlayer) resolveLikedPlaylistFromDealerPush(ctx context.Context, msg dealer.Message) string {
+	if p.cachedLikedPlaylistURI() != "" {
+		return "" // already resolved; never overwrite
+	}
+
+	candidates := make([]string, 0, 4)
+	if u := firstPlaylistURInItem(msg.Payload); u != "" {
+		candidates = append(candidates, u)
+	}
+	for _, u := range playlistURIsInText(msg.Uri) { // the push URI path may carry the token itself (T13 observation)
+		candidates = append(candidates, u)
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	out := candidates[:0]
+	for _, c := range candidates {
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		out = append(out, c)
+	}
+	if len(out) == 0 {
+		p.app.log.Debugf("play: dealer-push liked-playlist scan found no spotify:playlist tokens (uri=%s)", msg.Uri)
+		return ""
+	}
+
+	validate := p.likedPlaylistCountFn
+	if validate == nil {
+		validate = p.fetchPlaylistCount
+	}
+	for _, cand := range out {
+		total, ok := validate(ctx, cand)
+		if !ok || total <= 0 {
+			p.app.log.Debugf("play: dealer-push liked-playlist candidate %s failed validation (total=%d ok=%v)", cand, total, ok)
+			continue
+		}
+		p.setLikedPlaylistURI(cand)
+		return cand
+	}
+	return ""
+}
+
 // issue #56 (real playlist context): pacing of the background liked-songs
 // playlist-URI resolver — the same shape as the account-id resolver: one
 // generous deadline per attempt, a retry delay that doubles per consecutive
@@ -2192,7 +2260,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	p.metaResolvedCh = make(chan resolvedTrackMeta, 4)
 
 	apRecv := p.sess.Accesspoint().Receive(ap.PacketTypeProductInfo, ap.PacketTypeCountryCode)
-	msgRecv := p.sess.Dealer().ReceiveMessage("hm://pusher/v1/connections/", "hm://connect-state/v1/")
+	msgRecv := p.sess.Dealer().ReceiveMessage("hm://pusher/v1/connections/", "hm://connect-state/v1/", "hm://playlist/")
 	reqRecv := p.sess.Dealer().ReceiveRequest("hm://connect-state/v1/player/command")
 
 	heartbeat := time.NewTicker(connectStateHeartbeatInterval)
