@@ -107,6 +107,10 @@ type AppPlayer struct {
 	// by the dealer-push tests for the seam.
 	likedPlaylistCountFn func(ctx context.Context, uri string) (int, bool)
 
+	// lookupChildEntitiesFn issues the secondary liked-playlist discovery probe
+	// (issue #15); nil in production → pathfinderQueryEx on the live session.
+	lookupChildEntitiesFn func(ctx context.Context) ([]byte, error)
+
 	// issue #56: set while the current session is a liked-songs context —
 	// queue expansion of that session pages library tracks even if the
 	// Connect state reports a playlist-shaped context id for it. Cleared on
@@ -1006,6 +1010,28 @@ const (
 	pfRecentsHash = "698be5892a3cc95331deebeff463d05dfdd5febf5254bea30b895b5a93dfb584"
 )
 
+// issue #15: the web client's child-entities op. Called with the pseudo uri
+// spotify:collection:tracks it answers with the collection's concrete child
+// entities — for Liked Songs that is the real per-user playlist carrying a
+// spotify:playlist:<id>. Operation name + sha256 captured from the user's
+// web-client DevTools session on 2026-09-21 (operationName
+// "lookupChildEntities", variables {"uris": ["<playlist uri>"]}).
+//
+// Hardcoded on purpose, like pfRecentsHash: this op is deliberately NOT in
+// opHashDefaults. Adding it there would make rotateOnce's haveAllTargets gate
+// reject an entire freshly scraped table whenever the op is absent from the
+// fetched chunks — blocking hash rotation of every other tracked op — and the
+// stale on-disk pathfinder_hashes.json fixture would flip hasAllTargets() to
+// false, forcing a startup scrape on every boot. If Spotify rotates this one
+// hash, pathfinderQueryEx surfaces PersistedQueryNotFound, onPersistedDrift
+// fires the existing re-scrape machinery for the ops that ARE tracked, and
+// this probe simply degrades to a logged failure until the capture is
+// refreshed by a firmware build.
+const (
+	pfLookupChildEntitiesOp   = "lookupChildEntities"
+	pfLookupChildEntitiesHash = "91ce02e32b19123de231dc8de91fe4b9ab84eca087d4c015549308d77fbb6d10"
+)
+
 // returns the current hash for an operation
 func (p *AppPlayer) hashOf(op string) string {
 	return p.app.hashes.hash(op)
@@ -1856,6 +1882,76 @@ func (p *AppPlayer) resolveLikedPlaylistFromDealerPush(ctx context.Context, msg 
 	return ""
 }
 
+// probeLookupChildEntities is the SECONDARY liked-playlist discovery step
+// (issue #15). The current libraryV3 PseudoPlaylist payload carries no nested
+// spotify:playlist uri, so instead of depending on its shape we issue the web
+// client's own lookupChildEntities persisted query with the pseudo uri — the
+// response body is token-scanned with playlistURIsInText and every candidate
+// is validated in order with the count query (acceptance bar: total > 0); the
+// first one that passes is persisted via setLikedPlaylistURI. Only runs while
+// state.LikedPlaylistURI is still empty — a value resolved elsewhere (dealer
+// push, an earlier attempt) is never re-validated or overwritten. All traffic
+// goes through pathfinderQueryEx on the live session (never persisted tokens);
+// a PersistedQuery error hands off to the existing re-scrape machinery and any
+// failure yields "" so the caller's retry/backoff/budget semantics stay
+// untouched (no new timers here).
+func (p *AppPlayer) probeLookupChildEntities(ctx context.Context) string {
+	if p.cachedLikedPlaylistURI() != "" {
+		return "" // already resolved; never overwrite
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"operationName": pfLookupChildEntitiesOp,
+		"variables":     map[string]any{"uris": []string{likedCollectionUri}},
+		"extensions": map[string]any{
+			"persistedQuery": map[string]any{"version": 1, "sha256Hash": pfLookupChildEntitiesHash},
+		},
+	})
+	if err != nil {
+		p.app.log.Warnf("play: liked-playlist child-entities probe marshal failed: %v", err)
+		return ""
+	}
+
+	var data []byte
+	if p.lookupChildEntitiesFn != nil {
+		data, err = p.lookupChildEntitiesFn(ctx)
+	} else {
+		data, err = p.pathfinderQueryEx(ctx, body, false)
+	}
+	if err != nil {
+		if pe, ok := err.(*pathfinderError); ok && pe.PersistedQuery {
+			p.onPersistedDrift() // rotated hash → existing re-scrape machinery
+		}
+		p.app.log.Debugf("play: liked-playlist child-entities probe failed: %v", err)
+		return ""
+	}
+
+	candidates := playlistURIsInText(string(data))
+	if len(candidates) == 0 {
+		p.app.log.Debugf("play: liked-playlist child-entities probe returned no spotify:playlist uris")
+		return ""
+	}
+
+	validate := p.likedPlaylistCountFn
+	if validate == nil {
+		validate = p.fetchPlaylistCount
+	}
+	for _, cand := range candidates {
+		if p.cachedLikedPlaylistURI() != "" {
+			break // resolved in the meantime (dealer push or an earlier attempt)
+		}
+		total, ok := validate(ctx, cand)
+		if !ok || total <= 0 {
+			p.app.log.Debugf("play: liked-playlist child-entities candidate %s failed validation (total=%d ok=%v)", cand, total, ok)
+			continue
+		}
+		p.setLikedPlaylistURI(cand)
+		return cand
+	}
+	p.app.log.Debugf("play: liked-playlist child-entities probe found %d candidates but none passed validation", len(candidates))
+	return ""
+}
+
 // issue #56 (real playlist context): pacing of the background liked-songs
 // playlist-URI resolver — the same shape as the account-id resolver: one
 // generous deadline per attempt, a retry delay that doubles per consecutive
@@ -1976,7 +2072,9 @@ func (p *AppPlayer) fetchAndValidateLikedPlaylistURI(ctx context.Context) string
 	}
 	uri := p.scanLikedPlaylistURI(data)
 	if uri == "" {
-		return "" // the scan logged the raw item at debug level for pinning
+		// the current PseudoPlaylist payload carries no nested playlist uri
+		// (issue #15) — fall through to the child-entities discovery probe
+		return p.probeLookupChildEntities(ctx)
 	}
 	total, ok := p.fetchPlaylistCount(ctx, uri)
 	if !ok || total <= 0 {
