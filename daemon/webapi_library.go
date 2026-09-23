@@ -883,18 +883,19 @@ func firstPlaylistURInItem(raw json.RawMessage) string {
 }
 
 // playlistURIsInText returns every literal spotify:playlist:<id> token present
-// in s, de-duplicated and in order of appearance (issue #56). A token ends at
-// the first path/quote/space/comma/brace boundary or end of string; nothing is
-// parsed beyond that — dealer push URIs and payload text are opaque strings here.
+// in s, de-duplicated and in order of appearance (issue #56). After the prefix
+// ONLY [0-9A-Za-z] bytes are consumed as the id — the run ends at the first
+// byte outside that class, so binary tail bytes in protobuf dealer payloads can
+// no longer leak into candidates (issue #17; T23 build-152 capture:
+// "spotify:playlist:<id>\x12\x18…"). The consumed run must be 20..25 chars long
+// to yield a candidate, mirroring the ^[0-9A-Za-z]{20,25}$ shape matcher in
+// playlistIDFromDealerPushURI (player.go; replicated here — not exported).
+// Normal JSON input (22-char ids followed by quotes/commas) is unchanged.
 func playlistURIsInText(s string) []string {
 	const prefix = "spotify:playlist:"
 
-	isBoundary := func(b byte) bool {
-		switch b {
-		case '/', '"', '\'', ' ', ',', '{', '}':
-			return true
-		}
-		return false
+	isPlaylistIDByte := func(b byte) bool {
+		return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 	}
 
 	var out []string
@@ -904,16 +905,16 @@ func playlistURIsInText(s string) []string {
 		if i < 0 {
 			break
 		}
-		j := i + len(prefix)
-		end := len(rest)
-		for k := j; k < len(rest); k++ {
-			if isBoundary(rest[k]) {
-				end = k
+		start := i + len(prefix)
+		end := start
+		for k := start; k < len(rest); k++ {
+			if !isPlaylistIDByte(rest[k]) {
 				break
 			}
+			end = k + 1
 		}
-		if id := rest[j:end]; id != "" {
-			uri := prefix + id
+		if idLen := end - start; idLen >= 20 && idLen <= 25 {
+			uri := rest[i:end]
 			if _, dup := seen[uri]; !dup {
 				seen[uri] = struct{}{}
 				out = append(out, uri)
@@ -922,7 +923,7 @@ func playlistURIsInText(s string) []string {
 		if end == len(rest) {
 			break
 		}
-		rest = rest[end+1:]
+		rest = rest[end:] // resume at the first non-id byte (always past i)
 	}
 	return out
 }

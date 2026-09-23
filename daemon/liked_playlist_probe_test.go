@@ -26,7 +26,7 @@ func TestLikedProbe_PayloadUriResolvesWhenEmpty(t *testing.T) {
 	var probed bool
 	p.lookupChildEntitiesFn = func(_ context.Context) ([]byte, error) {
 		probed = true
-		return []byte(`{"data":{"child":{"entities":[{"uri":"spotify:playlist:probed123"},{"name":"Liked Songs"}]}}}`), nil
+		return []byte(`{"data":{"child":{"entities":[{"uri":"spotify:playlist:5oQ4wV0tYBnJc9xK3mZaR2"},{"name":"Liked Songs"}]}}}`), nil
 	}
 	var validated []string
 	p.likedPlaylistCountFn = func(_ context.Context, uri string) (int, bool) {
@@ -34,17 +34,17 @@ func TestLikedProbe_PayloadUriResolvesWhenEmpty(t *testing.T) {
 		return 7, true
 	}
 
-	if got := p.probeLookupChildEntities(context.Background()); got != "spotify:playlist:probed123" {
-		t.Fatalf("probe return: got %q want spotify:playlist:probed123", got)
+	if got := p.probeLookupChildEntities(context.Background()); got != "spotify:playlist:5oQ4wV0tYBnJc9xK3mZaR2" {
+		t.Fatalf("probe return: got %q want spotify:playlist:5oQ4wV0tYBnJc9xK3mZaR2", got)
 	}
 	if !probed {
 		t.Error("probe transport was not invoked")
 	}
-	if state.LikedPlaylistURI != "spotify:playlist:probed123" {
-		t.Errorf("state.LikedPlaylistURI: got %q want spotify:playlist:probed123", state.LikedPlaylistURI)
+	if state.LikedPlaylistURI != "spotify:playlist:5oQ4wV0tYBnJc9xK3mZaR2" {
+		t.Errorf("state.LikedPlaylistURI: got %q want spotify:playlist:5oQ4wV0tYBnJc9xK3mZaR2", state.LikedPlaylistURI)
 	}
-	if len(validated) != 1 || validated[0] != "spotify:playlist:probed123" {
-		t.Errorf("validated candidates: got %v want [spotify:playlist:probed123]", validated)
+	if len(validated) != 1 || validated[0] != "spotify:playlist:5oQ4wV0tYBnJc9xK3mZaR2" {
+		t.Errorf("validated candidates: got %v want [spotify:playlist:5oQ4wV0tYBnJc9xK3mZaR2]", validated)
 	}
 }
 
