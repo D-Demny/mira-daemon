@@ -514,6 +514,74 @@ func TestPlayerPlayCommand_OffsetUriBecomesSkipTo(t *testing.T) {
 	}
 }
 
+// issue #56: liked-songs context resolution no longer does any account-id
+// work — it returns the persisted real per-user playlist uri when one has been
+// resolved (background resolver / opportunistic me/playlists scan), and ""
+// otherwise so the play path can fall back to standalone track playback. The
+// bare pseudo id and the legacy user-specific collection form are never
+// synthesized here; they are rejected by Connect receivers.
+func TestResolvePlayContextUri_ReturnsPersistedPlaylistUri(t *testing.T) {
+	t.Parallel()
+
+	state := &librespot.AppState{
+		OAuth:            librespot.OAuthState{AccessToken: "opaque-token-no-dots"},
+		LikedPlaylistURI: "spotify:playlist:37i9dQZF1F5p3rmiWPIYgZ",
+	}
+	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}}
+
+	got := p.resolvePlayContextUri(likedCollectionUri)
+	if want := "spotify:playlist:37i9dQZF1F5p3rmiWPIYgZ"; got != want {
+		t.Fatalf("persisted uri: got %q want %q", got, want)
+	}
+}
+
+// nothing persisted yet: the pseudo id resolves to "" — the caller treats
+// empty as "context unavailable" and owns the fallback. And every other
+// context passes through byte-for-byte (including the legacy user-form an
+// older session may still echo).
+func TestResolvePlayContextUri_UnresolvedYieldsEmptyWithNoWebTraffic(t *testing.T) {
+	t.Parallel()
+
+	state := &librespot.AppState{OAuth: librespot.OAuthState{AccessToken: "opaque-token-no-dots"}}
+	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}}
+
+	if got := p.resolvePlayContextUri(likedCollectionUri); got != "" {
+		t.Errorf("unresolved liked context: got %q want empty (the play path owns the fallback)", got)
+	}
+	for _, uri := range []string{
+		"spotify:user:u1:collection:tracks", // legacy echo form passes through untouched
+		"spotify:playlist:abc123",
+		"spotify:album:abc123",
+		"spotify:track:xyz789",
+		"spotify:artist:abc456",
+	} {
+		if res := p.resolvePlayContextUri(uri); res != uri {
+			t.Errorf("passthrough %q: got %q", uri, res)
+		}
+	}
+}
+
+// the resolved context rides the play envelope as its connect uri/url, with
+// any skip-to riding along.
+func TestResolvePlayContextUri_EnvelopeCarriesResolvedContext(t *testing.T) {
+	t.Parallel()
+
+	state := &librespot.AppState{
+		OAuth:            librespot.OAuthState{AccessToken: "opaque-token-no-dots"},
+		LikedPlaylistURI: "spotify:playlist:liked-real",
+	}
+	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}}
+
+	resolved := p.resolvePlayContextUri(likedCollectionUri)
+	cmd := buildPlayCommand(ApiRequestDataPlay{Uri: resolved, SkipToUri: "spotify:track:abc"})
+	if cmd.Context.Uri != resolved || cmd.Context.Url != "context://"+resolved {
+		t.Errorf("envelope context: got uri=%q url=%q, want %q", cmd.Context.Uri, cmd.Context.Url, resolved)
+	}
+	if cmd.Options.SkipTo.TrackUri != "spotify:track:abc" {
+		t.Errorf("skip_to: got %q want spotify:track:abc", cmd.Options.SkipTo.TrackUri)
+	}
+}
+
 func TestPlayerSeek_DecodesAbsolutePositionFromBody(t *testing.T) {
 	t.Parallel()
 

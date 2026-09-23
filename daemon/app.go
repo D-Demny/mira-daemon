@@ -79,6 +79,11 @@ type App struct {
 
 	retryNowCh chan struct{}
 
+	// issue #56: shutdown signal for the background liked-songs playlist-uri
+	// resolver started from Run / the me/playlists scan / re-pair (see
+	// resolveLikedPlaylistURIInBackground)
+	likedPlaylistStopCh chan struct{}
+
 	// pre-network attempt sits in DNS resolution for 20-30s. parking here until network is up dodges that
 	onlineMu sync.Mutex
 	isOnline bool
@@ -128,8 +133,11 @@ func New(opts *Options) (*App, error) {
 		client:     &http.Client{Timeout: 30 * time.Second},
 		retryNowCh: make(chan struct{}, 1),
 		onlineCh:   make(chan struct{}),
-		hashes:     newHashStore(),
-		startedAt:  time.Now(),
+		// issue #56: persistent stop for the background liked-songs playlist-uri
+		// resolver (App has no context of its own)
+		likedPlaylistStopCh: make(chan struct{}),
+		hashes:              newHashStore(),
+		startedAt:           time.Now(),
 	}
 
 	var err error
@@ -442,6 +450,10 @@ func (app *App) Close() error {
 	}
 	app.closed = true
 
+	// issue #56: shutdown signal for the liked-songs playlist-uri resolver; the
+	// closed flag above guarantees this closes exactly once
+	close(app.likedPlaylistStopCh)
+
 	if app.piRecovery != nil {
 		app.piRecovery.Stop()
 	}
@@ -471,10 +483,33 @@ func (app *App) persistState() error {
 // daemon restarts (the StoredCredentials path restores it from app state)
 func (app *App) onOAuthTokenChanged(oauth *librespot.OAuthState) {
 	app.state.Lock()
+	// issue #56: a different refresh token means the account was (re-)paired —
+	// the real per-user liked-songs playlist uri belongs to the previous
+	// account, so it is dropped and the background resolver re-derives it from
+	// me/playlists. Routine hourly refreshes keep the same refresh token and
+	// leave the cached uri intact.
+	repaired := false
+	if app.state.OAuth.RefreshToken != "" &&
+		oauth.RefreshToken != "" &&
+		oauth.RefreshToken != app.state.OAuth.RefreshToken {
+		app.state.LikedPlaylistURI = ""
+		repaired = true
+	}
 	app.state.OAuth = *oauth
 	app.state.Unlock()
 	if err := app.persistState(); err != nil {
 		app.log.WithError(err).Warn("failed to persist OAuth tokens")
+	}
+
+	// issue #56: a fresh pairing just dropped the cached liked-songs playlist
+	// uri — restart its background resolver so the next liked-songs play hits
+	// the resolved context instead of the standalone fallback. The single-flight
+	// guard inside the resolver keeps this from racing a loop started at app
+	// start.
+	if repaired {
+		if player := app.currentPlayer.Load(); player != nil {
+			go player.resolveLikedPlaylistURIInBackground(app.likedPlaylistStopCh)
+		}
 	}
 }
 
@@ -841,14 +876,14 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 	appPlayer.prefetchTimer.Stop()
 
 	if appPlayer.sess, err = session.NewSessionFromOptions(ctx, &session.Options{
-		Log:         app.log,
-		DeviceType:  app.deviceType,
-		DeviceId:    app.deviceId,
-		ClientToken: app.clientToken,
-		Resolver:    app.resolver,
-		Client:      app.client,
-		AppState:    app.state,
-		Credentials: creds,
+		Log:               app.log,
+		DeviceType:        app.deviceType,
+		DeviceId:          app.deviceId,
+		ClientToken:       app.clientToken,
+		Resolver:          app.resolver,
+		Client:            app.client,
+		AppState:          app.state,
+		Credentials:       creds,
 		PersistedOAuth:    &app.state.OAuth,
 		OAuthTokenChanged: app.onOAuthTokenChanged,
 		AuthURLCallback: func(url string) {

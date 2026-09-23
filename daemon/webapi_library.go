@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -25,9 +26,10 @@ const (
 )
 
 type playlistCountEntry struct {
-	total int
-	at    time.Time
-	ok    bool
+	total  int
+	format string // playlistV2.format from the same response (issue #15 discriminator)
+	at     time.Time
+	ok     bool
 }
 
 type playlistCountTarget struct {
@@ -449,8 +451,8 @@ type recentsItem struct {
 	artists []any
 	images  []webApiImage
 	// the context the track was played from (album/playlist/...), when known
-	contextURI  string
-	albumName   string
+	contextURI string
+	albumName  string
 }
 
 // parseRecentsItem extracts the identity fields from one raw list entry.
@@ -602,7 +604,7 @@ func mapSavedTracksPage(data []byte, baseOffset int) ([]any, int, error) {
 			Me struct {
 				Library struct {
 					Tracks struct {
-						TotalCount int `json:"totalCount"`
+						TotalCount int   `json:"totalCount"`
 						Items      []any `json:"items"`
 					} `json:"tracks"`
 				} `json:"library"`
@@ -784,7 +786,145 @@ func (p *AppPlayer) webApiPlaylists(ctx context.Context, q url.Values) (any, err
 	if len(targets) > 0 {
 		p.fillPlaylistCounts(ctx, targets, &resp)
 	}
+
+	// issue #56: while the real per-user liked-songs playlist uri is still
+	// unknown, opportunistically scan for it in this very payload — the pseudo
+	// "Liked Songs" item may carry the real spotify:playlist:<id> alongside
+	// its collection uri. The background resolver validates + persists it
+	// (fetchPlaylistCount), and its single-flight guard makes duplicate
+	// triggers no-ops.
+	if p.cachedLikedPlaylistURI() == "" {
+		if candidate := p.scanLikedPlaylistURI(data); candidate != "" {
+			p.app.log.Infof("web-api: me/playlists payload carries the liked-songs playlist uri %s — starting background validation", candidate)
+			if ch := p.app.likedPlaylistStopCh; ch != nil {
+				go p.resolveLikedPlaylistURIInBackground(ch)
+			}
+		}
+	}
 	return resp, nil
+}
+
+// scanLikedPlaylistURI looks for the REAL spotify:playlist:<id> uri inside the
+// pseudo "Liked Songs" item of a raw libraryV3 Pathfinder payload (issue #56).
+// The pseudo item is identified like mapLibraryV3Page does (data.uri / _uri ==
+// spotify:collection:tracks); as a secondary signal for payload variants that
+// keep the real uri but drop the collection uri, a PseudoPlaylist item named
+// "Liked Songs" qualifies. Within that ONE item object only, the first string
+// value with the spotify:playlist: prefix in document order is returned —
+// real playlist items elsewhere on the page are deliberately ignored (their
+// ids belong to user playlists, not the liked-songs context). Returns "" when
+// the payload carries no uri; the raw item is logged at debug level so the
+// carrying field can be pinned from a device log.
+func (p *AppPlayer) scanLikedPlaylistURI(data []byte) string {
+	var env struct {
+		Data struct {
+			Me struct {
+				LibraryV3 struct {
+					Items []struct {
+						Item json.RawMessage `json:"item"`
+					} `json:"items"`
+				} `json:"libraryV3"`
+			} `json:"me"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
+		return ""
+	}
+
+	type ident struct {
+		Data struct {
+			Typename string `json:"__typename"`
+			URI      string `json:"uri"`
+			Name     string `json:"name"`
+		} `json:"data"`
+		URI string `json:"_uri"`
+	}
+
+	var secondary json.RawMessage
+	for i := range env.Data.Me.LibraryV3.Items {
+		raw := env.Data.Me.LibraryV3.Items[i].Item
+		var id ident
+		if err := json.Unmarshal(raw, &id); err != nil {
+			continue
+		}
+		if id.Data.URI == likedCollectionUri || id.URI == likedCollectionUri {
+			// the explicit pseudo uri is the canonical signal: report whatever
+			// this item embeds ("" when the variant carries no real uri) and do
+			// NOT fall through to a same-named user playlist
+			uri := firstPlaylistURInItem(raw)
+			if uri == "" {
+				p.app.log.Debugf("play: liked-songs pseudo item carries no spotify:playlist uri — raw item for pinning: %s", string(raw))
+			}
+			return uri
+		}
+		if secondary == nil && id.Data.Typename == "PseudoPlaylist" && strings.EqualFold(id.Data.Name, "Liked Songs") {
+			secondary = raw
+		}
+	}
+	if secondary != nil {
+		return firstPlaylistURInItem(secondary)
+	}
+	return ""
+}
+
+// firstPlaylistURInItem returns the first spotify:playlist:* string value in
+// document order inside one libraryV3 item object ("" when absent).
+func firstPlaylistURInItem(raw json.RawMessage) string {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if s, ok := tok.(string); ok && strings.HasPrefix(s, "spotify:playlist:") {
+			return s
+		}
+	}
+}
+
+// playlistURIsInText returns every literal spotify:playlist:<id> token present
+// in s, de-duplicated and in order of appearance (issue #56). A token ends at
+// the first path/quote/space/comma/brace boundary or end of string; nothing is
+// parsed beyond that — dealer push URIs and payload text are opaque strings here.
+func playlistURIsInText(s string) []string {
+	const prefix = "spotify:playlist:"
+
+	isBoundary := func(b byte) bool {
+		switch b {
+		case '/', '"', '\'', ' ', ',', '{', '}':
+			return true
+		}
+		return false
+	}
+
+	var out []string
+	seen := make(map[string]struct{})
+	for rest := s; ; {
+		i := strings.Index(rest, prefix)
+		if i < 0 {
+			break
+		}
+		j := i + len(prefix)
+		end := len(rest)
+		for k := j; k < len(rest); k++ {
+			if isBoundary(rest[k]) {
+				end = k
+				break
+			}
+		}
+		if id := rest[j:end]; id != "" {
+			uri := prefix + id
+			if _, dup := seen[uri]; !dup {
+				seen[uri] = struct{}{}
+				out = append(out, uri)
+			}
+		}
+		if end == len(rest) {
+			break
+		}
+		rest = rest[end+1:]
+	}
+	return out
 }
 
 // parseWebApiPaging clamps the limit/offset query params to Web API bounds.
@@ -956,12 +1096,14 @@ func (p *AppPlayer) fillPlaylistCounts(ctx context.Context, targets []playlistCo
 	}
 }
 
-func (p *AppPlayer) cachedPlaylistCount(uri string) (int, bool) {
+// cachedPlaylistMeta returns the raw cache entry (count + format) with the
+// same TTL/eviction semantics as before.
+func (p *AppPlayer) cachedPlaylistMeta(uri string) (playlistCountEntry, bool) {
 	p.playlistCountMu.Lock()
 	defer p.playlistCountMu.Unlock()
 	e, ok := p.playlistCountCache[uri]
 	if !ok {
-		return 0, false
+		return playlistCountEntry{}, false
 	}
 	ttl := playlistCountCacheTTL
 	if !e.ok {
@@ -969,25 +1111,52 @@ func (p *AppPlayer) cachedPlaylistCount(uri string) (int, bool) {
 	}
 	if time.Since(e.at) > ttl {
 		delete(p.playlistCountCache, uri)
-		return 0, false
+		return playlistCountEntry{}, false
 	}
+	return e, true
+}
+
+func (p *AppPlayer) cachedPlaylistCount(uri string) (int, bool) {
+	e, ok := p.cachedPlaylistMeta(uri)
 	return e.total, ok
 }
 
-func (p *AppPlayer) storePlaylistCount(uri string, total int, ok bool) {
+func (p *AppPlayer) storePlaylistMeta(uri string, e playlistCountEntry) {
 	p.playlistCountMu.Lock()
 	defer p.playlistCountMu.Unlock()
 	if p.playlistCountCache == nil {
 		p.playlistCountCache = make(map[string]playlistCountEntry)
 	}
-	p.playlistCountCache[uri] = playlistCountEntry{total: total, at: time.Now(), ok: ok}
+	p.playlistCountCache[uri] = e
+}
+
+func (p *AppPlayer) storePlaylistCount(uri string, total int, ok bool) {
+	p.storePlaylistMeta(uri, playlistCountEntry{total: total, at: time.Now(), ok: ok})
 }
 
 // fetchPlaylistCount asks Pathfinder for one page (limit 1) of the playlist to
-// read its content.totalCount, using the in-memory count cache.
+// read its content.totalCount, using the in-memory meta cache.
 func (p *AppPlayer) fetchPlaylistCount(ctx context.Context, uri string) (int, bool) {
-	if total, ok := p.cachedPlaylistCount(uri); ok {
-		return total, ok
+	total, _, ok := p.fetchPlaylistMeta(ctx, uri)
+	return total, ok
+}
+
+// fetchPlaylistFormat reads playlistV2.format from the SAME single-page
+// fetchPlaylist response as fetchPlaylistCount (issue #15: only a "liked-songs"
+// format may be persisted as the liked-songs playlist uri). The shared meta
+// cache makes a count+format validation pair cost one query.
+func (p *AppPlayer) fetchPlaylistFormat(ctx context.Context, uri string) (string, bool) {
+	_, format, ok := p.fetchPlaylistMeta(ctx, uri)
+	return format, ok
+}
+
+// fetchPlaylistMeta runs the shared single-page fetchPlaylist query and parses
+// BOTH content.totalCount and playlistV2.format from one response. A failed
+// query or an unreadable payload caches a failure entry (ok=false) so both
+// readers fail closed until the TTL expires.
+func (p *AppPlayer) fetchPlaylistMeta(ctx context.Context, uri string) (int, string, bool) {
+	if e, ok := p.cachedPlaylistMeta(uri); ok {
+		return e.total, e.format, e.ok
 	}
 	body := p.pfBody("fetchPlaylist", map[string]any{
 		"uri":                       uri,
@@ -997,16 +1166,16 @@ func (p *AppPlayer) fetchPlaylistCount(ctx context.Context, uri string) (int, bo
 	})
 	data, err := p.pathfinderQueryEx(ctx, body, false)
 	if err != nil {
-		p.storePlaylistCount(uri, 0, false)
-		return 0, false
+		p.storePlaylistMeta(uri, playlistCountEntry{at: time.Now(), ok: false})
+		return 0, "", false
 	}
-	total, err := parsePlaylistCount(data)
+	total, format, err := parsePlaylistMeta(data)
 	if err != nil {
-		p.storePlaylistCount(uri, 0, false)
-		return 0, false
+		p.storePlaylistMeta(uri, playlistCountEntry{at: time.Now(), ok: false})
+		return 0, "", false
 	}
-	p.storePlaylistCount(uri, total, true)
-	return total, true
+	p.storePlaylistMeta(uri, playlistCountEntry{total: total, format: format, at: time.Now(), ok: true})
+	return total, format, true
 }
 
 // parsePlaylistCount reads content.totalCount from a fetchPlaylist payload.
@@ -1024,4 +1193,24 @@ func parsePlaylistCount(data []byte) (int, error) {
 		return 0, err
 	}
 	return r.Data.PlaylistV2.Content.TotalCount, nil
+}
+
+// parsePlaylistMeta reads content.totalCount AND playlistV2.format (both at the
+// playlist object level) from one fetchPlaylist payload. A missing format
+// parses to "" and the caller's liked-songs check fails closed on it.
+func parsePlaylistMeta(data []byte) (int, string, error) {
+	var r struct {
+		Data struct {
+			PlaylistV2 struct {
+				Format  string `json:"format"`
+				Content struct {
+					TotalCount int `json:"totalCount"`
+				} `json:"content"`
+			} `json:"playlistV2"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return 0, "", err
+	}
+	return r.Data.PlaylistV2.Content.TotalCount, r.Data.PlaylistV2.Format, nil
 }

@@ -189,6 +189,10 @@ func TestExpandableContextUri(t *testing.T) {
 	}{
 		{"spotify:playlist:abc123", "spotify:playlist:abc123"},
 		{"spotify:collection:tracks", "spotify:collection:tracks"},
+		// issue #56: the user-specific form played through (and possibly
+		// echoed by connect) must expand like the bare pseudo id
+		{"spotify:user:abc123:collection:tracks", "spotify:user:abc123:collection:tracks"},
+		{"spotify:user:abc123:collection:podcasts", ""},
 		{"spotify:album:abc", ""},
 		{"spotify:track:abc", ""},
 		{"spotify:artist:abc", ""},
@@ -421,10 +425,111 @@ func TestPruneQueueExpandCache(t *testing.T) {
 	}
 }
 
+// issue #56: sessions that STARTED on the legacy user-specific collection
+// form (older daemon builds still sent spotify:user:<id>:collection:tracks)
+// may echo that context uri from the connect state — queue expansion must
+// keep triggering off it and page library tracks (invariant b). New plays no
+// longer produce this form, but in-flight sessions do.
+func TestExpandQueue_UserCollectionLikedSongsStillExpands(t *testing.T) {
+	t.Parallel()
+
+	const ctxUri = "spotify:user:user123:collection:tracks"
+	var fetchedFor string
+	p := newTestQueueExpandPlayer(t)
+	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int, asLibrary bool) ([]any, int, error) {
+		fetchedFor = uri
+		return []any{
+			map[string]any{"is_local": false, "track": map[string]any{"id": "t00", "name": "A", "uri": "spotify:track:t00"}},
+			map[string]any{"is_local": false, "track": map[string]any{"id": "t01", "name": "B", "uri": "spotify:track:t01"}},
+		}, 2, nil
+	}
+
+	rs := &RemoteState{
+		TrackUri:   "spotify:track:t00",
+		ContextUri: ctxUri,
+		NextTracks: []QueueTrack{{Uri: "spotify:track:t01", TrackId: "t01"}},
+	}
+	p.expandQueue(rs)
+
+	select {
+	case res := <-p.queueExpandedCh:
+		if fetchedFor != ctxUri {
+			t.Errorf("fetch keyed off %q, want the echoed user-collection uri %q", fetchedFor, ctxUri)
+		}
+		if len(res.list) != 2 || res.total != 2 {
+			t.Errorf("result: got %d tracks (total %d), want 2 (2)", len(res.list), res.total)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no queue expansion result for the user-collection liked-songs context")
+	}
+
+	// the run loop re-applies the landed cache entry: preview replaced by the
+	// derived upcoming queue (t01)
+	p.expandQueue(rs)
+	if len(rs.NextTracks) != 1 || rs.NextTracks[0].Uri != "spotify:track:t01" {
+		t.Errorf("re-apply: got %+v, want [spotify:track:t01]", rs.NextTracks)
+	}
+}
+
+// issue #56 glue: the uri play-time resolution produces for liked songs (the
+// persisted REAL per-user playlist uri spotify:playlist:<id>) is exactly the
+// context queue expansion keys off — and while the session is marked as
+// liked, a playlist-shaped echo must still page LIBRARY tracks instead of
+// paging whatever internal playlist the receiver chose to report.
+func TestResolvedLikedSongsContextIsQueueExpandable(t *testing.T) {
+	t.Parallel()
+
+	const realLiked = "spotify:playlist:37i9dQZF1F5p3rmiWPIYgZ" // observed on-device liked-songs id
+	p := newTestQueueExpandPlayer(t)
+	p.app.state.LikedPlaylistURI = realLiked
+
+	resolved := p.resolvePlayContextUri(likedCollectionUri)
+	if resolved != realLiked {
+		t.Fatalf("resolve: got %q want the persisted per-user playlist uri %q", resolved, realLiked)
+	}
+	if got := expandableContextUri(resolved); got != resolved {
+		t.Fatalf("expandable: got %q, want the resolved uri %q to stay expandable", got, resolved)
+	}
+
+	var fetchedFor string
+	var asLibraries []bool
+	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int, asLibrary bool) ([]any, int, error) {
+		fetchedFor = uri // ordered before the channel send
+		asLibraries = append(asLibraries, asLibrary)
+		return []any{
+			map[string]any{"is_local": false, "track": map[string]any{"id": "t00", "name": "A", "uri": "spotify:track:t00"}},
+			map[string]any{"is_local": false, "track": map[string]any{"id": "t01", "name": "B", "uri": "spotify:track:t01"}},
+		}, 2, nil
+	}
+	p.likedSessionActive.Store(true) // a taken liked-songs play marks the session
+
+	rs := &RemoteState{
+		TrackUri:   "spotify:track:t00",
+		ContextUri: resolved, // the receiver echoes the real playlist uri
+		NextTracks: []QueueTrack{{Uri: "spotify:track:t01", TrackId: "t01"}},
+	}
+	p.expandQueue(rs)
+
+	select {
+	case res := <-p.queueExpandedCh:
+		if fetchedFor != resolved {
+			t.Errorf("fetch keyed off %q, want the resolved uri %q", fetchedFor, resolved)
+		}
+		if len(asLibraries) != 1 || !asLibraries[0] {
+			t.Errorf("page called with asLibrary=%v, want [true] (liked session forces the library route)", asLibraries)
+		}
+		if len(res.list) != 2 || res.total != 2 {
+			t.Errorf("result: got %d tracks (total %d), want 2 (2)", len(res.list), res.total)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no queue expansion result for the resolved liked-songs context")
+	}
+}
+
 func newTestQueueExpandPlayer(t *testing.T) *AppPlayer {
 	t.Helper()
 	return &AppPlayer{
-		app:                 &App{log: &librespot.NullLogger{}},
+		app:                 &App{log: &librespot.NullLogger{}, state: &librespot.AppState{}, stateStore: nopStateStore{}},
 		queueExpandCache:    make(map[string]queueExpandCacheEntry),
 		queueExpandInFlight: make(map[string]struct{}),
 		queueExpandedCh:     make(chan queueExpandResult, 1),
@@ -511,7 +616,7 @@ func TestExpandQueue_StaleCacheIsIgnored(t *testing.T) {
 
 	// a stale entry must not be applied; the cache-miss path starts a
 	// background fetch (stubbed here to an empty page, which writes no cache)
-	p.queueExpandPageFn = func(_ context.Context, _ string, _, _ int) ([]any, int, error) {
+	p.queueExpandPageFn = func(_ context.Context, _ string, _, _ int, _ bool) ([]any, int, error) {
 		return nil, 0, nil
 	}
 	preview := []QueueTrack{{Uri: "spotify:track:next", TrackId: "next"}}
@@ -549,7 +654,7 @@ func TestExpandQueue_CacheMissFetchesAndApplies(t *testing.T) {
 	}
 	var pages int
 	p := newTestQueueExpandPlayer(t)
-	p.queueExpandPageFn = func(_ context.Context, _ string, offset, limit int) ([]any, int, error) {
+	p.queueExpandPageFn = func(_ context.Context, _ string, offset, limit int, _ bool) ([]any, int, error) {
 		pages++
 		end := offset + limit
 		if end > total {
@@ -598,5 +703,59 @@ func TestExpandQueue_CacheMissFetchesAndApplies(t *testing.T) {
 	// the derived 142 entries are capped at the QueueLimit payload guard
 	if len(rs.NextTracks) != QueueLimit {
 		t.Errorf("re-apply: got %d upcoming entries, want the QueueLimit cap (%d)", len(rs.NextTracks), QueueLimit)
+	}
+}
+
+// issue #56: a playlist-shaped context (e.g. the internal playlist id a
+// receiver echoes during a Liked-Songs session) routes through the ordinary
+// playlist fetch — same 100-per-page paging as any other playlist, stopped at
+// the 500-entry safety cap even when the context claims more tracks.
+func TestQueueExpand_PlaylistContextPagesWithCap(t *testing.T) {
+	t.Parallel()
+
+	const claimedTotal = 1000 // the context claims more tracks than the cap allows
+	p := newTestQueueExpandPlayer(t)
+	var offsets []int
+	var routes []bool
+	p.queueExpandPageFn = func(_ context.Context, uri string, offset, limit int, asLibrary bool) ([]any, int, error) {
+		if uri != "spotify:playlist:pl" {
+			t.Errorf("page uri: got %q want spotify:playlist:pl", uri)
+		}
+		offsets = append(offsets, offset)
+		routes = append(routes, asLibrary)
+		items := make([]any, 0, limit)
+		for i := 0; i < limit; i++ {
+			id := fmt.Sprintf("t%03d", offset+i)
+			items = append(items, map[string]any{
+				"is_local": false,
+				"track":    map[string]any{"id": id, "name": "A", "uri": "spotify:track:" + id},
+			})
+		}
+		return items, claimedTotal, nil
+	}
+
+	p.fetchQueueExpand("spotify:playlist:pl", false)
+
+	select {
+	case res := <-p.queueExpandedCh:
+		if len(res.list) != queueExpandMaxEntries {
+			t.Errorf("fetched %d entries, want the %d-entry safety cap", len(res.list), queueExpandMaxEntries)
+		}
+		if res.total != claimedTotal {
+			t.Errorf("result total: got %d want %d (the context's claimed length)", res.total, claimedTotal)
+		}
+		if want := []int{0, 100, 200, 300, 400}; fmt.Sprintf("%v", offsets) != fmt.Sprintf("%v", want) {
+			t.Errorf("page offsets: got %v want %v (queueExpandPageLimit per page up to the cap)", offsets, want)
+		}
+		for i, asLibrary := range routes {
+			if asLibrary {
+				t.Errorf("page %d routed to library tracks; an unflagged playlist session stays a playlist", i)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no queue expansion result for the playlist context")
+	}
+	if p.likedSessionActive.Load() {
+		t.Error("an unflagged playlist session must not set the library-route flag")
 	}
 }

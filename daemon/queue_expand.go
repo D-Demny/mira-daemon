@@ -34,6 +34,10 @@ type queueExpandCacheEntry struct {
 	list      []QueueTrack
 	total     int
 	fetchedAt time.Time
+	// issue #56 fix #7: whether this entry was paged via the library-tracks
+	// route (see queueExpandFetchOp). A fresh entry fetched for a different
+	// route must not be served to the other — re-fetch instead.
+	asLibrary bool
 }
 
 // queueExpandResult is delivered to the run loop when a background fetch lands
@@ -49,10 +53,37 @@ func expandableContextUri(uri string) string {
 	if strings.HasPrefix(uri, "spotify:playlist:") {
 		return uri
 	}
-	if uri == "spotify:collection:tracks" {
+	if isLikedCollectionUri(uri) {
 		return uri
 	}
 	return ""
+}
+
+// isLikedCollectionUri matches the liked-songs collection in both of its
+// uri forms: the bare pseudo id the UI requests with, and the user-specific
+// `spotify:user:<id>:collection:tracks` form issue #56 plays through (and
+// the Connect state echo may report). Both hold the same saved-tracks list,
+// which queueExpandPage already pages via fetchLibraryTracks for any
+// non-playlist uri.
+func isLikedCollectionUri(uri string) bool {
+	if uri == likedCollectionUri {
+		return true
+	}
+	return strings.HasPrefix(uri, "spotify:user:") && strings.HasSuffix(uri, ":collection:tracks")
+}
+
+// queueExpandFetchOp picks the pathfinder operation that pages a context's
+// track list: fetchPlaylist for ordinary playlists, fetchLibraryTracks for the
+// liked-songs collection in both uri forms (the bare pseudo id the UI requests
+// with and the user-specific collection). asLibrary forces the library route
+// for a playlist-shaped id while the current session is a liked-songs context
+// (issue #56 — the Connect state may echo an internal playlist id for it, but
+// the track list must still come from the saved-tracks route).
+func queueExpandFetchOp(contextUri string, asLibrary bool) string {
+	if strings.HasPrefix(contextUri, "spotify:playlist:") && !asLibrary {
+		return "fetchPlaylist"
+	}
+	return "fetchLibraryTracks"
 }
 
 // expandQueue replaces the short Connect preview in rs.NextTracks with the
@@ -71,9 +102,16 @@ func (p *AppPlayer) expandQueue(rs *RemoteState) {
 	}
 
 	activeId := trackIdFromUri(rs.TrackUri)
+
+	// issue #56: a liked-songs session may be reported back by the Connect
+	// state with a playlist-shaped context id — force the library-tracks fetch
+	// route for it instead of paging whatever internal playlist the receiver
+	// chose to echo.
+	neededAsLibrary := p.likedSessionActive.Load() && strings.HasPrefix(contextUri, "spotify:playlist:")
+
 	p.queueExpandMu.Lock()
 	entry, ok := p.queueExpandCache[contextUri]
-	if ok && time.Since(entry.fetchedAt) >= queueExpandCacheTTL {
+	if ok && (time.Since(entry.fetchedAt) >= queueExpandCacheTTL || entry.asLibrary != neededAsLibrary) {
 		ok = false
 	}
 	inflight := false
@@ -94,7 +132,7 @@ func (p *AppPlayer) expandQueue(rs *RemoteState) {
 	p.queueExpandMu.Lock()
 	p.queueExpandInFlight[contextUri] = struct{}{}
 	p.queueExpandMu.Unlock()
-	go p.fetchQueueExpand(contextUri)
+	go p.fetchQueueExpand(contextUri, neededAsLibrary)
 }
 
 // computeQueueExpansion returns the upcoming queue of the active track
@@ -208,8 +246,9 @@ func trackIdFromUri(uri string) string {
 }
 
 // fetchQueueExpand pages the full track list of an expandable context in the
-// background and hands it to the run loop via queueExpandedCh
-func (p *AppPlayer) fetchQueueExpand(contextUri string) {
+// background and hands it to the run loop via queueExpandedCh. asLibrary
+// selects the fetch route (see queueExpandFetchOp).
+func (p *AppPlayer) fetchQueueExpand(contextUri string, asLibrary bool) {
 	defer func() {
 		p.queueExpandMu.Lock()
 		delete(p.queueExpandInFlight, contextUri)
@@ -231,7 +270,7 @@ func (p *AppPlayer) fetchQueueExpand(contextUri string) {
 		if offset+limit > queueExpandMaxEntries {
 			limit = queueExpandMaxEntries - offset
 		}
-		items, pageTotal, err := page(fctx, contextUri, offset, limit)
+		items, pageTotal, err := page(fctx, contextUri, offset, limit, asLibrary)
 		if err != nil {
 			p.app.log.Warnf("queue expand: %s page %d: %v", contextUri, offset, err)
 			return
@@ -249,7 +288,7 @@ func (p *AppPlayer) fetchQueueExpand(contextUri string) {
 
 	now := time.Now()
 	p.queueExpandMu.Lock()
-	p.queueExpandCache[contextUri] = queueExpandCacheEntry{list: list, total: total, fetchedAt: now}
+	p.queueExpandCache[contextUri] = queueExpandCacheEntry{list: list, total: total, fetchedAt: now, asLibrary: asLibrary}
 	if len(p.queueExpandCache) > queueExpandCacheMaxContexts {
 		pruneQueueExpandCache(p.queueExpandCache, now)
 	}
@@ -264,10 +303,12 @@ func (p *AppPlayer) fetchQueueExpand(contextUri string) {
 }
 
 // queueExpandPage fetches one page of the context's tracks with the same
-// lenient mappers the local /web-api/ endpoints use
-func (p *AppPlayer) queueExpandPage(ctx context.Context, contextUri string, offset, limit int) ([]any, int, error) {
+// lenient mappers the local /web-api/ endpoints use. asLibrary forces the
+// library-tracks route (see queueExpandFetchOp).
+func (p *AppPlayer) queueExpandPage(ctx context.Context, contextUri string, offset, limit int, asLibrary bool) ([]any, int, error) {
+	op := queueExpandFetchOp(contextUri, asLibrary)
 	var body []byte
-	if strings.HasPrefix(contextUri, "spotify:playlist:") {
+	if op == "fetchPlaylist" {
 		body = p.pfBody("fetchPlaylist", map[string]any{
 			"uri":                       contextUri,
 			"offset":                    offset,
@@ -284,7 +325,7 @@ func (p *AppPlayer) queueExpandPage(ctx context.Context, contextUri string, offs
 	if err != nil {
 		return nil, 0, err
 	}
-	if strings.HasPrefix(contextUri, "spotify:playlist:") {
+	if op == "fetchPlaylist" {
 		return mapPlaylistTracksPage(data, offset)
 	}
 	return mapSavedTracksPage(data, offset)
