@@ -107,6 +107,11 @@ type AppPlayer struct {
 	// by the dealer-push tests for the seam.
 	likedPlaylistCountFn func(ctx context.Context, uri string) (int, bool)
 
+	// likedPlaylistFormatFn returns the playlistV2.format of a candidate
+	// liked-playlist uri (issue #15 discriminator: only "liked-songs" passes);
+	// nil in production (→ fetchPlaylistFormat), swapped by tests.
+	likedPlaylistFormatFn func(ctx context.Context, uri string) (string, bool)
+
 	// lookupChildEntitiesFn issues the secondary liked-playlist discovery probe
 	// (issue #15); nil in production → pathfinderQueryEx on the live session.
 	lookupChildEntitiesFn func(ctx context.Context) ([]byte, error)
@@ -1831,24 +1836,34 @@ func (p *AppPlayer) setLikedPlaylistURI(uri string) {
 }
 
 // resolveLikedPlaylistFromDealerPush opportunistically resolves the liked-songs
-// playlist uri from an hm://playlist/ dealer push (issue #56). The receiver
+// playlist uri from an hm://playlist/ dealer push (issue #56/#15). The receiver
 // sees a fully decoded payload — base64 and gzip already stripped by
-// dealer/recv.go — plus the raw push URI; both are scanned for literal
-// spotify:playlist:<id> tokens. Candidates are validated in order with the
-// pathfinder count query (acceptance bar: total > 0) and the first one that
-// passes is persisted via setLikedPlaylistURI. Only fills state.LikedPlaylistURI
-// when it is still empty — a value resolved elsewhere (background resolver,
-// me/playlists scan) is never overwritten. Returns "" when nothing resolves.
+// dealer/recv.go — plus the raw push URI. Candidate sources, merged in priority
+// order: (1) the bare id of an hm://playlist/v2/playlist/<id> push uri — the
+// push is ABOUT that playlist, (2) literal spotify:playlist:<id> tokens in the
+// payload bytes — Spotify ships protobuf payloads that carry the token verbatim
+// where the JSON item walk finds nothing (T20 device capture), (3) the JSON
+// item walk (kept for plain-JSON payload shapes). The merged list is
+// de-duplicated, and each candidate must pass BOTH the pathfinder count query
+// (total > 0) AND playlistV2.format == "liked-songs" — a missing/unreadable
+// format rejects it (fail closed), so pushes for OTHER playlists can never be
+// persisted as the liked-songs uri; the first passing candidate is persisted
+// via setLikedPlaylistURI. Only fills state.LikedPlaylistURI when it is still
+// empty — a value resolved elsewhere (background resolver, me/playlists scan)
+// is never overwritten. Returns "" when nothing resolves.
 func (p *AppPlayer) resolveLikedPlaylistFromDealerPush(ctx context.Context, msg dealer.Message) string {
 	if p.cachedLikedPlaylistURI() != "" {
 		return "" // already resolved; never overwrite
 	}
 
 	candidates := make([]string, 0, 4)
-	if u := firstPlaylistURInItem(msg.Payload); u != "" {
+	if id := playlistIDFromDealerPushURI(msg.Uri); id != "" {
+		candidates = append(candidates, "spotify:playlist:"+id) // the push is ABOUT this playlist
+	}
+	for _, u := range playlistURIsInText(string(msg.Payload)) { // protobuf payloads carry literal tokens
 		candidates = append(candidates, u)
 	}
-	for _, u := range playlistURIsInText(msg.Uri) { // the push URI path may carry the token itself (T13 observation)
+	if u := firstPlaylistURInItem(msg.Payload); u != "" {
 		candidates = append(candidates, u)
 	}
 
@@ -1866,20 +1881,74 @@ func (p *AppPlayer) resolveLikedPlaylistFromDealerPush(ctx context.Context, msg 
 		return ""
 	}
 
-	validate := p.likedPlaylistCountFn
-	if validate == nil {
-		validate = p.fetchPlaylistCount
-	}
 	for _, cand := range out {
-		total, ok := validate(ctx, cand)
+		total, ok, format, fok := p.validateLikedCandidate(ctx, cand)
 		if !ok || total <= 0 {
 			p.app.log.Debugf("play: dealer-push liked-playlist candidate %s failed validation (total=%d ok=%v)", cand, total, ok)
+			continue
+		}
+		if !fok || format != likedSongsPlaylistFormat {
+			p.app.log.Debugf("play: dealer candidate rejected (no liked-songs format): %s", cand)
 			continue
 		}
 		p.setLikedPlaylistURI(cand)
 		return cand
 	}
 	return ""
+}
+
+// likedSongsPlaylistFormat is the playlistV2.format value of the per-user
+// liked-songs playlist in fetchPlaylist responses (issue #15 discriminator).
+const likedSongsPlaylistFormat = "liked-songs"
+
+// playlistIDFromDealerPushURI extracts the bare playlist id from an
+// hm://playlist/v2/playlist/<id> push uri, where <id> matches
+// ^[0-9A-Za-z]{20,25}$. ONLY that shape yields a uri-path candidate — other
+// push shapes (hm://playlist/v2/list/..., artist lists, ...) must not produce
+// one.
+func playlistIDFromDealerPushURI(uri string) string {
+	const prefix = "hm://playlist/v2/playlist/"
+	if !strings.HasPrefix(uri, prefix) {
+		return ""
+	}
+	id := uri[len(prefix):]
+	if i := strings.IndexAny(id, "/?"); i >= 0 {
+		id = id[:i]
+	}
+	if len(id) < 20 || len(id) > 25 {
+		return ""
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+			return ""
+		}
+	}
+	return id
+}
+
+// validateLikedCandidate runs the issue #15 acceptance check for one candidate
+// liked-playlist uri: the pathfinder single-page fetch must yield total > 0
+// AND playlistV2.format == "liked-songs". Both values come from ONE query via
+// the shared meta cache (fetchPlaylistMeta). Returns the raw count and format
+// results so the caller can log why a candidate was rejected; a missing format
+// ("") never passes — fail closed. Tests swap the two fn seams; production
+// uses the pathfinder-backed fetchers.
+func (p *AppPlayer) validateLikedCandidate(ctx context.Context, cand string) (int, bool, string, bool) {
+	countValidate := p.likedPlaylistCountFn
+	if countValidate == nil {
+		countValidate = p.fetchPlaylistCount
+	}
+	formatValidate := p.likedPlaylistFormatFn
+	if formatValidate == nil {
+		formatValidate = p.fetchPlaylistFormat
+	}
+	total, ok := countValidate(ctx, cand)
+	if !ok || total <= 0 {
+		return total, ok, "", false
+	}
+	format, fok := formatValidate(ctx, cand)
+	return total, true, format, fok
 }
 
 // probeLookupChildEntities is the SECONDARY liked-playlist discovery step

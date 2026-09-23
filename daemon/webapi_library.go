@@ -26,9 +26,10 @@ const (
 )
 
 type playlistCountEntry struct {
-	total int
-	at    time.Time
-	ok    bool
+	total  int
+	format string // playlistV2.format from the same response (issue #15 discriminator)
+	at     time.Time
+	ok     bool
 }
 
 type playlistCountTarget struct {
@@ -1095,12 +1096,14 @@ func (p *AppPlayer) fillPlaylistCounts(ctx context.Context, targets []playlistCo
 	}
 }
 
-func (p *AppPlayer) cachedPlaylistCount(uri string) (int, bool) {
+// cachedPlaylistMeta returns the raw cache entry (count + format) with the
+// same TTL/eviction semantics as before.
+func (p *AppPlayer) cachedPlaylistMeta(uri string) (playlistCountEntry, bool) {
 	p.playlistCountMu.Lock()
 	defer p.playlistCountMu.Unlock()
 	e, ok := p.playlistCountCache[uri]
 	if !ok {
-		return 0, false
+		return playlistCountEntry{}, false
 	}
 	ttl := playlistCountCacheTTL
 	if !e.ok {
@@ -1108,25 +1111,52 @@ func (p *AppPlayer) cachedPlaylistCount(uri string) (int, bool) {
 	}
 	if time.Since(e.at) > ttl {
 		delete(p.playlistCountCache, uri)
-		return 0, false
+		return playlistCountEntry{}, false
 	}
+	return e, true
+}
+
+func (p *AppPlayer) cachedPlaylistCount(uri string) (int, bool) {
+	e, ok := p.cachedPlaylistMeta(uri)
 	return e.total, ok
 }
 
-func (p *AppPlayer) storePlaylistCount(uri string, total int, ok bool) {
+func (p *AppPlayer) storePlaylistMeta(uri string, e playlistCountEntry) {
 	p.playlistCountMu.Lock()
 	defer p.playlistCountMu.Unlock()
 	if p.playlistCountCache == nil {
 		p.playlistCountCache = make(map[string]playlistCountEntry)
 	}
-	p.playlistCountCache[uri] = playlistCountEntry{total: total, at: time.Now(), ok: ok}
+	p.playlistCountCache[uri] = e
+}
+
+func (p *AppPlayer) storePlaylistCount(uri string, total int, ok bool) {
+	p.storePlaylistMeta(uri, playlistCountEntry{total: total, at: time.Now(), ok: ok})
 }
 
 // fetchPlaylistCount asks Pathfinder for one page (limit 1) of the playlist to
-// read its content.totalCount, using the in-memory count cache.
+// read its content.totalCount, using the in-memory meta cache.
 func (p *AppPlayer) fetchPlaylistCount(ctx context.Context, uri string) (int, bool) {
-	if total, ok := p.cachedPlaylistCount(uri); ok {
-		return total, ok
+	total, _, ok := p.fetchPlaylistMeta(ctx, uri)
+	return total, ok
+}
+
+// fetchPlaylistFormat reads playlistV2.format from the SAME single-page
+// fetchPlaylist response as fetchPlaylistCount (issue #15: only a "liked-songs"
+// format may be persisted as the liked-songs playlist uri). The shared meta
+// cache makes a count+format validation pair cost one query.
+func (p *AppPlayer) fetchPlaylistFormat(ctx context.Context, uri string) (string, bool) {
+	_, format, ok := p.fetchPlaylistMeta(ctx, uri)
+	return format, ok
+}
+
+// fetchPlaylistMeta runs the shared single-page fetchPlaylist query and parses
+// BOTH content.totalCount and playlistV2.format from one response. A failed
+// query or an unreadable payload caches a failure entry (ok=false) so both
+// readers fail closed until the TTL expires.
+func (p *AppPlayer) fetchPlaylistMeta(ctx context.Context, uri string) (int, string, bool) {
+	if e, ok := p.cachedPlaylistMeta(uri); ok {
+		return e.total, e.format, e.ok
 	}
 	body := p.pfBody("fetchPlaylist", map[string]any{
 		"uri":                       uri,
@@ -1136,16 +1166,16 @@ func (p *AppPlayer) fetchPlaylistCount(ctx context.Context, uri string) (int, bo
 	})
 	data, err := p.pathfinderQueryEx(ctx, body, false)
 	if err != nil {
-		p.storePlaylistCount(uri, 0, false)
-		return 0, false
+		p.storePlaylistMeta(uri, playlistCountEntry{at: time.Now(), ok: false})
+		return 0, "", false
 	}
-	total, err := parsePlaylistCount(data)
+	total, format, err := parsePlaylistMeta(data)
 	if err != nil {
-		p.storePlaylistCount(uri, 0, false)
-		return 0, false
+		p.storePlaylistMeta(uri, playlistCountEntry{at: time.Now(), ok: false})
+		return 0, "", false
 	}
-	p.storePlaylistCount(uri, total, true)
-	return total, true
+	p.storePlaylistMeta(uri, playlistCountEntry{total: total, format: format, at: time.Now(), ok: true})
+	return total, format, true
 }
 
 // parsePlaylistCount reads content.totalCount from a fetchPlaylist payload.
@@ -1163,4 +1193,24 @@ func parsePlaylistCount(data []byte) (int, error) {
 		return 0, err
 	}
 	return r.Data.PlaylistV2.Content.TotalCount, nil
+}
+
+// parsePlaylistMeta reads content.totalCount AND playlistV2.format (both at the
+// playlist object level) from one fetchPlaylist payload. A missing format
+// parses to "" and the caller's liked-songs check fails closed on it.
+func parsePlaylistMeta(data []byte) (int, string, error) {
+	var r struct {
+		Data struct {
+			PlaylistV2 struct {
+				Format  string `json:"format"`
+				Content struct {
+					TotalCount int `json:"totalCount"`
+				} `json:"content"`
+			} `json:"playlistV2"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return 0, "", err
+	}
+	return r.Data.PlaylistV2.Content.TotalCount, r.Data.PlaylistV2.Format, nil
 }
