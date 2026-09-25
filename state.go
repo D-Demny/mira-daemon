@@ -47,21 +47,6 @@ type AppState struct {
 	// OAuth holds the persisted Web API OAuth tokens (see OAuthState)
 	OAuth OAuthState `json:"oauth,omitempty"`
 
-	// AccountID caches the Spotify account id of the paired user, resolved
-	// once via the Web API GET /v1/me — the device-flow access token is
-	// opaque (no JWT sub claim), so the id cannot be derived from the token
-	// itself and must survive restarts for the liked-songs context
-	// resolution (issue #56, fix #2)
-	AccountID string `json:"account_id,omitempty"`
-
-	// LikedPlaylistURI caches the REAL per-user liked-songs playlist uri
-	// (spotify:playlist:<id>) resolved from the libraryV3 pathfinder payload
-	// — the bare pseudo id and the user-form collection context are both
-	// rejected by Connect receivers (issue #56), while the real playlist id
-	// starts playback reliably. Resolved once in the background / opportunistically
-	// via me/playlists polling, then plays go out with this context directly.
-	LikedPlaylistURI string `json:"liked_playlist_uri,omitempty"`
-
 	// last offset from the check in service
 	UtcOffsetMin *int `json:"utc_offset_min,omitempty"`
 

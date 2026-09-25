@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -31,35 +30,6 @@ func TestFileStateStoreSaveLoadRoundTrip(t *testing.T) {
 		string(got.Credentials.Data) != string(want.Credentials.Data) ||
 		got.LastBluetoothPanAddress != want.LastBluetoothPanAddress {
 		t.Fatalf("round-trip mismatch:\n got  %+v\n want %+v", got, want)
-	}
-}
-
-// issue #56: AppState.AccountID is a persisted field — whatever writes it must
-// land in state.json (as "account_id") and survive a restart via Save/Load.
-func TestFileStateStoreSavePersistsAccountID(t *testing.T) {
-	dir := t.TempDir()
-	statePath := filepath.Join(dir, "state.json")
-	s := NewFileStateStore(statePath, "", &librespot.NullLogger{})
-
-	want := &librespot.AppState{DeviceId: "abc123", AccountID: "sp-user-42"}
-	if err := s.Save(want); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-
-	raw, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatalf("reading state.json: %v", err)
-	}
-	if !strings.Contains(string(raw), `"account_id":"sp-user-42"`) {
-		t.Fatalf("state.json does not carry the persisted account id:\n%s", raw)
-	}
-
-	got, err := s.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if got.AccountID != "sp-user-42" {
-		t.Errorf("reloaded AccountID: got %q want sp-user-42", got.AccountID)
 	}
 }
 

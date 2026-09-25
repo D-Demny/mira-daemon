@@ -479,7 +479,7 @@ func TestPlayerPlayCommand_OffsetUriBecomesSkipTo(t *testing.T) {
 		Uri:    "spotify:playlist:abc",
 		Offset: &ApiRequestPlayOffset{Uri: "spotify:track:xyz", Position: 2},
 	}
-	cmd := buildPlayCommand(data)
+	cmd := buildPlayCommand(data, "someone") // non-alias contexts are username-insensitive
 
 	if got := cmd.Options.SkipTo.TrackUri; got != "spotify:track:xyz" {
 		t.Errorf("options.skip_to.track_uri: got %q want %q", got, "spotify:track:xyz")
@@ -500,7 +500,7 @@ func TestPlayerPlayCommand_OffsetUriBecomesSkipTo(t *testing.T) {
 		SkipToUri: "spotify:track:explicit",
 		Offset:    &ApiRequestPlayOffset{Uri: "spotify:track:xyz", Position: 2},
 	}
-	if got := buildPlayCommand(dataExplicit).Options.SkipTo.TrackUri; got != "spotify:track:explicit" {
+	if got := buildPlayCommand(dataExplicit, "someone").Options.SkipTo.TrackUri; got != "spotify:track:explicit" {
 		t.Errorf("explicit skip_to_uri not honored: got %q", got)
 	}
 
@@ -509,76 +509,61 @@ func TestPlayerPlayCommand_OffsetUriBecomesSkipTo(t *testing.T) {
 		Uri:    "spotify:playlist:abc",
 		Offset: &ApiRequestPlayOffset{Position: 5},
 	}
-	if got := buildPlayCommand(dataPosOnly).Options.SkipTo.TrackUri; got != "" {
+	if got := buildPlayCommand(dataPosOnly, "someone").Options.SkipTo.TrackUri; got != "" {
 		t.Errorf("skip_to.track_uri without offset uri: got %q want empty", got)
 	}
 }
 
-// issue #56: liked-songs context resolution no longer does any account-id
-// work — it returns the persisted real per-user playlist uri when one has been
-// resolved (background resolver / opportunistic me/playlists scan), and ""
-// otherwise so the play path can fall back to standalone track playback. The
-// bare pseudo id and the legacy user-specific collection form are never
-// synthesized here; they are rejected by Connect receivers.
-func TestResolvePlayContextUri_ReturnsPersistedPlaylistUri(t *testing.T) {
+// issue #56 (upstream b9a0970): the bare library alias is not a playable
+// context — only the account's own collection resolves, so buildPlayCommand
+// rewrites it into Context.Uri and Url whenever the session reports a username.
+func TestBuildPlayCommand_LikedSongsRewrittenToAccountCollection(t *testing.T) {
 	t.Parallel()
 
-	state := &librespot.AppState{
-		OAuth:            librespot.OAuthState{AccessToken: "opaque-token-no-dots"},
-		LikedPlaylistURI: "spotify:playlist:37i9dQZF1F5p3rmiWPIYgZ",
+	cmd := buildPlayCommand(ApiRequestDataPlay{
+		Uri:    likedCollectionUri,
+		SkipToUri: "spotify:track:abc",
+	}, "someone")
+	want := "spotify:user:someone:collection"
+	if got := cmd.Context.Uri; got != want {
+		t.Errorf("context uri: got %q want the account collection %q", got, want)
 	}
-	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}}
-
-	got := p.resolvePlayContextUri(likedCollectionUri)
-	if want := "spotify:playlist:37i9dQZF1F5p3rmiWPIYgZ"; got != want {
-		t.Fatalf("persisted uri: got %q want %q", got, want)
+	if got, w := cmd.Context.Url, "context://"+want; got != w {
+		t.Errorf("context url: got %q want %q", got, w)
+	}
+	if got := cmd.Options.SkipTo.TrackUri; got != "spotify:track:abc" {
+		t.Errorf("skip_to: got %q, want the explicit skip-to riding along", got)
 	}
 }
 
-// nothing persisted yet: the pseudo id resolves to "" — the caller treats
-// empty as "context unavailable" and owns the fallback. And every other
-// context passes through byte-for-byte (including the legacy user-form an
-// older session may still echo).
-func TestResolvePlayContextUri_UnresolvedYieldsEmptyWithNoWebTraffic(t *testing.T) {
+// a play before the session reports a username: the bare alias goes out
+// as-is — sending `spotify:user::collection` would be worse than the alias it
+// was asked for. Every non-alias context passes through byte-for-byte, with or
+// without a username (including the legacy user-form an older session may
+// still echo).
+func TestBuildPlayCommand_LikedSongsAliasKeptWithoutUsername(t *testing.T) {
 	t.Parallel()
 
-	state := &librespot.AppState{OAuth: librespot.OAuthState{AccessToken: "opaque-token-no-dots"}}
-	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}}
-
-	if got := p.resolvePlayContextUri(likedCollectionUri); got != "" {
-		t.Errorf("unresolved liked context: got %q want empty (the play path owns the fallback)", got)
+	cmd := buildPlayCommand(ApiRequestDataPlay{Uri: likedCollectionUri}, "")
+	if got := cmd.Context.Uri; got != likedCollectionUri {
+		t.Errorf("context uri without username: got %q want the bare alias untouched", got)
 	}
+	if got, want := cmd.Context.Url, "context://"+likedCollectionUri; got != want {
+		t.Errorf("context url without username: got %q want %q", got, want)
+	}
+
 	for _, uri := range []string{
-		"spotify:user:u1:collection:tracks", // legacy echo form passes through untouched
+		"spotify:user:u1:collection:tracks", // legacy echo form is never rewritten
 		"spotify:playlist:abc123",
 		"spotify:album:abc123",
 		"spotify:track:xyz789",
 		"spotify:artist:abc456",
 	} {
-		if res := p.resolvePlayContextUri(uri); res != uri {
-			t.Errorf("passthrough %q: got %q", uri, res)
+		for _, user := range []string{"", "someone"} {
+			if got := buildPlayCommand(ApiRequestDataPlay{Uri: uri}, user).Context.Uri; got != uri {
+				t.Errorf("passthrough %q (username %q): got %q", uri, user, got)
+			}
 		}
-	}
-}
-
-// the resolved context rides the play envelope as its connect uri/url, with
-// any skip-to riding along.
-func TestResolvePlayContextUri_EnvelopeCarriesResolvedContext(t *testing.T) {
-	t.Parallel()
-
-	state := &librespot.AppState{
-		OAuth:            librespot.OAuthState{AccessToken: "opaque-token-no-dots"},
-		LikedPlaylistURI: "spotify:playlist:liked-real",
-	}
-	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, state: state, stateStore: nopStateStore{}}}
-
-	resolved := p.resolvePlayContextUri(likedCollectionUri)
-	cmd := buildPlayCommand(ApiRequestDataPlay{Uri: resolved, SkipToUri: "spotify:track:abc"})
-	if cmd.Context.Uri != resolved || cmd.Context.Url != "context://"+resolved {
-		t.Errorf("envelope context: got uri=%q url=%q, want %q", cmd.Context.Uri, cmd.Context.Url, resolved)
-	}
-	if cmd.Options.SkipTo.TrackUri != "spotify:track:abc" {
-		t.Errorf("skip_to: got %q want spotify:track:abc", cmd.Options.SkipTo.TrackUri)
 	}
 }
 
