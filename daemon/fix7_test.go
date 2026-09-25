@@ -2,8 +2,6 @@ package daemon
 
 import (
 	"context"
-	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,23 +9,18 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 )
 
-// issue #56 — the Liked-Songs play path. The UI tap carries the bare pseudo id
-// `spotify:collection:tracks`; the daemon plays the REAL per-user liked-songs
-// playlist uri (`spotify:playlist:<id>`) whenever one has been resolved (the
-// background resolver / the opportunistic me/playlists scan persist it), which
-// is a context Connect receivers reliably start. Until then the tap falls back
-// to STANDALONE TRACK playback — the tapped offset track when the request
-// carries one, otherwise the first library track via a bounded fetch — and
-// NEVER sends the bare pseudo id or the legacy user-specific collection form
-// (Connect receivers reject both and clear playback). A taken liked-songs play
-// marks the session as liked so queue expansion pages library tracks even for
-// a playlist-shaped Connect echo. There is no escape-hatch retry: the real
-// context starts reliably on-device and nothing is re-sent after it. Spotify's
-// global "Today's Top Hits" playlist is NOT a liked-songs context and is never
-// sent here.
-// Reuses the nopStateStore fixture plus the sendDeviceCommandFn transport
-// seam; fallback tests use the libraryFirstTrackFn seam instead of touching a
-// session.
+// issue #56 — the Liked-Songs play path (upstream b9a0970). The UI tap carries
+// the bare library alias `spotify:collection:tracks`; buildPlayCommand
+// rewrites it to the paired account's own collection
+// (`spotify:user:<username>:collection`) — the only liked-songs context
+// Connect receivers actually start. The username comes from the live session
+// (the playUsername seam stands in for tests); a play that arrives before the
+// session reports one sends the alias as-is rather than a half-built user form.
+// A taken liked-songs play marks the session as liked so queue expansion pages
+// library tracks even for a playlist-shaped Connect echo. Spotify's global
+// "Today's Top Hits" playlist is NOT a liked-songs context and is never sent
+// here. Reuses the nopStateStore fixture plus the sendDeviceCommandFn transport
+// seam.
 
 // sentCommands records the connect commands a stubbed sendDeviceCommand saw
 // (single-goroutine: tests drive handleApiRequest directly, no Run loop
@@ -54,11 +47,9 @@ func (r *sentCommands) take() []connectCommand {
 
 // newFix7Player wires a minimal AppPlayer for the play path: stubbed
 // transport (sendDeviceCommandFn) and an active target device in the observer
-// state so resolveTargetDevice has somewhere to send. The fixture state
-// carries no credentials username, an opaque access token — AND no persisted
-// liked-songs playlist uri: the only resolution source is empty by design
-// until a test seeds one. No session exists: any code path that would hit the
-// network must go through a seam (libraryFirstTrackFn).
+// state so resolveTargetDevice has somewhere to send. No session exists, so
+// playUsername() yields "" unless a test sets the playUsernameFn seam — the
+// same "" a real player reports before its first welcome packet.
 func newFix7Player(t *testing.T) (*AppPlayer, *sentCommands) {
 	t.Helper()
 	rec := &sentCommands{}
@@ -71,26 +62,17 @@ func newFix7Player(t *testing.T) (*AppPlayer, *sentCommands) {
 	return p, rec
 }
 
-// playLikedSongs issues the UI's actual request shape: the bare pseudo id with
-// the tapped offset — exactly what the UI sends for a Liked-Songs tap.
-func playLikedSongs(t *testing.T, p *AppPlayer) {
-	t.Helper()
-	req, _ := NewApiRequest(ApiRequestTypePlay, ApiRequestDataPlay{Uri: likedCollectionUri})
-	if _, err := p.handleApiRequest(context.Background(), req); err != nil {
-		t.Fatalf("play (liked songs): %v", err)
-	}
-}
-
-// (a) wire contract: a liked-songs play with a RESOLVED context leaves the
-// envelope with the real per-user playlist uri as the connect context — no
-// account-id traffic on the path — and the tapped offset rides along
-// unchanged. The pure builder still passes every other context through
-// byte-for-byte.
-func TestPlay_LikedSongsResolvedSendsRealPlaylistContext(t *testing.T) {
+// (a) wire contract: a liked-songs play whose session reports a username
+// leaves the envelope with the ACCOUNT COLLECTION as the connect context —
+// the bare library alias is rewritten in both Context.Uri and Url — and the
+// tapped offset rides along unchanged. The session is marked as liked so queue
+// expansion pages library tracks even for a playlist-shaped Connect echo. The
+// pure builder still passes every other context through byte-for-byte.
+func TestPlay_LikedSongsSendsAccountCollection(t *testing.T) {
 	t.Parallel()
 	p, rec := newFix7Player(t)
-	const realLiked = "spotify:playlist:liked-real"
-	p.app.state.LikedPlaylistURI = realLiked
+	const username = "u1"
+	p.playUsernameFn = func() string { return username }
 
 	req, _ := NewApiRequest(ApiRequestTypePlay, ApiRequestDataPlay{
 		Uri:    likedCollectionUri,
@@ -100,15 +82,16 @@ func TestPlay_LikedSongsResolvedSendsRealPlaylistContext(t *testing.T) {
 		t.Fatalf("play (liked songs): %v", err)
 	}
 
+	const want = "spotify:user:" + username + ":collection"
 	cmds := rec.take()
 	if len(cmds) != 1 {
 		t.Fatalf("sent %d commands, want exactly 1 (the primary play)", len(cmds))
 	}
-	if got := cmds[0].Context.Uri; got != realLiked {
-		t.Errorf("primary context: got %q want the resolved per-user playlist uri %q", got, realLiked)
+	if got := cmds[0].Context.Uri; got != want {
+		t.Errorf("primary context: got %q want the account collection %q", got, want)
 	}
-	if got, want := cmds[0].Context.Url, "context://"+realLiked; got != want {
-		t.Errorf("context url: got %q want %q", got, want)
+	if got, w := cmds[0].Context.Url, "context://"+want; got != w {
+		t.Errorf("context url: got %q want %q", got, w)
 	}
 	if cmds[0].Options.Offset == nil || cmds[0].Options.Offset.Uri != "spotify:track:first" || cmds[0].Options.Offset.Position != 42 {
 		t.Errorf("offset: got %+v, want unchanged {uri:spotify:track:first pos:42}", cmds[0].Options.Offset)
@@ -120,44 +103,44 @@ func TestPlay_LikedSongsResolvedSendsRealPlaylistContext(t *testing.T) {
 		t.Error("a taken liked-songs play must mark the session for library-track queue expansion")
 	}
 
-	// the pure builder still passes every other context through untouched
+	// the pure builder still passes every other context through untouched,
+	// and never rewrites anything that is not the bare library alias
 	for _, uri := range []string{
-		likedCollectionUri,
-		"spotify:user:u1:collection:tracks",
 		"spotify:playlist:abc123",
 		"spotify:album:abc123",
+		"spotify:user:u2:collection:tracks",
 	} {
-		if got := buildPlayCommand(ApiRequestDataPlay{Uri: uri}).Context.Uri; got != uri {
+		if got := buildPlayCommand(ApiRequestDataPlay{Uri: uri}, username).Context.Uri; got != uri {
 			t.Errorf("builder passthrough %q: got %q", uri, got)
 		}
 	}
 }
 
-// (b) nothing resolved yet: the play is NOT refused and NOTHING
-// collection-shaped goes out — the tapped offset track plays standalone. The
-// session is NOT marked as liked (a plain track play) and no retry is armed.
-// A subsequent non-liked play leaves all state clean.
-func TestPlay_LikedSongsUnresolvedFallsBackToTappedTrack(t *testing.T) {
+// (b) the session has not reported a username yet (before the welcome packet):
+// the play is NOT refused and the bare library alias goes out AS-IS — no
+// half-built user form is ever constructed. A subsequent non-liked play clears
+// the liked-session flag again.
+func TestPlay_LikedSongsWithoutUsernameSendsAliasUntouched(t *testing.T) {
 	t.Parallel()
-	p, rec := newFix7Player(t) // fresh install: no persisted playlist uri
+	p, rec := newFix7Player(t) // no session, no seam → playUsername() == ""
 
-	req, _ := NewApiRequest(ApiRequestTypePlay, ApiRequestDataPlay{
-		Uri:    likedCollectionUri,
-		Offset: &ApiRequestPlayOffset{Uri: "spotify:track:first", Position: 42},
-	})
+	req, _ := NewApiRequest(ApiRequestTypePlay, ApiRequestDataPlay{Uri: likedCollectionUri})
 	if _, err := p.handleApiRequest(context.Background(), req); err != nil {
 		t.Fatalf("play (liked songs): %v", err)
 	}
 
 	cmds := rec.take()
 	if len(cmds) != 1 {
-		t.Fatalf("sent %d commands, want exactly 1 (the fallback track play)", len(cmds))
+		t.Fatalf("sent %d commands, want exactly 1 (the primary play)", len(cmds))
 	}
-	if got := cmds[0].Context.Uri; got != "spotify:track:first" {
-		t.Errorf("unresolved fallback: got %q want the tapped track played standalone", got)
+	if got, want := cmds[0].Context.Uri, likedCollectionUri; got != want {
+		t.Errorf("context: got %q want the bare alias sent untouched while no username is known", got)
 	}
-	if p.likedSessionActive.Load() {
-		t.Error("the standalone fallback is a plain track play and must not mark the session as liked")
+	if got, want := cmds[0].Context.Url, "context://"+likedCollectionUri; got != want {
+		t.Errorf("context url: got %q want %q", got, want)
+	}
+	if !p.likedSessionActive.Load() {
+		t.Error("a taken liked-songs play must mark the session for library-track queue expansion")
 	}
 
 	req2, _ := NewApiRequest(ApiRequestTypePlay, ApiRequestDataPlay{Uri: "spotify:playlist:pl"})
@@ -167,50 +150,8 @@ func TestPlay_LikedSongsUnresolvedFallsBackToTappedTrack(t *testing.T) {
 	if p.likedSessionActive.Load() {
 		t.Error("a playlist play must clear the liked-session flag")
 	}
-	if len(rec.take()) != 2 {
-		t.Errorf("sent %d commands, want 2 (one per play)", len(rec.take()))
-	}
-}
-
-// (b) no offset either — the fallback pages the first library track through
-// the bounded fetch seam and plays it standalone.
-func TestPlay_LikedSongsUnresolvedFallsBackToFirstLibraryTrack(t *testing.T) {
-	t.Parallel()
-	p, rec := newFix7Player(t)
-	p.libraryFirstTrackFn = func(context.Context) (string, error) {
-		return "spotify:track:first-lib", nil
-	}
-
-	playLikedSongs(t, p) // no offset — must not be refused
-
-	cmds := rec.take()
-	if len(cmds) != 1 {
-		t.Fatalf("sent %d commands, want exactly 1 (the fallback track play)", len(cmds))
-	}
-	if got := cmds[0].Context.Uri; got != "spotify:track:first-lib" {
-		t.Errorf("unresolved fallback without offset: got %q want the first library track", got)
-	}
-}
-
-// (b) the first-library-track fetch fails too — the tap is refused with a
-// rate-limit-friendly message and NOTHING goes out on the wire.
-func TestPlay_LikedSongsUnresolvedFallbackSurfacesFetchFailure(t *testing.T) {
-	t.Parallel()
-	p, rec := newFix7Player(t)
-	p.libraryFirstTrackFn = func(context.Context) (string, error) {
-		return "", errors.New("library query rate-limited")
-	}
-
-	req, _ := NewApiRequest(ApiRequestTypePlay, ApiRequestDataPlay{Uri: likedCollectionUri})
-	_, err := p.handleApiRequest(context.Background(), req)
-	if err == nil {
-		t.Fatal("want an error while no real context and no library track are available")
-	}
-	if !strings.Contains(err.Error(), "still being set up") {
-		t.Errorf("fallback error: got %q, want the retry-later message", err.Error())
-	}
-	if len(rec.take()) != 0 {
-		t.Errorf("sent %d commands on a failed fallback, want 0", len(rec.take()))
+	if got := len(rec.take()); got != 2 {
+		t.Errorf("sent %d commands, want 2 (one per play)", got)
 	}
 }
 
@@ -228,6 +169,7 @@ func TestQueueExpandFetchOp_Routing(t *testing.T) {
 		{"spotify:playlist:abc", true, "fetchLibraryTracks"},
 		{likedCollectionUri, false, "fetchLibraryTracks"},
 		{likedCollectionUri, true, "fetchLibraryTracks"},
+		{"spotify:user:u1:collection", false, "fetchLibraryTracks"},
 		{"spotify:user:u1:collection:tracks", false, "fetchLibraryTracks"},
 	} {
 		if got := queueExpandFetchOp(tc.uri, tc.asLibrary); got != tc.want {

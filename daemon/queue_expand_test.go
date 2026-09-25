@@ -189,8 +189,9 @@ func TestExpandableContextUri(t *testing.T) {
 	}{
 		{"spotify:playlist:abc123", "spotify:playlist:abc123"},
 		{"spotify:collection:tracks", "spotify:collection:tracks"},
-		// issue #56: the user-specific form played through (and possibly
-		// echoed by connect) must expand like the bare pseudo id
+		// issue #56: the account-collection form play sends (upstream b9a0970)
+		// and the legacy user-specific form must expand like the bare pseudo id
+		{"spotify:user:abc123:collection", "spotify:user:abc123:collection"},
 		{"spotify:user:abc123:collection:tracks", "spotify:user:abc123:collection:tracks"},
 		{"spotify:user:abc123:collection:podcasts", ""},
 		{"spotify:album:abc", ""},
@@ -471,31 +472,23 @@ func TestExpandQueue_UserCollectionLikedSongsStillExpands(t *testing.T) {
 	}
 }
 
-// issue #56 glue: the uri play-time resolution produces for liked songs (the
-// persisted REAL per-user playlist uri spotify:playlist:<id>) is exactly the
-// context queue expansion keys off — and while the session is marked as
-// liked, a playlist-shaped echo must still page LIBRARY tracks instead of
-// paging whatever internal playlist the receiver chose to report.
+// issue #56 glue (upstream b9a0970): the uri the play path sends for liked
+// songs — the account collection spotify:user:<username>:collection — is
+// exactly the context queue expansion keys off: it pages LIBRARY tracks
+// directly, and while the session is marked as liked a playlist-shaped echo
+// must still page library tracks (the flag-forced route).
 func TestResolvedLikedSongsContextIsQueueExpandable(t *testing.T) {
 	t.Parallel()
 
-	const realLiked = "spotify:playlist:37i9dQZF1F5p3rmiWPIYgZ" // observed on-device liked-songs id
-	p := newTestQueueExpandPlayer(t)
-	p.app.state.LikedPlaylistURI = realLiked
-
-	resolved := p.resolvePlayContextUri(likedCollectionUri)
-	if resolved != realLiked {
-		t.Fatalf("resolve: got %q want the persisted per-user playlist uri %q", resolved, realLiked)
-	}
+	const resolved = "spotify:user:someone:collection" // play-time form for username "someone"
 	if got := expandableContextUri(resolved); got != resolved {
-		t.Fatalf("expandable: got %q, want the resolved uri %q to stay expandable", got, resolved)
+		t.Fatalf("expandable: got %q, want the account-collection uri %q to be queue-expandable", got, resolved)
 	}
 
+	p := newTestQueueExpandPlayer(t)
 	var fetchedFor string
-	var asLibraries []bool
-	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int, asLibrary bool) ([]any, int, error) {
+	p.queueExpandPageFn = func(_ context.Context, uri string, _, _ int, _ bool) ([]any, int, error) {
 		fetchedFor = uri // ordered before the channel send
-		asLibraries = append(asLibraries, asLibrary)
 		return []any{
 			map[string]any{"is_local": false, "track": map[string]any{"id": "t00", "name": "A", "uri": "spotify:track:t00"}},
 			map[string]any{"is_local": false, "track": map[string]any{"id": "t01", "name": "B", "uri": "spotify:track:t01"}},
@@ -505,7 +498,7 @@ func TestResolvedLikedSongsContextIsQueueExpandable(t *testing.T) {
 
 	rs := &RemoteState{
 		TrackUri:   "spotify:track:t00",
-		ContextUri: resolved, // the receiver echoes the real playlist uri
+		ContextUri: resolved,
 		NextTracks: []QueueTrack{{Uri: "spotify:track:t01", TrackId: "t01"}},
 	}
 	p.expandQueue(rs)
@@ -513,16 +506,13 @@ func TestResolvedLikedSongsContextIsQueueExpandable(t *testing.T) {
 	select {
 	case res := <-p.queueExpandedCh:
 		if fetchedFor != resolved {
-			t.Errorf("fetch keyed off %q, want the resolved uri %q", fetchedFor, resolved)
-		}
-		if len(asLibraries) != 1 || !asLibraries[0] {
-			t.Errorf("page called with asLibrary=%v, want [true] (liked session forces the library route)", asLibraries)
+			t.Errorf("fetch keyed off %q, want the account-collection uri %q", fetchedFor, resolved)
 		}
 		if len(res.list) != 2 || res.total != 2 {
 			t.Errorf("result: got %d tracks (total %d), want 2 (2)", len(res.list), res.total)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("no queue expansion result for the resolved liked-songs context")
+		t.Fatal("no queue expansion result for the account-collection liked-songs context")
 	}
 }
 

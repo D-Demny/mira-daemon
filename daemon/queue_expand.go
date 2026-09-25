@@ -59,17 +59,21 @@ func expandableContextUri(uri string) string {
 	return ""
 }
 
-// isLikedCollectionUri matches the liked-songs collection in both of its
+// isLikedCollectionUri matches the liked-songs collection in all of its
 // uri forms: the bare pseudo id the UI requests with, and the user-specific
-// `spotify:user:<id>:collection:tracks` form issue #56 plays through (and
-// the Connect state echo may report). Both hold the same saved-tracks list,
-// which queueExpandPage already pages via fetchLibraryTracks for any
-// non-playlist uri.
+// account-collection form `spotify:user:<id>:collection` issue #56 plays
+// through (upstream b9a0970) — with or without the legacy `:tracks` suffix
+// (older daemon builds sent it, and the Connect state echo may report either).
+// All forms hold the same saved-tracks list, which queueExpandPage already
+// pages via fetchLibraryTracks for any non-playlist uri.
 func isLikedCollectionUri(uri string) bool {
 	if uri == likedCollectionUri {
 		return true
 	}
-	return strings.HasPrefix(uri, "spotify:user:") && strings.HasSuffix(uri, ":collection:tracks")
+	if !strings.HasPrefix(uri, "spotify:user:") {
+		return false
+	}
+	return strings.HasSuffix(uri, ":collection") || strings.HasSuffix(uri, ":collection:tracks")
 }
 
 // queueExpandFetchOp picks the pathfinder operation that pages a context's
