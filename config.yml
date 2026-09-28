@@ -1,6 +1,6 @@
 device_name: "Mira"
 device_type: "car_thing"
-log_level: "debug"
+log_level: "info"
 
 observer_mode: true
 
@@ -13,14 +13,14 @@ server:
   port: 3678
   allow_origin: "*"
 
-report_url: "https://mira-reports.mira-thing.workers.dev/"
+report_url: ""
 
 homeassistant:
-  url: "http://10.10.1.104:8123"
+  url: ""
   token: "" # injected by CI from repo secret HA_TOKEN; committed default intentionally empty (prior value leaked and was revoked 2026-09-18)
 
-checkin: true
-checkin_url: "https://mira-checkin.mira-thing.workers.dev"
+checkin: false
+checkin_url: ""
 
 # Raspberry Pi provisioning wizard (epic 10): the script the daemon execs
 # when the settings UI triggers "Pi automatisch einrichten"
