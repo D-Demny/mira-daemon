@@ -174,8 +174,8 @@ func loadCLIConfig(cfg *cliConfig) error {
 
 		"credentials.type": "interactive",
 
-		"checkin":     true,
-		"checkin_url": "https://mira-checkin.mira-thing.workers.dev",
+		"checkin":     false,
+		"checkin_url": "",
 
 		"server.address":    "localhost",
 		"server.image_size": "default",

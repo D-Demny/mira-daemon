@@ -90,14 +90,16 @@ func parseVersionParts(v string) ([3]int, bool) {
 	return out, true
 }
 
+// utcOffsetMin returns the device's UTC offset in minutes, derived locally
+// from the OS timezone on every call. Local-first since issue #13
+// (zero-outbound default): the value is always DST-correct and never stale
+// without any network round-trip; checkin only overwrites the persisted
+// state, not this accessor.
 func (app *App) utcOffsetMin() *int {
-	app.state.Lock()
-	defer app.state.Unlock()
-	if app.state.UtcOffsetMin == nil {
-		return nil
-	}
-	v := *app.state.UtcOffsetMin
-	return &v
+	now := time.Now()
+	_, offsetSec := now.Zone()
+	off := offsetSec / 60
+	return &off
 }
 
 func (app *App) latestVersion() string {
@@ -129,7 +131,9 @@ func (app *App) updateAvailable() bool {
 }
 
 func (app *App) hasCheckedInEver() bool {
-	return app.utcOffsetMin() != nil
+	app.state.Lock()
+	defer app.state.Unlock()
+	return app.state.UtcOffsetMin != nil
 }
 
 func (app *App) startCheckin() {

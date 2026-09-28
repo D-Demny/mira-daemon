@@ -99,8 +99,11 @@ func TestDoCheckinStoresOffsetAndLatest(t *testing.T) {
 	if gotQuery.Get("version") != "1.0.0" {
 		t.Fatalf("unexpected query: %v", gotQuery)
 	}
-	if off := app.utcOffsetMin(); off == nil || *off != -240 {
-		t.Fatalf("offset not persisted: %v", off)
+	app.state.Lock()
+	stored := app.state.UtcOffsetMin
+	app.state.Unlock()
+	if stored == nil || *stored != -240 {
+		t.Fatalf("offset not persisted in state: %v", stored)
 	}
 	if app.latestVersion() != "1.1.0" {
 		t.Fatalf("latest_version not persisted: %q", app.latestVersion())
@@ -123,7 +126,10 @@ func TestDoCheckinMissingOffset(t *testing.T) {
 	if err := app.doCheckin(context.Background(), "1.0.0"); err == nil {
 		t.Fatal("expected error when the response carries no offset")
 	}
-	if app.utcOffsetMin() != nil {
+	app.state.Lock()
+	stored := app.state.UtcOffsetMin
+	app.state.Unlock()
+	if stored != nil {
 		t.Fatal("a response without an offset must not persist one")
 	}
 }
@@ -139,10 +145,40 @@ func TestDoCheckinServerError(t *testing.T) {
 	if err := app.doCheckin(context.Background(), "1.0.0"); err == nil {
 		t.Fatal("expected error on 500")
 	}
-	if app.utcOffsetMin() != nil {
+	app.state.Lock()
+	stored := app.state.UtcOffsetMin
+	app.state.Unlock()
+	if stored != nil {
 		t.Fatal("failed request must not persist an offset")
 	}
 	if app.hasCheckedInEver() {
 		t.Fatal("failed request must not count as a success")
+	}
+}
+
+func TestUtcOffsetMinLocalFirst(t *testing.T) {
+	t.Parallel()
+	app := checkinTestApp("http://unused")
+
+	// Computed from the same source the accessor uses, so the expectation
+	// is TZ-independent (CI and dev boxes may differ); see issue #13.
+	_, wantSec := time.Now().Zone()
+	wantMin := wantSec / 60
+
+	off := app.utcOffsetMin()
+	if off == nil {
+		t.Fatal("utcOffsetMin must never be nil now that it derives locally")
+	}
+	if *off != wantMin {
+		t.Fatalf("utcOffsetMin = %d, want local offset %d (minutes)", *off, wantMin)
+	}
+
+	// A persisted value must not shadow the local derivation.
+	fixed := -240
+	app.state.Lock()
+	app.state.UtcOffsetMin = &fixed
+	app.state.Unlock()
+	if off = app.utcOffsetMin(); *off != wantMin {
+		t.Fatalf("utcOffsetMin = %d with persisted state set, want local offset %d", *off, wantMin)
 	}
 }
