@@ -224,7 +224,13 @@ func (s *Session) oauthTokenFunc() librespot.GetLogin5TokenFunc {
 
 		remaining := time.Until(expiresAt)
 		s.log.Infof("OAuth: token %s (refresh token available: %v)",
-			func() string { if force { return "force refresh" } else { return "expired" } }(), hasRefresh)
+			func() string {
+				if force {
+					return "force refresh"
+				} else {
+					return "expired"
+				}
+			}(), hasRefresh)
 
 		if !hasRefresh {
 			if token != "" {
