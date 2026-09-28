@@ -738,8 +738,8 @@ func (s *ConcreteApiServer) SetHomeAssistantConfig(cfg HomeAssistantConfig) {
 func (s *ConcreteApiServer) getHomeAssistantConfig() HomeAssistantConfig {
 	if h := s.getSettingsHandler(); h != nil {
 		if hc := ParseHaConfig(h.GetSettings()); hc != nil {
-			// the proxy only needs URL + Token; username/password belong
-			// to the WS login endpoint, which receives them in its body
+			// the proxy only needs URL + Token (issue #4: WS auth is now
+			// long-lived token based; the blob's other fields are kept for shape fidelity)
 			return HomeAssistantConfig{URL: hc.URL, Token: hc.Token}
 		}
 	}
@@ -1113,13 +1113,13 @@ func (s *ConcreteApiServer) serve() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(h.TetheringStatus())
 	})
-	// ticket 9.4: the settings UI configures the Home Assistant connection.
-	// /api/ha/login exchanges username+password for a fresh 10-year
-	// long-lived token via the HA websocket API; /api/ha/test probes
-	// GET <url>/api/. Cross-service handlers like /api/pi/*: no player
-	// session needed (no playerReady gate). SECURITY: credentials never
-	// reach a log line, the token only appears in the login response body
-	// (ha_login.go).
+	// ticket 9.4 + issue #4: the settings UI configures the Home Assistant
+	// connection. /api/ha/login validates a user-provided long-lived access
+	// token via the HA websocket API (HA 2026.9 removed username/password
+	// auth); /api/ha/test probes GET <url>/api/. Cross-service handlers like
+	// /api/pi/*: no player session needed (no playerReady gate). SECURITY:
+	// url and token never reach a log line, the token only appears in the
+	// login response body (ha_login.go).
 	m.HandleFunc("POST /api/ha/login", s.handleHaLogin)
 	m.HandleFunc("POST /api/ha/test", s.handleHaTest)
 	m.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {

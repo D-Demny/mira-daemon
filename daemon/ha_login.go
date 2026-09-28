@@ -12,32 +12,39 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 )
 
-// ticket 9.4 (daemon part 2): the Home Assistant connection endpoints for
-// the settings UI (ticket 9.4, design section 4, tasks 9+10).
+// ticket 9.4 (daemon part 2) + issue #4: the Home Assistant connection
+// endpoints for the settings UI (ticket 9.4, design section 4, tasks 9+10).
 //
 // POST /api/ha/login
 //
-//	Body {"url","username","password"} (all strings). The daemon dials the
-//	HA websocket API at ws(s)://<host:port>/api/websocket (the url is
-//	normalized: trimmed, missing scheme defaults to http, trailing slash
-//	stripped, ws(s) mapped to http(s)), sends the credentials and asks HA
-//	itself to issue a fresh long-lived access token:
+// Background (issue #4): HA 2026.9 removed username/password login from the
+// WebSocket auth protocol - the auth schema only accepts a long-lived access
+// token ({"type":"auth","access_token":...}) or the api_password option (not
+// used here), and it rejects unknown fields including "id". The REST
+// /api/login path never existed, so there is no credential-based login left:
+// the user pastes a long-lived access token (HA UI: Profile -> Security ->
+// Long-Lived Access Tokens) and the daemon validates it by speaking the real
+// WebSocket protocol - which is exactly what the T1 acceptance needs, since
+// the REST probe (/api/ha/test) alone cannot prove WS auth works.
 //
-//	{"id":1,"type":"auth","username":U,"password":P}
-//	    -> {"type":"auth_ok"}                        (continue)
-//	    -> {"type":"auth_invalid"}                   (-> invalid_credentials)
-//	    -> anything else (MFA reprompt, any other
-//	       non auth_ok/auth_invalid answer)          (-> mfa)
-//	{"id":2,"type":"auth/long_lived_access_token","client_name":"Mira Thing"}
-//	    -> {"id":2,"type":"auth/long_lived_access_token/result","access_token":"<jwt>"}
+//	Body {"url","token"}. The daemon dials the HA websocket API at
+//	ws(s)://<host:port>/api/websocket (the url is normalized: trimmed, missing
+//	scheme defaults to http, trailing slash stripped, ws(s) mapped to http(s))
+//	and sends the token VERBATIM (same rule as ParseHaConfig):
 //
-// Without the optional "lifespan" parameter HA issues its default 10-year
-// long-lived token - the user never types a token (ticket 9.4, option (a)).
-// Response: {"ok":true,"token":"<jwt>"} (200) or {"ok":false,"error":<class>}:
-// 400 bad_request (missing/invalid url, username or password),
-// 401 invalid_credentials | mfa, 502 unreachable (dial error, any timeout,
-// or a protocol failure after a successful auth - see haLoginToken).
+//	{"type":"auth","access_token":T}
+//	    -> {"type":"auth_ok"}      (-> 200)
+//	    -> {"type":"auth_invalid"} (-> invalid_credentials)
+//	    -> anything else           (protocol failure -> unreachable)
 //
+// No "id" field on the auth message (HA 2026.9 rejects it, issue #4 section
+// 3). No token re-issue: the user-provided token stays in effect - the old
+// client-issued token flow is gone with the username/password path.
+// Response: {"ok":true,"token":"<token>"} (200; the validated token echoed so
+// the UI's store shape does not change) or {"ok":false,"error":<class>}:
+// 400 bad_request (missing/invalid url, missing token), 401
+// invalid_credentials, 502 unreachable (dial error, any timeout, or a
+// protocol failure - see haAuthWithToken).
 // POST /api/ha/test
 //
 //	Body {"url","token"} (token optional). Probes GET <url>/api/ (the HA
@@ -65,37 +72,29 @@ import (
 // registered without the playerReady gate (serve, api_server.go).
 //
 // SECURITY (ticket 9.4 mandatory lesson, hard acceptance criterion):
-// username, password and token must NEVER appear in a log line. Log lines
-// carry at most the host of the URL and the error class. The token appears
-// only in the JSON response body of the login endpoint.
+// the url and token must NEVER appear in a log line. Log lines carry at most
+// the host of the URL and the error class. The token appears only in the
+// JSON response body of the login endpoint.
 
 // Error classes of the login endpoint (body {"ok":false,"error":<class>}).
 const (
 	haErrBadRequest   = "bad_request"
 	haErrUnreachable  = "unreachable"
 	haErrInvalidCreds = "invalid_credentials"
-	haErrMfa          = "mfa"
 )
-
-// haLoginClientName is the client_name sent with the token request. Fixed
-// on purpose: every token this device issues shows up under the same name
-// in the HA profile, so it is identifiable and revocable (ticket 9.4,
-// token-accumulation note).
-const haLoginClientName = "Mira Thing"
 
 // Timeouts are package-level vars (not consts) so tests can dial them down;
 // each request re-reads the current values.
 var (
 	haLoginConnectTimeout = 5 * time.Second  // websocket dial (handshake)
-	haLoginOverallTimeout = 15 * time.Second // dial + auth + token exchange
+	haLoginOverallTimeout = 15 * time.Second // dial + auth
 	haTestTimeout         = 5 * time.Second  // GET <url>/api/ probe
 )
 
 // Request/response shapes of the two endpoints.
 type haLoginRequest struct {
-	URL      string `json:"url"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	URL   string `json:"url"`
+	Token string `json:"token"`
 }
 
 type haTestRequest struct {
@@ -177,7 +176,7 @@ func haStatusForError(class string) int {
 	switch class {
 	case haErrBadRequest:
 		return http.StatusBadRequest
-	case haErrInvalidCreds, haErrMfa:
+	case haErrInvalidCreds:
 		return http.StatusUnauthorized
 	default: // haErrUnreachable
 		return http.StatusBadGateway
@@ -190,27 +189,25 @@ func writeHaJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// haLoginToken performs the HA websocket handshake described in the file
-// header and returns the freshly issued long-lived access token.
+// haAuthWithToken dials the HA websocket API at u and validates the
+// long-lived access token by sending it as the auth request. It returns the
+// validated token (echoed) and "" on success, or "" and the error class on
+// failure.
 //
 // Error mapping (second return value; "" = success):
-//   - dial error, any timeout, or a failure AFTER a successful auth_ok
-//     (read error, unexpected message, empty access_token) ->
-//     haErrUnreachable (502). A protocol failure after a successful auth is
-//     indistinguishable from a transport problem on the device side and is
-//     definitely not a credential problem, so it lands in the generic
-//     "could not complete the conversation" class rather than
-//     invalid_credentials.
-//   - auth_invalid -> haErrInvalidCreds (401)
-//   - any other answer to the auth request -> haErrMfa (401). HA answers an
-//     MFA-enabled account with a reprompt (type "auth" carrying the
-//     mfa_setup / mfa_setup_followup fields); the device cannot do TOTP, so
-//     every non auth_ok/auth_invalid answer is classified as mfa (the UI
-//     then offers manual token entry, ticket 9.4 phase 2).
+//   - dial error, any timeout, a non-text read, or an unexpected answer to
+//     the auth request (anything that is not auth_ok/auth_invalid) ->
+//     haErrUnreachable (502). A protocol failure is indistinguishable from a
+//     transport problem on the device side and is definitely not a
+//     credential problem. Token auth cannot trigger an MFA reprompt, so no
+//     separate class exists for it (issue #4 removed the username/password
+//     path that used to reach the reprompt).
+//   - auth_invalid -> haErrInvalidCreds (401): this HA instance does not
+//     accept the token.
 //
-// SECURITY: u, username and password never reach a log line; only the host
-// and the error class are logged (ticket 9.4 mandatory lesson).
-func haLoginToken(log librespot.Logger, u, username, password string) (string, string) {
+// SECURITY: u and the token never reach a log line; only the host and the
+// error class are logged (ticket 9.4 mandatory lesson).
+func haAuthWithToken(log librespot.Logger, u, token string) (string, string) {
 	host := haHostForLog(u)
 
 	// The overall timeout bounds the whole conversation; the connect
@@ -230,12 +227,7 @@ func haLoginToken(log librespot.Logger, u, username, password string) (string, s
 	// websocket self-closes), so this Close returns immediately there.
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "") }()
 
-	authMsg, err := json.Marshal(haWsAuthRequest{
-		ID:       1,
-		Type:     "auth",
-		Username: username,
-		Password: password,
-	})
+	authMsg, err := json.Marshal(haWsAuthRequest{Type: "auth", AccessToken: token})
 	if err != nil {
 		return "", haErrUnreachable
 	}
@@ -258,64 +250,28 @@ func haLoginToken(log librespot.Logger, u, username, password string) (string, s
 	}
 	switch authResp.Type {
 	case "auth_ok":
-		// proceed to the token request
+		log.Infof("ha login: access token accepted by %s", host)
+		return token, ""
 	case "auth_invalid":
-		log.Warnf("ha login: %s: credentials rejected (%s)", host, haErrInvalidCreds)
+		log.Warnf("ha login: %s: token rejected (%s)", host, haErrInvalidCreds)
 		return "", haErrInvalidCreds
 	default:
-		// MFA reprompt (type "auth" with mfa_setup/mfa_setup_followup) or
-		// any other answer to the auth request (see func docs).
-		log.Warnf("ha login: %s: auth reprompt (%s)", host, haErrMfa)
-		return "", haErrMfa
-	}
-
-	tokenMsg, err := json.Marshal(haWsTokenRequest{
-		ID:         2,
-		Type:       "auth/long_lived_access_token",
-		ClientName: haLoginClientName,
-	})
-	if err != nil {
+		// An unexpected answer to the auth request (see func docs):
+		// protocol failure, not a credential problem.
+		log.Warnf("ha login: %s: unexpected auth response type %q (%s)", host, authResp.Type, haErrUnreachable)
 		return "", haErrUnreachable
 	}
-	if err := conn.Write(overallCtx, websocket.MessageText, tokenMsg); err != nil {
-		log.Warnf("ha login: %s: token request failed (%s)", host, haErrUnreachable)
-		return "", haErrUnreachable
-	}
-
-	_, data, err = conn.Read(overallCtx)
-	if err != nil {
-		log.Warnf("ha login: %s: token response failed (%s)", host, haErrUnreachable)
-		return "", haErrUnreachable
-	}
-	// Documented HA shape: {"id":2,"type":"auth/long_lived_access_token/
-	// result","access_token":"<jwt>"}. We accept any message carrying a
-	// non-empty access_token; everything else (wrong type, empty token,
-	// error result) is a protocol failure -> unreachable (see func docs).
-	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.Unmarshal(data, &tokenResp); err != nil || tokenResp.AccessToken == "" {
-		log.Warnf("ha login: %s: empty or malformed token result (%s)", host, haErrUnreachable)
-		return "", haErrUnreachable
-	}
-	return tokenResp.AccessToken, ""
 }
 
-// The two websocket request messages. Struct field order is part of the
-// wire contract: the tests assert the exact byte sequence (the HA protocol
-// is JSON, key order is irrelevant to HA, but a stable shape keeps the
-// traffic greppable and the tests strict).
+// haWsAuthRequest is the HA WebSocket auth request for long-lived token
+// login (issue #4). Struct field order is part of the wire contract: the
+// tests assert the exact byte sequence (the HA protocol is JSON, key order
+// is irrelevant to HA, but a stable shape keeps the traffic greppable and
+// the tests strict). No "id": HA 2026.9's auth schema rejects unknown
+// fields, including "id".
 type haWsAuthRequest struct {
-	ID       int    `json:"id"`
-	Type     string `json:"type"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-type haWsTokenRequest struct {
-	ID         int    `json:"id"`
-	Type       string `json:"type"`
-	ClientName string `json:"client_name"`
+	Type        string `json:"type"`
+	AccessToken string `json:"access_token"`
 }
 
 // handleHaLogin implements POST /api/ha/login (see the file header for the
@@ -327,15 +283,13 @@ func (s *ConcreteApiServer) handleHaLogin(w http.ResponseWriter, r *http.Request
 		return
 	}
 	canonical := normalizeHaURL(req.URL)
-	// username is trimmed (the UI trims it too, like ParseHaConfig); the
-	// password is deliberately VERBATIM - a leading/trailing space is a
-	// legitimate password character (same rule as ParseHaConfig).
-	if canonical == "" || strings.TrimSpace(req.Username) == "" || req.Password == "" {
+	// the token is deliberately VERBATIM - same rule as ParseHaConfig.
+	if canonical == "" || req.Token == "" {
 		writeHaJSON(w, http.StatusBadRequest, haLoginErrorBody{OK: false, Error: haErrBadRequest})
 		return
 	}
 
-	token, class := haLoginToken(s.log, canonical, strings.TrimSpace(req.Username), req.Password)
+	token, class := haAuthWithToken(s.log, canonical, req.Token)
 	if class != "" {
 		writeHaJSON(w, haStatusForError(class), haLoginErrorBody{OK: false, Error: class})
 		return

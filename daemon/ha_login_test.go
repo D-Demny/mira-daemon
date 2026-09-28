@@ -14,9 +14,15 @@ import (
 	"github.com/coder/websocket"
 )
 
-// ticket 9.4 (daemon part 2): contract tests for POST /api/ha/login (fake
-// HA websocket server speaking the real auth protocol) and POST /api/ha/test
-// (fake HA REST root).
+// ticket 9.4 (daemon part 2) + issue #4: contract tests for POST /api/ha/login
+// (fake HA websocket server speaking the real auth protocol) and POST
+// /api/ha/test (fake HA REST root).
+//
+// Login protocol under test (issue #4): HA 2026.9 removed username/password
+// from the WS auth schema - the daemon sends exactly one frame,
+// {"type":"auth","access_token":T} (no "id" field, which HA rejects), and
+// accepts only auth_ok/auth_invalid as answers; anything else is a protocol
+// failure -> unreachable.
 //
 // The login tests are deliberately NOT t.Parallel: TestHaLogin_SlowServer
 // dials the package-level haLogin*Timeout vars down (shared process state,
@@ -108,23 +114,16 @@ func readFrame(ctx context.Context, conn *websocket.Conn, f *fakeHaWs) bool {
 	return true
 }
 
-// haWsBehaviorSuccess: auth request -> auth_ok, token request -> token
-// result with the access_token field (the documented HA shapes, ticket 9.4
-// section 1).
+// haWsBehaviorSuccess: one auth request -> auth_ok (the documented HA 2026.9
+// shape; issue #4: there is no second exchange, the token is not re-issued).
 func haWsBehaviorSuccess(ctx context.Context, conn *websocket.Conn, f *fakeHaWs) {
 	if !readFrame(ctx, conn, f) {
 		return
 	}
-	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"auth_ok","ha_version":"2026.9.1"}`)); err != nil {
-		return
-	}
-	if !readFrame(ctx, conn, f) {
-		return
-	}
-	_ = conn.Write(ctx, websocket.MessageText, []byte(`{"id":2,"type":"auth/long_lived_access_token/result","access_token":"fake-jwt-123"}`))
+	_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"auth_ok","ha_version":"2026.9.1"}`))
 }
 
-// haWsBehaviorAuthInvalid: HA rejects the credentials.
+// haWsBehaviorAuthInvalid: HA rejects the token.
 func haWsBehaviorAuthInvalid(ctx context.Context, conn *websocket.Conn, f *fakeHaWs) {
 	if !readFrame(ctx, conn, f) {
 		return
@@ -132,10 +131,11 @@ func haWsBehaviorAuthInvalid(ctx context.Context, conn *websocket.Conn, f *fakeH
 	_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"auth_invalid"}`))
 }
 
-// haWsBehaviorMfa: MFA-enabled account, the auth request gets a reprompt
-// instead of auth_ok (the documented shape with the mfa_setup_followup
-// field).
-func haWsBehaviorMfa(ctx context.Context, conn *websocket.Conn, f *fakeHaWs) {
+// haWsBehaviorMfaReprompt: the pre-2026.9 MFA reprompt answer for a username/
+// password auth request (the documented shape with the mfa_setup_followup
+// field). With token auth the daemon never triggers it, but if an HA build
+// ever answered with this shape it is a protocol failure -> unreachable.
+func haWsBehaviorMfaReprompt(ctx context.Context, conn *websocket.Conn, f *fakeHaWs) {
 	if !readFrame(ctx, conn, f) {
 		return
 	}
@@ -198,8 +198,11 @@ func TestHaLogin_Success(t *testing.T) {
 	_ = srv
 
 	// url without scheme + trailing slash: exercises the normalization
-	// (http:// default, slash stripped) end to end.
-	resp := postHaLogin(t, base, `{"url":"`+hostPortOf(fakeURL)+`/","username":" user1 ","password":"secret-pass"}`)
+	// (http:// default, slash stripped) end to end. Token with leading and
+	// trailing whitespace on purpose: it must be sent VERBATIM (same rule as
+	// ParseHaConfig) and echoed back unchanged.
+	const rawToken = " tok-abc "
+	resp := postHaLogin(t, base, `{"url":"`+hostPortOf(fakeURL)+`/","token":"`+rawToken+`"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
@@ -208,22 +211,19 @@ func TestHaLogin_Success(t *testing.T) {
 	if body["ok"] != true {
 		t.Errorf("ok = %v, want true", body["ok"])
 	}
-	if body["token"] != "fake-jwt-123" {
-		t.Errorf("token = %v, want fake-jwt-123", body["token"])
+	if body["token"] != rawToken {
+		t.Errorf("token = %v, want the verbatim token %q echoed", body["token"], rawToken)
 	}
 	if _, has := body["error"]; has {
 		t.Errorf("unexpected error field: %v", body)
 	}
 
-	// the exact request sequence the daemon sent
-	f.waitFrames(t, 2)
-	const wantAuth = `{"id":1,"type":"auth","username":"user1","password":"secret-pass"}`
+	// the exact request sequence the daemon sent: exactly one frame (issue
+	// #4 removed the token re-issue exchange)
+	f.waitFrames(t, 1)
+	const wantAuth = `{"type":"auth","access_token":" tok-abc "}`
 	if got := f.frame(0); got != wantAuth {
 		t.Errorf("auth request = %s, want %s", got, wantAuth)
-	}
-	const wantToken = `{"id":2,"type":"auth/long_lived_access_token","client_name":"Mira Thing"}`
-	if got := f.frame(1); got != wantToken {
-		t.Errorf("token request = %s, want %s", got, wantToken)
 	}
 	if f.path != "/api/websocket" {
 		t.Errorf("handshake path = %q, want /api/websocket", f.path)
@@ -236,7 +236,7 @@ func TestHaLogin_AuthInvalid(t *testing.T) {
 	srv, base := newTestApiServer(t)
 	_ = srv
 
-	resp := postHaLogin(t, base, `{"url":"`+hostPortOf(fakeURL)+`","username":"u","password":"p"}`)
+	resp := postHaLogin(t, base, `{"url":"`+hostPortOf(fakeURL)+`","token":"tok"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
@@ -247,26 +247,29 @@ func TestHaLogin_AuthInvalid(t *testing.T) {
 	}
 
 	f.waitFrames(t, 1)
-	const wantAuth = `{"id":1,"type":"auth","username":"u","password":"p"}`
+	const wantAuth = `{"type":"auth","access_token":"tok"}`
 	if got := f.frame(0); got != wantAuth {
 		t.Errorf("auth request = %s, want %s", got, wantAuth)
 	}
 }
 
+// TestHaLogin_MfaReprompt pins the behavior on a legacy MFA reprompt answer:
+// with token auth (issue #4) it is not its own error class but a protocol
+// failure -> unreachable (502), never 401 (the token itself may be fine).
 func TestHaLogin_MfaReprompt(t *testing.T) {
-	f, fakeURL := newFakeHaWs(t, haWsBehaviorMfa)
+	f, fakeURL := newFakeHaWs(t, haWsBehaviorMfaReprompt)
 
 	srv, base := newTestApiServer(t)
 	_ = srv
 
-	resp := postHaLogin(t, base, `{"url":"`+hostPortOf(fakeURL)+`","username":"u","password":"p"}`)
+	resp := postHaLogin(t, base, `{"url":"`+hostPortOf(fakeURL)+`","token":"tok"}`)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
 	}
 	body := mustReadJSON(t, resp.Body)
-	if body["ok"] != false || body["error"] != "mfa" {
-		t.Errorf("body = %v, want ok:false error:mfa", body)
+	if body["ok"] != false || body["error"] != "unreachable" {
+		t.Errorf("body = %v, want ok:false error:unreachable", body)
 	}
 	f.waitFrames(t, 1)
 }
@@ -276,7 +279,7 @@ func TestHaLogin_UnreachableClosedPort(t *testing.T) {
 	_ = srv
 
 	// nothing listens on this port
-	resp := postHaLogin(t, base, `{"url":"http://127.0.0.1:1","username":"u","password":"p"}`)
+	resp := postHaLogin(t, base, `{"url":"http://127.0.0.1:1","token":"tok"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
@@ -295,7 +298,7 @@ func TestHaLogin_SlowServerTimesOut(t *testing.T) {
 	_ = srv
 
 	start := time.Now()
-	resp := postHaLogin(t, base, `{"url":"`+hostPortOf(fakeURL)+`","username":"u","password":"p"}`)
+	resp := postHaLogin(t, base, `{"url":"`+hostPortOf(fakeURL)+`","token":"tok"}`)
 	elapsed := time.Since(start)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
@@ -320,11 +323,11 @@ func TestHaLogin_BadRequest(t *testing.T) {
 		name string
 		body string
 	}{
-		{"missing password", `{"url":"http://h:8123","username":"u"}`},
-		{"missing username", `{"url":"http://h:8123","password":"p"}`},
-		{"missing url", `{"username":"u","password":"p"}`},
-		{"whitespace-only url", `{"url":"   ","username":"u","password":"p"}`},
-		{"unknown scheme", `{"url":"ftp://h:8123","username":"u","password":"p"}`},
+		{"missing token", `{"url":"http://h:8123"}`},
+		{"empty token", `{"url":"http://h:8123","token":""}`},
+		{"missing url", `{"token":"tok"}`},
+		{"whitespace-only url", `{"url":"   ","token":"tok"}`},
+		{"unknown scheme", `{"url":"ftp://h:8123","token":"tok"}`},
 		{"invalid json", `{"url":`},
 		{"empty body", ``},
 	}

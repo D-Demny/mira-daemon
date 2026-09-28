@@ -43,8 +43,9 @@ import (
 
 // HaConfig is the stored Home Assistant connection (ticket 9.4), the same
 // shape the UI persists in the settings blob. Username and Password are
-// consumed by the WS login endpoint (task 9, later part of this ticket);
-// the /ha-api/ proxy only needs URL + Token.
+// parsed for blob shape fidelity (the UI-owned blob still carries them) but
+// no longer consumed by any daemon path after issue #4 removed the
+// username/password WS login; the /ha-api/ proxy only needs URL + Token.
 type HaConfig struct {
 	URL         string `json:"url"`
 	Username    string `json:"username"`
