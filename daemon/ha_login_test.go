@@ -98,6 +98,10 @@ func newFakeHaWs(t *testing.T, behavior func(ctx context.Context, conn *websocke
 		f.mu.Lock()
 		f.path = r.URL.Path
 		f.mu.Unlock()
+		// Real HA always sends auth_required as the first server->client frame;
+		// the fake must model it so the tests exercise the real protocol shape
+		// (issue #23: the daemon had skipped this frame in production).
+		_ = conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"auth_required","ha_version":"2026.9.1"}`))
 		behavior(context.Background(), conn, f)
 	}))
 	t.Cleanup(ts.Close)
@@ -272,6 +276,42 @@ func TestHaLogin_MfaReprompt(t *testing.T) {
 		t.Errorf("body = %v, want ok:false error:unreachable", body)
 	}
 	f.waitFrames(t, 1)
+}
+
+// TestHaLogin_BadOpeningFrame pins the strict handling of the server's first
+// frame (issue #23): real HA always sends auth_required; anything else on
+// that slot is a protocol failure -> unreachable (502), never 401.
+func TestHaLogin_BadOpeningFrame(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/websocket" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		ctx := context.Background()
+		_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello"}`))
+		// keep the connection open so the client's read completes
+		time.Sleep(2 * time.Second)
+	}))
+	t.Cleanup(ts.Close)
+
+	srv, base := newTestApiServer(t)
+	_ = srv
+
+	resp := postHaLogin(t, base, `{"url":"`+hostPortOf(ts.URL)+`","token":"tok"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
+	}
+	body := mustReadJSON(t, resp.Body)
+	if body["ok"] != false || body["error"] != "unreachable" {
+		t.Errorf("body = %v, want ok:false error:unreachable", body)
+	}
 }
 
 func TestHaLogin_UnreachableClosedPort(t *testing.T) {

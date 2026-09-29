@@ -29,8 +29,11 @@ import (
 //
 //	Body {"url","token"}. The daemon dials the HA websocket API at
 //	ws(s)://<host:port>/api/websocket (the url is normalized: trimmed, missing
-//	scheme defaults to http, trailing slash stripped, ws(s) mapped to http(s))
-//	and sends the token VERBATIM (same rule as ParseHaConfig):
+//	scheme defaults to http, trailing slash stripped, ws(s) mapped to http(s)).
+//	After dialing it consumes the server's opening frame, which real HA always
+//	sends as the first message: {"type":"auth_required"} (anything else on that
+//	slot is a protocol failure -> unreachable). Only then does it send the token
+//	VERBATIM (same rule as ParseHaConfig):
 //
 //	{"type":"auth","access_token":T}
 //	    -> {"type":"auth_ok"}      (-> 200)
@@ -226,6 +229,23 @@ func haAuthWithToken(log librespot.Logger, u, token string) (string, string) {
 	// On a timeout the ctx cancellation already closed the conn (coder/
 	// websocket self-closes), so this Close returns immediately there.
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "") }()
+	// HA always sends {"type":"auth_required"} as the first server->client frame
+	// right after connection establishment; consume it before writing the auth
+	// frame. Without this, the single response read below picks up the queued
+	// auth_required and misclassifies it as a protocol failure (observed live
+	// against HA 2026.9 - issue #23).
+	openType, openData, err := conn.Read(overallCtx)
+	if err != nil || openType != websocket.MessageText {
+		log.Warnf("ha login: %s: opening frame read failed (%s)", host, haErrUnreachable)
+		return "", haErrUnreachable
+	}
+	var opening struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(openData, &opening); err != nil || opening.Type != "auth_required" {
+		log.Warnf("ha login: %s: unexpected opening frame (%s)", host, haErrUnreachable)
+		return "", haErrUnreachable
+	}
 
 	authMsg, err := json.Marshal(haWsAuthRequest{Type: "auth", AccessToken: token})
 	if err != nil {
