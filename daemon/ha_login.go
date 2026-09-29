@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -78,11 +79,23 @@ import (
 //	   "access_token":<30-min JWT>} (no "id" field) -> auth_ok; a rejection
 //	   of the HA-issued token is a protocol failure -> unreachable (the
 //	   credentials themselves were just accepted in step 2).
-//	5. WS {"id":2,"type":"auth/long_lived_access_token","client_name":
-//	   "Mira","lifespan":3650} -> {"id":2,"type":"result","success":true,
-//	   "result":<LLA JWT>}. HA keeps one LLA per (user, client_name); on a
-//	   duplicate-name failure the daemon retries ONCE with a unique
-//	   client_name "Mira <UTC YYYYMMDD-HHMM>".
+//	5a. WS {"id":1,"type":"auth/refresh_tokens"} -> result list of the
+//	   user's refresh tokens; if a long-lived token with client_name "Mira"
+//	   already exists, step 5b mints straight under a unique name. The
+//	   pre-check is required because HA 2026.9 sanitizes the duplicate-name
+//	   mint error to code "unknown_error" + message "Unknown error", so the
+//	   conflict cannot be detected from the mint answer itself. A list-check
+//	   failure is non-fatal: proceed with the stable name (the 5b retry
+//	   still covers it).
+//	5b. WS {"id":2,"type":"auth/long_lived_access_token","client_name":
+//	   <name>,"lifespan":3650} -> {"id":2,"type":"result","success":true,
+//	   "result":<LLA JWT>}. HA keeps one LLA per (user, client_name):
+//	   <name> is the stable "Mira" unless 5a found it taken, in which case
+//	   "Mira <UTC YYYYMMDD-HHMMSS>". Any mint failure triggers ONE retry
+//	   with a fresh unique name; a second failure -> unreachable. HA's WS
+//	   API requires strictly increasing message ids per connection (ERR_ID
+//	   REUSE), so the token list, the first mint and the retry carry ids 1,
+//	   2 and 3.
 //
 // Response: 200 {"ok":true,"token":"<T>"} where T is the minted LLA in
 // credential mode or the validated token (echoed) in token mode - same
@@ -131,13 +144,18 @@ const (
 	haErrUnreachable  = "unreachable"
 	haErrInvalidCreds = "invalid_credentials"
 
-	// Credential-mode bootstrap wire constants (issue #25): the id HA must
-	// echo in the WS mint answer, the stable LLA client_name (HA keeps one
-	// LLA per user per name; a duplicate triggers the unique-name retry),
-	// and the LLA lifespan in days.
-	haLLAMsgID = 2
-	haLLAName  = "Mira"
-	haLLADays  = 3650 // ~10 years (issue #25)
+	// Credential-mode bootstrap wire constants (issue #25): HA's WS API
+	// requires strictly increasing message ids per connection (a reused or
+	// lower id is rejected with ERR_ID_REUSE "Identifier values have to
+	// increase."), so the bootstrap takes them from a fixed sequence:
+	// token-list check first, then the mint attempt(s). Also: the stable
+	// LLA client_name (HA keeps one LLA per user per name), its token_type
+	// as reported by auth/refresh_tokens, and the LLA lifespan in days.
+	haListMsgID    = 1 // auth/refresh_tokens pre-check
+	haMintMsgID    = 2 // first mint attempt; the retry takes haMintMsgID+1
+	haLLAName      = "Mira"
+	haLLADays      = 3650 // ~10 years (issue #25)
+	haTokenTypeLLA = "long_lived_access_token"
 )
 
 // Timeouts are package-level vars (not consts) so tests can dial them down;
@@ -587,33 +605,125 @@ type haWsMintRequest struct {
 }
 
 // haWsMintResponse is HA's answer to the mint command ({"id":2,"type":
-// "result","success":...}); Result carries the LLA JWT on success, Message
-// the error text on failure. ID is a pointer so frames without an id (async
+// "result","success":...}); on success Result carries the LLA JWT. Error
+// frames carry their text in the error payload - but note that HA 2026.9
+// sanitizes unexpected exceptions (incl. the duplicate-name ValueError) to
+// code "unknown_error" + message "Unknown error", so a name conflict must
+// NOT be detected from this frame; it is pre-checked via
+// auth/refresh_tokens instead. Message is kept for diagnostics on
+// older/newer frame shapes. ID is a pointer so frames without an id (async
 // events) can be skipped.
 type haWsMintResponse struct {
-	ID      *int   `json:"id"`
-	Type    string `json:"type"`
-	Success bool   `json:"success"`
-	Result  string `json:"result"`
+	ID      *int          `json:"id"`
+	Type    string        `json:"type"`
+	Success bool          `json:"success"`
+	Result  string        `json:"result"`
+	Message string        `json:"message"`
+	Error   haWsMintError `json:"error"`
+}
+
+// haWsMintError is the "error" payload of a failed WS command frame.
+type haWsMintError struct {
+	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// haWsTokenEntry is one entry of the auth/refresh_tokens result list; only
+// the two fields needed for the LLA name check are kept. Note that HA names
+// the token-type field "type" in this answer (not "token_type").
+type haWsTokenEntry struct {
+	ClientName string `json:"client_name"`
+	Type       string `json:"type"`
+}
+
+// haWsTokenListResponse is HA's answer to the auth/refresh_tokens command.
+type haWsTokenListResponse struct {
+	ID      *int             `json:"id"`
+	Type    string           `json:"type"`
+	Success bool             `json:"success"`
+	Result  []haWsTokenEntry `json:"result"`
+	Error   haWsMintError    `json:"error"`
+}
+
+// haUniqueLLAName builds the run-specific fallback client_name: the UTC
+// timestamp to the second plus 4 hex chars of randomness, so two logins in
+// the same second cannot mint under the same name (the duplicate-name error
+// is sanitized by HA, so the collision must be prevented, not detected).
+func haUniqueLLAName() string {
+	base := time.Now().UTC().Format("20060102-150405")
+	rnd := make([]byte, 2)
+	if _, err := crand.Read(rnd); err != nil {
+		return fmt.Sprintf("%s %s", haLLAName, base)
+	}
+	return fmt.Sprintf("%s %s-%x", haLLAName, base, rnd)
+}
+
+// haWsStableNameTaken asks HA which refresh tokens the current user already
+// has (auth/refresh_tokens - the same command the frontend uses) and
+// reports whether a long-lived token with the stable client_name exists.
+// The check is required because HA 2026.9 sanitizes the duplicate-name
+// mint error to "Unknown error", making it indistinguishable from any other
+// server-side failure. Protocol/IO failures are returned as errors and are
+// treated as non-fatal by the caller (proceed with the stable name; the
+// mint retry still covers the conflict).
+func haWsStableNameTaken(conn *websocket.Conn, overallCtx context.Context) (bool, error) {
+	msg, err := json.Marshal(map[string]any{
+		"id":   haListMsgID,
+		"type": "auth/refresh_tokens",
+	})
+	if err != nil {
+		return false, err
+	}
+	if err := conn.Write(overallCtx, websocket.MessageText, msg); err != nil {
+		return false, err
+	}
+	for {
+		msgType, data, err := conn.Read(overallCtx)
+		if err != nil || msgType != websocket.MessageText {
+			return false, fmt.Errorf("list response read failed")
+		}
+		var resp haWsTokenListResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return false, fmt.Errorf("malformed list response")
+		}
+		if resp.ID == nil || *resp.ID != haListMsgID {
+			continue // an async event for another request
+		}
+		if !resp.Success {
+			return false, fmt.Errorf("list failed: %s", resp.Error.Message)
+		}
+		for _, e := range resp.Result {
+			if e.ClientName == haLLAName && e.Type == haTokenTypeLLA {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
 }
 
 // haMintLLA is bootstrap step 5: on an authenticated HA websocket connection
 // (already auth_ok'd) it requests the long-lived access token and returns
-// the minted JWT. HA keeps one LLA per (user, client_name); when HA reports
-// that the stable name already exists, it retries ONCE with a unique name
-// "Mira <UTC YYYYMMDD-HHMM>". Any other failure is a protocol failure ->
-// unreachable. Frames that do not carry the mint request's id (async events)
-// are skipped.
+// the minted JWT. HA keeps one LLA per (user, client_name), so before
+// minting under the stable name it pre-checks via haWsStableNameTaken; a
+// taken name goes straight to a unique "Mira <UTC YYYYMMDD-HHMMSS>". Any
+// mint failure triggers ONE retry with a fresh unique name (covers the TOCTOU
+// race and undiagnosable server errors); a second failure -> unreachable.
+// Frames that do not carry the mint request's id (async events) are skipped.
 func haMintLLA(log librespot.Logger, host string, conn *websocket.Conn, overallCtx context.Context) (string, string) {
+	clientName := haLLAName
+	if taken, err := haWsStableNameTaken(conn, overallCtx); err != nil {
+		log.Warnf("ha login: %s: LLA name check failed, proceeding with the stable name (%s)", host, err)
+	} else if taken {
+		clientName = haUniqueLLAName()
+		log.Infof("ha login: %s: stable LLA name exists, minting under a unique name", host)
+	}
 	for attempt := range 2 {
-		clientName := haLLAName
 		if attempt > 0 {
-			// The stable name is taken: mint under a unique run-specific name.
-			clientName = fmt.Sprintf("%s %s", haLLAName, time.Now().UTC().Format("20060102-1504"))
+			clientName = haUniqueLLAName() // fresh unique name for the retry
 		}
+		msgID := haMintMsgID + attempt // HA ids must strictly increase per connection
 		msg, err := json.Marshal(haWsMintRequest{
-			ID:         haLLAMsgID,
+			ID:         msgID,
 			Type:       "auth/long_lived_access_token",
 			ClientName: clientName,
 			Lifespan:   haLLADays,
@@ -637,15 +747,19 @@ func haMintLLA(log librespot.Logger, host string, conn *websocket.Conn, overallC
 				log.Warnf("ha login: %s: malformed mint response (%s)", host, haErrUnreachable)
 				return "", haErrUnreachable
 			}
-			if resp.ID == nil || *resp.ID != haLLAMsgID {
+			if resp.ID == nil || *resp.ID != msgID {
 				continue // an async event for another request
 			}
 			if !resp.Success {
-				if attempt == 0 && strings.Contains(resp.Message, "already exists") {
-					log.Warnf("ha login: %s: LLA name taken, retrying with a unique name", host)
-					break // -> retry once with the unique client_name
+				errMsg := resp.Error.Message
+				if errMsg == "" {
+					errMsg = resp.Message // HA protocol text only - never credentials
 				}
-				log.Warnf("ha login: %s: LLA mint failed (%s)", host, haErrUnreachable)
+				if attempt == 0 {
+					log.Warnf("ha login: %s: LLA mint failed (%s): %s, retrying with a unique name", host, haErrUnreachable, errMsg)
+					break // -> retry once with the fresh unique client_name
+				}
+				log.Warnf("ha login: %s: LLA mint failed twice (%s): %s", host, haErrUnreachable, errMsg)
 				return "", haErrUnreachable
 			}
 			if resp.Result == "" {
@@ -656,7 +770,7 @@ func haMintLLA(log librespot.Logger, host string, conn *websocket.Conn, overallC
 			return resp.Result, ""
 		}
 	}
-	log.Warnf("ha login: %s: LLA name conflict twice (%s)", host, haErrUnreachable)
+	log.Warnf("ha login: %s: LLA mint failed twice (%s)", host, haErrUnreachable)
 	return "", haErrUnreachable
 }
 

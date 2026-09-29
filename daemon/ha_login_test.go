@@ -415,15 +415,19 @@ type haBootstrapRec struct {
 // bootstrap protocol (issue #25). Knobs: invalidAuth makes the credential
 // step answer HTTP 200 + errors.base="invalid_auth"; wsDown makes
 // /api/websocket refuse the handshake (the REST steps stay up); mintAnswers
-// scripts the WS answers to the mint command(s) in order.
+// scripts the WS answers to the mint command(s) in order; listAnswer scripts
+// the auth/refresh_tokens answer verbatim, existingLLAs builds its default
+// success frame.
 type fakeHaBootstrap struct {
-	mu          sync.Mutex
-	httpReqs    []haBootstrapRec
-	wsFrames    [][]byte
-	mintAnswers []string
-	nextMintAns int
-	invalidAuth bool
-	wsDown      bool
+	mu           sync.Mutex
+	httpReqs     []haBootstrapRec
+	wsFrames     [][]byte
+	mintAnswers  []string
+	nextMintAns  int
+	invalidAuth  bool
+	wsDown       bool
+	listAnswer   string
+	existingLLAs []string
 }
 
 func (f *fakeHaBootstrap) httpRequest(i int) haBootstrapRec {
@@ -454,6 +458,39 @@ func (f *fakeHaBootstrap) wsCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.wsFrames)
+}
+
+// nextListAnswer returns the scripted auth/refresh_tokens answer
+// (listAnswer verbatim) or builds the default HA success frame from
+// existingLLAs.
+func (f *fakeHaBootstrap) nextListAnswer() string {
+	if f.listAnswer != "" {
+		return f.listAnswer
+	}
+	entries := make([]string, 0, len(f.existingLLAs))
+	for i, name := range f.existingLLAs {
+		entries = append(entries, fmt.Sprintf(`{"id":"tok-%d","client_name":%q,"type":"long_lived_access_token"}`, i+1, name))
+	}
+	return `{"id":1,"type":"result","success":true,"result":[` + strings.Join(entries, ",") + `]}`
+}
+
+// uniqueLLATimestamp validates that name is a fallback client_name in the
+// "Mira <UTC YYYYMMDD-HHMMSS>[-<random tail>]" form (issue #25) and returns
+// the parsed timestamp part.
+func uniqueLLATimestamp(t *testing.T, name string) time.Time {
+	t.Helper()
+	if !strings.HasPrefix(name, haLLAName+" ") {
+		t.Fatalf("unique LLA name %q is not prefixed with %q", name, haLLAName+" ")
+	}
+	suffix := strings.TrimPrefix(name, haLLAName+" ")
+	if i := strings.LastIndex(suffix, "-"); i >= 0 {
+		suffix = suffix[:i] // drop the random collision-avoidance tail
+	}
+	ts, err := time.ParseInLocation("20060102-150405", suffix, time.UTC)
+	if err != nil {
+		t.Fatalf("unique LLA name %q: timestamp part %q is not a UTC YYYYMMDD-HHMMSS value", name, suffix)
+	}
+	return ts
 }
 
 // newFakeHaBootstrap stands up the fake HA instance; base is the canonical
@@ -510,7 +547,8 @@ func newFakeHaBootstrap(t *testing.T, cfg func(f *fakeHaBootstrap)) (*fakeHaBoot
 
 // serveWs speaks the WS half of the bootstrap on one accepted connection:
 // opening auth_required frame (issue #23), auth_ok after the access-token
-// auth request, then the scripted answers to the mint command(s).
+// auth request, then the scripted answers to the token-list command and the
+// mint command(s).
 func (f *fakeHaBootstrap) serveWs(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
@@ -535,10 +573,15 @@ func (f *fakeHaBootstrap) serveWs(w http.ResponseWriter, r *http.Request) {
 		}
 		ans := ""
 		if err := json.Unmarshal(data, &msg); err == nil && msg.ID != nil {
-			// the mint command (or its unique-name retry)
-			if f.nextMintAns < len(f.mintAnswers) {
-				ans = f.mintAnswers[f.nextMintAns]
-				f.nextMintAns++
+			switch msg.Type {
+			case "auth/refresh_tokens":
+				ans = f.nextListAnswer()
+			default:
+				// the mint command (or its unique-name retry)
+				if f.nextMintAns < len(f.mintAnswers) {
+					ans = f.mintAnswers[f.nextMintAns]
+					f.nextMintAns++
+				}
 			}
 		}
 		f.mu.Unlock()
@@ -637,16 +680,21 @@ func TestHaLogin_CredentialsSuccess(t *testing.T) {
 		t.Errorf("step 3 form = %q, want grant_type=authorization_code&client_id=%s&code=%s", f.httpRequest(2).Body, wantClientID, fakeAuthCode)
 	}
 
-	// --- WS wire sequence: auth (no "id" field), then the mint command
+	// --- WS wire sequence: auth (no "id" field), the token-list check,
+	// then the mint command under the stable name (free in this fake)
 	if got := f.wsFrame(0); got != `{"type":"auth","access_token":"`+fakeShortToken+`"}` {
 		t.Errorf("ws auth frame = %s, want the short-lived token with no id field", got)
 	}
-	mint := mustParseJSON(t, f.wsFrame(1))
+	list := mustParseJSON(t, f.wsFrame(1))
+	if list["id"] != float64(1) || list["type"] != "auth/refresh_tokens" {
+		t.Errorf("ws list frame = %v, want id:1 type:auth/refresh_tokens", list)
+	}
+	mint := mustParseJSON(t, f.wsFrame(2))
 	if mint["id"] != float64(2) || mint["type"] != "auth/long_lived_access_token" || mint["client_name"] != "Mira" || mint["lifespan"] != float64(3650) {
 		t.Errorf("ws mint frame = %v, want id:2 type:auth/long_lived_access_token client_name:Mira lifespan:3650", mint)
 	}
-	if f.wsCount() != 2 {
-		t.Errorf("ws frames = %d, want exactly 2 (auth + mint)", f.wsCount())
+	if f.wsCount() != 3 {
+		t.Errorf("ws frames = %d, want exactly 3 (auth + token list + mint)", f.wsCount())
 	}
 }
 
@@ -714,12 +762,9 @@ func TestHaLogin_CredentialsUnreachable(t *testing.T) {
 	}
 }
 
-func TestHaLogin_CredentialsLLANameConflictRetry(t *testing.T) {
+func TestHaLogin_CredentialsLLANameTaken(t *testing.T) {
 	f, fakeURL := newFakeHaBootstrap(t, func(f *fakeHaBootstrap) {
-		f.mintAnswers = []string{
-			`{"id":2,"type":"result","success":false,"message":"Mira already exists"}`,
-			`{"id":2,"type":"result","success":true,"result":"` + fakeMintedLLA + `"}`,
-		}
+		f.existingLLAs = []string{"Mira"}
 	})
 	base := hostPortOf(fakeURL)
 
@@ -736,19 +781,91 @@ func TestHaLogin_CredentialsLLANameConflictRetry(t *testing.T) {
 		t.Errorf("body = %v, want ok:true with the minted LLA echoed", body)
 	}
 
-	first := mustParseJSON(t, f.wsFrame(1))
-	if first["client_name"] != "Mira" {
-		t.Errorf("first mint client_name = %v, want the stable name Mira", first["client_name"])
+	// The daemon must not even try the taken stable name: after auth and
+	// the token-list check it mints directly under a unique name.
+	list := mustParseJSON(t, f.wsFrame(1))
+	if list["id"] != float64(1) || list["type"] != "auth/refresh_tokens" {
+		t.Errorf("ws list frame = %v, want id:1 type:auth/refresh_tokens", list)
 	}
-	retry := mustParseJSON(t, f.wsFrame(2))
-	retryName, _ := retry["client_name"].(string)
-	if !strings.HasPrefix(retryName, "Mira ") {
-		t.Errorf("retry mint client_name = %v, want the unique \"Mira <UTC YYYYMMDD-HHMM>\" form", retry["client_name"])
-	} else if _, err := time.ParseInLocation("20060102-1504", strings.TrimPrefix(retryName, "Mira "), time.UTC); err != nil {
-		t.Errorf("retry mint client_name = %q, suffix is not a UTC YYYYMMDD-HHMM timestamp", retryName)
+	mint := mustParseJSON(t, f.wsFrame(2))
+	name, _ := mint["client_name"].(string)
+	if !strings.HasPrefix(name, haLLAName+" ") {
+		t.Errorf("mint client_name = %v, want the unique \"Mira <UTC YYYYMMDD-HHMMSS>[-<rand>]\" form (the stable one is taken)", mint["client_name"])
+	} else {
+		uniqueLLATimestamp(t, name)
 	}
 	if f.wsCount() != 3 {
-		t.Errorf("ws frames = %d, want 3 (auth + mint + unique-name retry)", f.wsCount())
+		t.Errorf("ws frames = %d, want 3 (auth + token list + unique-name mint)", f.wsCount())
+	}
+}
+
+// A failing token-list check is non-fatal: the daemon falls back to the
+// stable name and succeeds if HA accepts it.
+func TestHaLogin_CredentialsLLAListCheckFailure(t *testing.T) {
+	f, fakeURL := newFakeHaBootstrap(t, func(f *fakeHaBootstrap) {
+		f.listAnswer = `{"id":1,"type":"result","success":false,"error":{"code":"unknown_error","message":"Unknown error"}}`
+	})
+	base := hostPortOf(fakeURL)
+	srv, apiBase := newTestApiServer(t)
+	_ = srv
+
+	resp := postHaLogin(t, apiBase, `{"url":"`+base+`","username":"probeuser","password":"rightpass"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
+	}
+	body := mustReadJSON(t, resp.Body)
+	if body["ok"] != true || body["token"] != fakeMintedLLA {
+		t.Errorf("body = %v, want ok:true (a failed list check is non-fatal)", body)
+	}
+	mint := mustParseJSON(t, f.wsFrame(2))
+	if mint["client_name"] != "Mira" {
+		t.Errorf("mint client_name = %v, want the stable name after a failed list check", mint["client_name"])
+	}
+	if f.wsCount() != 3 {
+		t.Errorf("ws frames = %d, want 3 (auth + token list + stable-name mint)", f.wsCount())
+	}
+}
+
+// TOCTOU fallback: the list says "Mira" is free, but the mint still fails
+// (e.g. another client took the name in between) - the daemon must retry
+// once under a fresh unique name.
+func TestHaLogin_CredentialsLLAMintFailureRetry(t *testing.T) {
+	f, fakeURL := newFakeHaBootstrap(t, func(f *fakeHaBootstrap) {
+		f.mintAnswers = []string{
+			`{"id":2,"type":"result","success":false,"error":{"code":"unknown_error","message":"Unknown error"}}`,
+			`{"id":3,"type":"result","success":true,"result":"` + fakeMintedLLA + `"}`,
+		}
+	})
+	base := hostPortOf(fakeURL)
+	srv, apiBase := newTestApiServer(t)
+	_ = srv
+
+	resp := postHaLogin(t, apiBase, `{"url":"`+base+`","username":"probeuser","password":"rightpass"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
+	}
+	body := mustReadJSON(t, resp.Body)
+	if body["ok"] != true || body["token"] != fakeMintedLLA {
+		t.Errorf("body = %v, want ok:true after the unique-name retry", body)
+	}
+	first := mustParseJSON(t, f.wsFrame(2))
+	if first["client_name"] != "Mira" {
+		t.Errorf("first mint client_name = %v, want the stable name (the list said it was free)", first["client_name"])
+	}
+	retry := mustParseJSON(t, f.wsFrame(3))
+	name, _ := retry["client_name"].(string)
+	if retry["id"] != float64(3) {
+		t.Errorf("retry mint id = %v, want 3 (HA requires strictly increasing ids per connection)", retry["id"])
+	}
+	if !strings.HasPrefix(name, haLLAName+" ") {
+		t.Errorf("retry mint client_name = %v, want the unique \"Mira <UTC YYYYMMDD-HHMMSS>[-<rand>]\" form", retry["client_name"])
+	} else {
+		uniqueLLATimestamp(t, name)
+	}
+	if f.wsCount() != 4 {
+		t.Errorf("ws frames = %d, want 4 (auth + token list + mint + unique-name retry)", f.wsCount())
 	}
 }
 
