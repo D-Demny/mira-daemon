@@ -3,9 +3,11 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -379,6 +381,406 @@ func TestHaLogin_BadRequest(t *testing.T) {
 		body := mustReadJSON(t, resp.Body)
 		if body["ok"] != false || body["error"] != "bad_request" {
 			t.Errorf("%s: body = %v, want ok:false error:bad_request", tc.name, body)
+		}
+		resp.Body.Close()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/ha/login - credential mode (issue #25)
+//
+// The fake below serves the whole HA 2026.9 bootstrap protocol on one
+// httptest server: the REST login flow (/auth/login_flow,
+// /auth/login_flow/{flow_id}, /auth/token) and the WS LLA mint endpoint
+// (/api/websocket). It records every HTTP request (method, path, headers,
+// body) and every WS client frame so the tests assert the exact wire
+// sequence the daemon sends.
+
+// Wire constants the fake answers with; the tests assert the daemon's
+// requests against them (controlled values only, no secret dumps).
+const (
+	fakeAuthCode   = "test-auth-code"
+	fakeShortToken = "short-lived-jwt"
+	fakeMintedLLA  = "minted-ll-jwt"
+)
+
+type haBootstrapRec struct {
+	Method string
+	Path   string
+	Body   string
+	Header http.Header
+}
+
+// fakeHaBootstrap is a fake HA 2026.9 instance speaking the credential-mode
+// bootstrap protocol (issue #25). Knobs: invalidAuth makes the credential
+// step answer HTTP 200 + errors.base="invalid_auth"; wsDown makes
+// /api/websocket refuse the handshake (the REST steps stay up); mintAnswers
+// scripts the WS answers to the mint command(s) in order.
+type fakeHaBootstrap struct {
+	mu          sync.Mutex
+	httpReqs    []haBootstrapRec
+	wsFrames    [][]byte
+	mintAnswers []string
+	nextMintAns int
+	invalidAuth bool
+	wsDown      bool
+}
+
+func (f *fakeHaBootstrap) httpRequest(i int) haBootstrapRec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if i >= len(f.httpReqs) {
+		return haBootstrapRec{}
+	}
+	return f.httpReqs[i]
+}
+
+func (f *fakeHaBootstrap) httpCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.httpReqs)
+}
+
+func (f *fakeHaBootstrap) wsFrame(i int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if i >= len(f.wsFrames) {
+		return ""
+	}
+	return string(f.wsFrames[i])
+}
+
+func (f *fakeHaBootstrap) wsCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.wsFrames)
+}
+
+// newFakeHaBootstrap stands up the fake HA instance; base is the canonical
+// http:// URL of it (the client_id/redirect_uri assertions are built from
+// it).
+func newFakeHaBootstrap(t *testing.T, cfg func(f *fakeHaBootstrap)) (*fakeHaBootstrap, string) {
+	t.Helper()
+	f := &fakeHaBootstrap{}
+	if cfg != nil {
+		cfg(f)
+	}
+	if len(f.mintAnswers) == 0 {
+		// default HA behavior: the mint command succeeds on the first try.
+		f.mintAnswers = []string{`{"id":2,"type":"result","success":true,"result":"` + fakeMintedLLA + `"}`}
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.httpReqs = append(f.httpReqs, haBootstrapRec{Method: r.Method, Path: r.URL.Path, Body: string(body), Header: r.Header.Clone()})
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/auth/login_flow":
+			// step 1: the local provider asks username+password together in
+			// one "init" step (HA 2026.9 shape, issue #25).
+			fmt.Fprint(w, `{"type":"form","flow_id":"flow-1234","handler":["homeassistant",null],`+
+				`"data_schema":[{"type":"string","name":"username","required":true},{"type":"string","name":"password","required":true}],`+
+				`"errors":{},"description_placeholders":null,"last_step":null,"preview":null,"step_id":"init"}`)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/auth/login_flow/"):
+			if f.invalidAuth {
+				// wrong credentials: HA answers 200 with errors.base set -
+				// the daemon must inspect the body, not the status.
+				fmt.Fprint(w, `{"type":"form","flow_id":"flow-1234","handler":["homeassistant",null],`+
+					`"data_schema":[],"errors":{"base":"invalid_auth"},`+
+					`"description_placeholders":null,"last_step":null,"preview":null,"step_id":"init"}`)
+				return
+			}
+			fmt.Fprintf(w, `{"type":"create_entry","flow_id":"flow-1234","handler":["homeassistant",null],"result":"%s"}`, fakeAuthCode)
+		case r.Method == http.MethodPost && r.URL.Path == "/auth/token":
+			fmt.Fprintf(w, `{"access_token":"%s","token_type":"Bearer","refresh_token":"refresh-id","expires_in":1800,"ha_auth_provider":"homeassistant"}`, fakeShortToken)
+		case r.URL.Path == "/api/websocket":
+			if f.wsDown {
+				http.NotFound(w, r)
+				return
+			}
+			f.serveWs(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return f, ts.URL
+}
+
+// serveWs speaks the WS half of the bootstrap on one accepted connection:
+// opening auth_required frame (issue #23), auth_ok after the access-token
+// auth request, then the scripted answers to the mint command(s).
+func (f *fakeHaBootstrap) serveWs(w http.ResponseWriter, r *http.Request) {
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	ctx := context.Background()
+	_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"auth_required","ha_version":"2026.9.1"}`))
+	for {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			return
+		}
+		f.mu.Lock()
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		f.wsFrames = append(f.wsFrames, cp)
+		var msg struct {
+			Type string `json:"type"`
+			ID   *int   `json:"id"`
+		}
+		ans := ""
+		if err := json.Unmarshal(data, &msg); err == nil && msg.ID != nil {
+			// the mint command (or its unique-name retry)
+			if f.nextMintAns < len(f.mintAnswers) {
+				ans = f.mintAnswers[f.nextMintAns]
+				f.nextMintAns++
+			}
+		}
+		f.mu.Unlock()
+		switch msg.Type {
+		case "auth":
+			_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"auth_ok","ha_version":"2026.9.1"}`))
+		case "": // malformed frame: stop answering
+			return
+		}
+		if ans != "" {
+			_ = conn.Write(ctx, websocket.MessageText, []byte(ans))
+		}
+	}
+}
+
+func mustParseJSON(t *testing.T, s string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		t.Fatalf("parse %q: %v", s, err)
+	}
+	return m
+}
+
+func TestHaLogin_CredentialsSuccess(t *testing.T) {
+	f, fakeURL := newFakeHaBootstrap(t, nil)
+	base := hostPortOf(fakeURL)
+
+	srv, apiBase := newTestApiServer(t)
+	_ = srv
+
+	resp := postHaLogin(t, apiBase, `{"url":"`+base+`","username":"probeuser","password":"rightpass"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
+	}
+	body := mustReadJSON(t, resp.Body)
+	if body["ok"] != true || body["token"] != fakeMintedLLA {
+		t.Errorf("body = %v, want ok:true with the minted LLA echoed", body)
+	}
+	if _, has := body["error"]; has {
+		t.Errorf("unexpected error field: %v", body)
+	}
+
+	// --- REST wire sequence: order, method, path, key fields (no secret
+	// dumps)
+	wantPaths := []string{"/auth/login_flow", "/auth/login_flow/flow-1234", "/auth/token"}
+	for i, wantPath := range wantPaths {
+		got := f.httpRequest(i)
+		if got.Method != http.MethodPost || got.Path != wantPath {
+			t.Errorf("request %d = %s %s, want POST %s", i, got.Method, got.Path, wantPath)
+		}
+	}
+	if f.httpCount() != len(wantPaths)+1 {
+		t.Errorf("http requests = %d, want %d (three REST steps + the WS upgrade)", f.httpCount(), len(wantPaths)+1)
+	}
+	if last := f.httpRequest(len(wantPaths)); last.Method != http.MethodGet || last.Path != "/api/websocket" {
+		t.Errorf("request %d = %s %s, want GET /api/websocket (the mint handshake)", len(wantPaths), last.Method, last.Path)
+	}
+
+	// step 1: deterministic client pair + the two-element handler
+	start := mustParseJSON(t, f.httpRequest(0).Body)
+	wantClientID := "http://" + base + "/mira"
+	if start["client_id"] != wantClientID {
+		t.Errorf("step 1 client_id = %v, want %q", start["client_id"], wantClientID)
+	}
+	if start["redirect_uri"] != wantClientID+"/callback" {
+		t.Errorf("step 1 redirect_uri = %v, want the same-netloc callback", start["redirect_uri"])
+	}
+	handler, ok := start["handler"].([]any)
+	if !ok || len(handler) != 2 || handler[0] != "homeassistant" || handler[1] != nil {
+		t.Errorf("step 1 handler = %v, want [\"homeassistant\",null]", start["handler"])
+	}
+	if ct := f.httpRequest(0).Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("step 1 content type = %q, want application/json", ct)
+	}
+
+	// step 2: the same client_id plus the credentials
+	sub := mustParseJSON(t, f.httpRequest(1).Body)
+	if sub["client_id"] != wantClientID {
+		t.Errorf("step 2 client_id = %v, want %q", sub["client_id"], wantClientID)
+	}
+	if sub["username"] != "probeuser" || sub["password"] != "rightpass" {
+		t.Errorf("step 2 fields = %v, want the submitted username+password", sub)
+	}
+
+	// step 3: form-urlencoded code exchange with the identical client_id
+	if ct := f.httpRequest(2).Header.Get("Content-Type"); ct != "application/x-www-form-urlencoded" {
+		t.Errorf("step 3 content type = %q, want application/x-www-form-urlencoded", ct)
+	}
+	form, err := url.ParseQuery(f.httpRequest(2).Body)
+	if err != nil {
+		t.Fatalf("step 3 body is not form-urlencoded: %v", err)
+	}
+	if form.Get("grant_type") != "authorization_code" || form.Get("client_id") != wantClientID || form.Get("code") != fakeAuthCode {
+		t.Errorf("step 3 form = %q, want grant_type=authorization_code&client_id=%s&code=%s", f.httpRequest(2).Body, wantClientID, fakeAuthCode)
+	}
+
+	// --- WS wire sequence: auth (no "id" field), then the mint command
+	if got := f.wsFrame(0); got != `{"type":"auth","access_token":"`+fakeShortToken+`"}` {
+		t.Errorf("ws auth frame = %s, want the short-lived token with no id field", got)
+	}
+	mint := mustParseJSON(t, f.wsFrame(1))
+	if mint["id"] != float64(2) || mint["type"] != "auth/long_lived_access_token" || mint["client_name"] != "Mira" || mint["lifespan"] != float64(3650) {
+		t.Errorf("ws mint frame = %v, want id:2 type:auth/long_lived_access_token client_name:Mira lifespan:3650", mint)
+	}
+	if f.wsCount() != 2 {
+		t.Errorf("ws frames = %d, want exactly 2 (auth + mint)", f.wsCount())
+	}
+}
+
+func TestHaLogin_CredentialsInvalidAuth(t *testing.T) {
+	f, fakeURL := newFakeHaBootstrap(t, func(f *fakeHaBootstrap) { f.invalidAuth = true })
+	base := hostPortOf(fakeURL)
+
+	srv, apiBase := newTestApiServer(t)
+	_ = srv
+
+	resp := postHaLogin(t, apiBase, `{"url":"`+base+`","username":"probeuser","password":"wrongpass"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
+	}
+	body := mustReadJSON(t, resp.Body)
+	if body["ok"] != false || body["error"] != "invalid_credentials" {
+		t.Errorf("body = %v, want ok:false error:invalid_credentials", body)
+	}
+	if body["message"] != "invalid_auth" {
+		t.Errorf("message = %v, want the HA errors.base value surfaced", body["message"])
+	}
+	// the bootstrap stops at step 2: no token exchange, no WS connection
+	if f.httpCount() != 2 {
+		t.Errorf("http requests = %d, want 2 (flow start + credential submit)", f.httpCount())
+	}
+	if f.wsCount() != 0 {
+		t.Errorf("ws frames = %d, want 0", f.wsCount())
+	}
+}
+
+func TestHaLogin_CredentialsUnreachable(t *testing.T) {
+	srv, apiBase := newTestApiServer(t)
+	_ = srv
+
+	// (1) dial failure in a REST step: nothing listens on this port.
+	resp := postHaLogin(t, apiBase, `{"url":"http://127.0.0.1:1","username":"u","password":"p"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("closed port: status = %d, want 502 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
+	}
+	body := mustReadJSON(t, resp.Body)
+	if body["ok"] != false || body["error"] != "unreachable" {
+		t.Errorf("closed port: body = %v, want ok:false error:unreachable", body)
+	}
+
+	// (2) dial failure in the WS step: all three REST steps succeed, then
+	// the websocket handshake is refused.
+	f, fakeURL := newFakeHaBootstrap(t, func(f *fakeHaBootstrap) { f.wsDown = true })
+	resp2 := postHaLogin(t, apiBase, `{"url":"`+hostPortOf(fakeURL)+`","username":"u","password":"p"}`)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadGateway {
+		t.Fatalf("ws down: status = %d, want 502 (body: %s)", resp2.StatusCode, mustReadJSON(t, resp2.Body))
+	}
+	body2 := mustReadJSON(t, resp2.Body)
+	if body2["ok"] != false || body2["error"] != "unreachable" {
+		t.Errorf("ws down: body = %v, want ok:false error:unreachable", body2)
+	}
+	if f.httpCount() != 4 {
+		t.Errorf("http requests = %d, want 4 (three REST steps + the refused WS handshake)", f.httpCount())
+	}
+	last := f.httpRequest(3)
+	if last.Method != http.MethodGet || last.Path != "/api/websocket" {
+		t.Errorf("request 3 = %s %s, want GET /api/websocket (the refused handshake)", last.Method, last.Path)
+	}
+}
+
+func TestHaLogin_CredentialsLLANameConflictRetry(t *testing.T) {
+	f, fakeURL := newFakeHaBootstrap(t, func(f *fakeHaBootstrap) {
+		f.mintAnswers = []string{
+			`{"id":2,"type":"result","success":false,"message":"Mira already exists"}`,
+			`{"id":2,"type":"result","success":true,"result":"` + fakeMintedLLA + `"}`,
+		}
+	})
+	base := hostPortOf(fakeURL)
+
+	srv, apiBase := newTestApiServer(t)
+	_ = srv
+
+	resp := postHaLogin(t, apiBase, `{"url":"`+base+`","username":"probeuser","password":"rightpass"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
+	}
+	body := mustReadJSON(t, resp.Body)
+	if body["ok"] != true || body["token"] != fakeMintedLLA {
+		t.Errorf("body = %v, want ok:true with the minted LLA echoed", body)
+	}
+
+	first := mustParseJSON(t, f.wsFrame(1))
+	if first["client_name"] != "Mira" {
+		t.Errorf("first mint client_name = %v, want the stable name Mira", first["client_name"])
+	}
+	retry := mustParseJSON(t, f.wsFrame(2))
+	retryName, _ := retry["client_name"].(string)
+	if !strings.HasPrefix(retryName, "Mira ") {
+		t.Errorf("retry mint client_name = %v, want the unique \"Mira <UTC YYYYMMDD-HHMM>\" form", retry["client_name"])
+	} else if _, err := time.ParseInLocation("20060102-1504", strings.TrimPrefix(retryName, "Mira "), time.UTC); err != nil {
+		t.Errorf("retry mint client_name = %q, suffix is not a UTC YYYYMMDD-HHMM timestamp", retryName)
+	}
+	if f.wsCount() != 3 {
+		t.Errorf("ws frames = %d, want 3 (auth + mint + unique-name retry)", f.wsCount())
+	}
+}
+
+func TestHaLogin_CredentialsValidation(t *testing.T) {
+	srv, apiBase := newTestApiServer(t)
+	_ = srv
+
+	// mixed token+password: token mode wins (a plain token-mode fake HA
+	// answers; credential mode would never reach it and end in 502).
+	_, fakeURL := newFakeHaWs(t, haWsBehaviorSuccess)
+	resp := postHaLogin(t, apiBase, `{"url":"`+hostPortOf(fakeURL)+`","token":"tok","username":"probeuser","password":"rightpass"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mixed: status = %d, want 200 (body: %s)", resp.StatusCode, mustReadJSON(t, resp.Body))
+	}
+	body := mustReadJSON(t, resp.Body)
+	if body["ok"] != true || body["token"] != "tok" {
+		t.Errorf("mixed: body = %v, want token mode (200 + the token echoed)", body)
+	}
+
+	// password without username - and username without password: 400.
+	for _, tc := range []string{
+		`{"url":"http://127.0.0.1:1","username":"probeuser"}`,
+		`{"url":"http://127.0.0.1:1","password":"rightpass"}`,
+	} {
+		resp := postHaLogin(t, apiBase, tc)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", tc, resp.StatusCode)
+		}
+		body := mustReadJSON(t, resp.Body)
+		if body["ok"] != false || body["error"] != "bad_request" {
+			t.Errorf("%s: body = %v, want ok:false error:bad_request", tc, body)
 		}
 		resp.Body.Close()
 	}

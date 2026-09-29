@@ -1,8 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -12,28 +15,30 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 )
 
-// ticket 9.4 (daemon part 2) + issue #4: the Home Assistant connection
-// endpoints for the settings UI (ticket 9.4, design section 4, tasks 9+10).
+// ticket 9.4 (daemon part 2) + issue #4 + issue #25: the Home Assistant
+// connection endpoints for the settings UI (ticket 9.4, design section 4,
+// tasks 9+10).
 //
 // POST /api/ha/login
 //
-// Background (issue #4): HA 2026.9 removed username/password login from the
-// WebSocket auth protocol - the auth schema only accepts a long-lived access
-// token ({"type":"auth","access_token":...}) or the api_password option (not
-// used here), and it rejects unknown fields including "id". The REST
-// /api/login path never existed, so there is no credential-based login left:
-// the user pastes a long-lived access token (HA UI: Profile -> Security ->
-// Long-Lived Access Tokens) and the daemon validates it by speaking the real
-// WebSocket protocol - which is exactly what the T1 acceptance needs, since
-// the REST probe (/api/ha/test) alone cannot prove WS auth works.
+// HA 2026.9 removed username/password from the WebSocket auth protocol -
+// the auth schema only accepts an access token ({"type":"auth",
+// "access_token":...}) or the api_password option (not used here), and it
+// rejects unknown fields including "id". The login endpoint therefore has
+// two mutually exclusive modes (token mode wins when both are given):
 //
-//	Body {"url","token"}. The daemon dials the HA websocket API at
-//	ws(s)://<host:port>/api/websocket (the url is normalized: trimmed, missing
-//	scheme defaults to http, trailing slash stripped, ws(s) mapped to http(s)).
-//	After dialing it consumes the server's opening frame, which real HA always
-//	sends as the first message: {"type":"auth_required"} (anything else on that
-//	slot is a protocol failure -> unreachable). Only then does it send the token
-//	VERBATIM (same rule as ParseHaConfig):
+// Token mode - Body {"url","token"}: the user pastes a long-lived access
+// token (HA UI: Profile -> Security -> Long-Lived Access Tokens) and the
+// daemon validates it by speaking the real WebSocket protocol - which is
+// exactly what the T1 acceptance needs, since the REST probe
+// (/api/ha/test) alone cannot prove WS auth works. The daemon dials the HA
+// websocket API at ws(s)://<host:port>/api/websocket (the url is
+// normalized: trimmed, missing scheme defaults to http, trailing slash
+// stripped, ws(s) mapped to http(s)). After dialing it consumes the
+// server's opening frame, which real HA always sends as the first message:
+// {"type":"auth_required"} (anything else on that slot is a protocol
+// failure -> unreachable). Only then does it send the token VERBATIM
+// (same rule as ParseHaConfig):
 //
 //	{"type":"auth","access_token":T}
 //	    -> {"type":"auth_ok"}      (-> 200)
@@ -41,13 +46,52 @@ import (
 //	    -> anything else           (protocol failure -> unreachable)
 //
 // No "id" field on the auth message (HA 2026.9 rejects it, issue #4 section
-// 3). No token re-issue: the user-provided token stays in effect - the old
-// client-issued token flow is gone with the username/password path.
-// Response: {"ok":true,"token":"<token>"} (200; the validated token echoed so
-// the UI's store shape does not change) or {"ok":false,"error":<class>}:
-// 400 bad_request (missing/invalid url, missing token), 401
-// invalid_credentials, 502 unreachable (dial error, any timeout, or a
-// protocol failure - see haAuthWithToken).
+// 3). No token re-issue: the user-provided token stays in effect.
+//
+// Credential mode - Body {"url","username","password"} (issue #25): HA
+// 2026.9 has no credential-based WS login, so the daemon bootstraps its own
+// long-lived access token (LLA) through the REST login flow + WS minting:
+//
+//	1. POST <url>/auth/login_flow, JSON {"client_id":C,"handler":
+//	   ["homeassistant",null],"redirect_uri":R} -> 200 form step "init"
+//	   (flow_id; the local provider asks username AND password together in
+//	   this one step - there is no username-only split). C = <url>/mira and
+//	   R = <url>/mira/callback: deterministic, well-formed http(s) URLs with
+//	   a path sharing scheme+netloc, so HA's IndieAuth client verification
+//	   passes without fetching anything.
+//	2. POST <url>/auth/login_flow/<flow_id>, JSON {"client_id":C,
+//	   "username":U,"password":P} -> 200:
+//	    - {"type":"create_entry","result":<code>} on success (single-use
+//	      auth code);
+//	    - the form step again with errors.base="invalid_auth" on wrong
+//	      credentials (HA answers 200 - inspect the body, not the status)
+//	      -> invalid_credentials;
+//	    - an unexpected intermediate flow step (MFA: select_mfa_module/mfa)
+//	      -> invalid_credentials with the HA message surfaced (the bootstrap
+//	      cannot complete without the MFA code);
+//	    - 403 "Login blocked: ..." (user inactive / not allowed to
+//	      authenticate remotely) -> invalid_credentials with the HA message.
+//	3. POST <url>/auth/token, form-urlencoded grant_type=authorization_code
+//	   &client_id=C&code=<code> -> {"access_token":<30-min JWT>, ...}.
+//	4. WS to ws(s)://<host:port>/api/websocket: consume the opening
+//	   auth_required frame (issue #23), then {"type":"auth",
+//	   "access_token":<30-min JWT>} (no "id" field) -> auth_ok; a rejection
+//	   of the HA-issued token is a protocol failure -> unreachable (the
+//	   credentials themselves were just accepted in step 2).
+//	5. WS {"id":2,"type":"auth/long_lived_access_token","client_name":
+//	   "Mira","lifespan":3650} -> {"id":2,"type":"result","success":true,
+//	   "result":<LLA JWT>}. HA keeps one LLA per (user, client_name); on a
+//	   duplicate-name failure the daemon retries ONCE with a unique
+//	   client_name "Mira <UTC YYYYMMDD-HHMM>".
+//
+// Response: 200 {"ok":true,"token":"<T>"} where T is the minted LLA in
+// credential mode or the validated token (echoed) in token mode - same
+// shape so the UI's store {url,token} does not change - or
+// {"ok":false,"error":<class>}: 400 bad_request (missing/invalid url;
+// neither a token nor username+password), 401 invalid_credentials (see
+// above; optional "message" carries HA's own message, never credentials),
+// 502 unreachable (dial error, any timeout, or a protocol failure - see
+// haAuthWithToken / haAuthWithCredentials).
 // POST /api/ha/test
 //
 //	Body {"url","token"} (token optional). Probes GET <url>/api/ (the HA
@@ -75,15 +119,25 @@ import (
 // registered without the playerReady gate (serve, api_server.go).
 //
 // SECURITY (ticket 9.4 mandatory lesson, hard acceptance criterion):
-// the url and token must NEVER appear in a log line. Log lines carry at most
-// the host of the URL and the error class. The token appears only in the
-// JSON response body of the login endpoint.
+// the url, token, username and password must NEVER appear in a log line or
+// in a response body other than the login endpoint's own. Log lines carry
+// at most the host of the URL and the error class; the invalid_credentials
+// "message" carries at most HA's own error text (never credentials). The
+// token appears only in the JSON response body of the login endpoint.
 
 // Error classes of the login endpoint (body {"ok":false,"error":<class>}).
 const (
 	haErrBadRequest   = "bad_request"
 	haErrUnreachable  = "unreachable"
 	haErrInvalidCreds = "invalid_credentials"
+
+	// Credential-mode bootstrap wire constants (issue #25): the id HA must
+	// echo in the WS mint answer, the stable LLA client_name (HA keeps one
+	// LLA per user per name; a duplicate triggers the unique-name retry),
+	// and the LLA lifespan in days.
+	haLLAMsgID = 2
+	haLLAName  = "Mira"
+	haLLADays  = 3650 // ~10 years (issue #25)
 )
 
 // Timeouts are package-level vars (not consts) so tests can dial them down;
@@ -91,6 +145,7 @@ const (
 var (
 	haLoginConnectTimeout = 5 * time.Second  // websocket dial (handshake)
 	haLoginOverallTimeout = 15 * time.Second // dial + auth
+	haLoginHTTPTimeout    = 10 * time.Second // one REST bootstrap request
 	haTestTimeout         = 5 * time.Second  // GET <url>/api/ probe
 )
 
@@ -98,6 +153,11 @@ var (
 type haLoginRequest struct {
 	URL   string `json:"url"`
 	Token string `json:"token"`
+
+	// Credential-mode bootstrap (issue #25): used only when Token is empty;
+	// both Username and Password must be present together.
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 type haTestRequest struct {
@@ -113,6 +173,9 @@ type haLoginSuccess struct {
 type haLoginErrorBody struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error"`
+	// HA's own message for invalid_credentials (issue #25: e.g. "Login
+	// blocked: ..." or the unexpected flow step) - never credentials.
+	Message string `json:"message,omitempty"`
 }
 
 type haTestDefaults struct {
@@ -192,6 +255,64 @@ func writeHaJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// haWsDialAndAuth dials the HA websocket API at u, consumes the server's
+// opening frame - real HA always sends {"type":"auth_required"} as the
+// first server->client message (anything else on that slot is a protocol
+// failure, issue #23) - and then sends the access-token auth request
+// VERBATIM ({"type":"auth","access_token":T}, no "id" field: HA 2026.9's
+// auth schema rejects unknown fields). On success it returns the open
+// connection plus the context that bounds the rest of the conversation and
+// its cancel func; on failure it returns class != "" and has already closed
+// the connection (on a ctx timeout coder/websocket self-closes, so the
+// Close there is immediate).
+//
+// SECURITY: u and the token never reach a log line; only the host and the
+// error class are logged (ticket 9.4 mandatory lesson).
+func haWsDialAndAuth(log librespot.Logger, u, token string) (*websocket.Conn, context.Context, context.CancelFunc, string) {
+	host := haHostForLog(u)
+
+	// The overall timeout bounds the whole conversation; the connect
+	// timeout bounds only the dial. Deriving the dial ctx from the overall
+	// ctx keeps both limits independent but cumulative.
+	overallCtx, cancel := context.WithTimeout(context.Background(), haLoginOverallTimeout)
+	dialCtx, dialCancel := context.WithTimeout(overallCtx, haLoginConnectTimeout)
+	conn, _, err := websocket.Dial(dialCtx, haWebSocketURL(u), nil)
+	dialCancel()
+	if err != nil {
+		log.Warnf("ha login: %s: dial failed (%s)", host, haErrUnreachable)
+		cancel()
+		return nil, nil, nil, haErrUnreachable
+	}
+	closeFailed := func(class string) (*websocket.Conn, context.Context, context.CancelFunc, string) {
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+		cancel()
+		return nil, nil, nil, class
+	}
+
+	openType, openData, err := conn.Read(overallCtx)
+	if err != nil || openType != websocket.MessageText {
+		log.Warnf("ha login: %s: opening frame read failed (%s)", host, haErrUnreachable)
+		return closeFailed(haErrUnreachable)
+	}
+	var opening struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(openData, &opening); err != nil || opening.Type != "auth_required" {
+		log.Warnf("ha login: %s: unexpected opening frame (%s)", host, haErrUnreachable)
+		return closeFailed(haErrUnreachable)
+	}
+
+	authMsg, err := json.Marshal(haWsAuthRequest{Type: "auth", AccessToken: token})
+	if err != nil {
+		return closeFailed(haErrUnreachable)
+	}
+	if err := conn.Write(overallCtx, websocket.MessageText, authMsg); err != nil {
+		log.Warnf("ha login: %s: auth write failed (%s)", host, haErrUnreachable)
+		return closeFailed(haErrUnreachable)
+	}
+	return conn, overallCtx, cancel, ""
+}
+
 // haAuthWithToken dials the HA websocket API at u and validates the
 // long-lived access token by sending it as the auth request. It returns the
 // validated token (echoed) and "" on success, or "" and the error class on
@@ -213,48 +334,12 @@ func writeHaJSON(w http.ResponseWriter, status int, v any) {
 func haAuthWithToken(log librespot.Logger, u, token string) (string, string) {
 	host := haHostForLog(u)
 
-	// The overall timeout bounds the whole conversation; the connect
-	// timeout bounds only the dial. Deriving the dial ctx from the overall
-	// ctx keeps both limits independent but cumulative.
-	overallCtx, cancel := context.WithTimeout(context.Background(), haLoginOverallTimeout)
+	conn, overallCtx, cancel, class := haWsDialAndAuth(log, u, token)
+	if class != "" {
+		return "", class
+	}
 	defer cancel()
-
-	dialCtx, dialCancel := context.WithTimeout(overallCtx, haLoginConnectTimeout)
-	conn, _, err := websocket.Dial(dialCtx, haWebSocketURL(u), nil)
-	dialCancel()
-	if err != nil {
-		log.Warnf("ha login: %s: dial failed (%s)", host, haErrUnreachable)
-		return "", haErrUnreachable
-	}
-	// On a timeout the ctx cancellation already closed the conn (coder/
-	// websocket self-closes), so this Close returns immediately there.
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "") }()
-	// HA always sends {"type":"auth_required"} as the first server->client frame
-	// right after connection establishment; consume it before writing the auth
-	// frame. Without this, the single response read below picks up the queued
-	// auth_required and misclassifies it as a protocol failure (observed live
-	// against HA 2026.9 - issue #23).
-	openType, openData, err := conn.Read(overallCtx)
-	if err != nil || openType != websocket.MessageText {
-		log.Warnf("ha login: %s: opening frame read failed (%s)", host, haErrUnreachable)
-		return "", haErrUnreachable
-	}
-	var opening struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(openData, &opening); err != nil || opening.Type != "auth_required" {
-		log.Warnf("ha login: %s: unexpected opening frame (%s)", host, haErrUnreachable)
-		return "", haErrUnreachable
-	}
-
-	authMsg, err := json.Marshal(haWsAuthRequest{Type: "auth", AccessToken: token})
-	if err != nil {
-		return "", haErrUnreachable
-	}
-	if err := conn.Write(overallCtx, websocket.MessageText, authMsg); err != nil {
-		log.Warnf("ha login: %s: auth write failed (%s)", host, haErrUnreachable)
-		return "", haErrUnreachable
-	}
 
 	msgType, data, err := conn.Read(overallCtx)
 	if err != nil || msgType != websocket.MessageText {
@@ -294,6 +379,342 @@ type haWsAuthRequest struct {
 	AccessToken string `json:"access_token"`
 }
 
+// haLoginFlowResult is one step's answer of HA's REST login flow (POST
+// /auth/login_flow or POST /auth/login_flow/{flow_id}); see the file header
+// for the full credential-mode contract.
+type haLoginFlowResult struct {
+	Type   string `json:"type"` // "form" (a step) or "create_entry" (done)
+	FlowID string `json:"flow_id"`
+	StepID string `json:"step_id"` // e.g. "init", "select_mfa_module", "mfa"
+	// Result is the single-use auth code when Type="create_entry"; Errors
+	// holds the per-field errors (e.g. {"base":"invalid_auth"}). HA answers
+	// wrong credentials with HTTP 200, so callers must inspect these
+	// fields, not the status code.
+	Result string            `json:"result"`
+	Errors map[string]string `json:"errors"`
+}
+
+// haBootstrapRequest runs one HTTP step of the credential bootstrap (issue
+// #25) against u with a per-request client and the current (test-overridable)
+// haLoginHTTPTimeout - the same pattern as the /api/ha/test probe. It returns
+// the status code and body on transport success, or class != "" on dial
+// error, timeout, or unreadable response (unreachable). Non-2xx statuses are
+// NOT an error here: HA answers wrong credentials with 200 and protocol
+// deviations (bad client_id, unknown handler, IP change) with 400/403/404 -
+// the callers classify status+body.
+func haBootstrapRequest(ctx context.Context, method, endpoint string, contentType string, payload []byte) (int, []byte, string) {
+	client := &http.Client{Timeout: haLoginHTTPTimeout}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, haErrUnreachable
+	}
+	req.Header.Set("Content-Type", contentType)
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, haErrUnreachable
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, haErrUnreachable
+	}
+	return resp.StatusCode, body, ""
+}
+
+// haHTTPErrorMessage extracts the human-readable message of an HA error
+// response ({"message":"..."} or {"error":...,"error_description":"..."}) -
+// the only part of an error body that may be surfaced to the UI (SECURITY:
+// never credentials). "" when the body carries no message.
+func haHTTPErrorMessage(body []byte) string {
+	var m struct {
+		Message          string `json:"message"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return ""
+	}
+	if m.Message != "" {
+		return m.Message
+	}
+	return m.ErrorDescription
+}
+
+// haLoginClientIDs derives the deterministic IndieAuth client pair from the
+// canonical base url (issue #25, file header step 1): a well-formed http(s)
+// URL with a path and a redirect_uri sharing its scheme+netloc, so HA's
+// verify_client_id/verify_redirect_uri pass without fetching anything.
+func haLoginClientIDs(canonical string) (clientID, redirectURI string) {
+	return canonical + "/mira", canonical + "/mira/callback"
+}
+
+// haStartLoginFlow is bootstrap step 1: POST <u>/auth/login_flow and expect
+// the form step "init" asking username+password together (the local provider
+// has no username-only split). Returns the flow result (carrying the
+// flow_id) on success; any deviation from the documented shape (non-200,
+// unexpected type/step) is a protocol failure -> unreachable.
+func haStartLoginFlow(log librespot.Logger, u string) (*haLoginFlowResult, string) {
+	host := haHostForLog(u)
+	clientID, redirectURI := haLoginClientIDs(u)
+
+	payload, err := json.Marshal(map[string]any{
+		"client_id":    clientID,
+		"handler":      []any{"homeassistant", nil}, // the length-1 handler ["homeassistant"] is rejected by HA
+		"redirect_uri": redirectURI,
+	})
+	if err != nil {
+		return nil, haErrUnreachable
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), haLoginHTTPTimeout)
+	defer cancel()
+	status, body, class := haBootstrapRequest(ctx, http.MethodPost, u+"/auth/login_flow", "application/json", payload)
+	if class != "" || status != http.StatusOK {
+		log.Warnf("ha login: %s: login flow start failed (%s)", host, haErrUnreachable)
+		return nil, haErrUnreachable
+	}
+	var res haLoginFlowResult
+	if err := json.Unmarshal(body, &res); err != nil || res.Type != "form" || res.StepID != "init" {
+		log.Warnf("ha login: %s: login flow start unexpected answer (%s)", host, haErrUnreachable)
+		return nil, haErrUnreachable
+	}
+	return &res, ""
+}
+
+// haFlowSubmit is bootstrap step 2: POST the username+password to the flow's
+// step endpoint. Returns the single-use auth code on success. Wrong
+// credentials arrive as HTTP 200 + errors.base="invalid_auth"; an unexpected
+// intermediate step (MFA) or a "Login blocked" 403 (the account was accepted
+// by the provider but cannot be issued tokens) both map to
+// invalid_credentials with HA's own message; anything else is a protocol
+// failure -> unreachable.
+func haFlowSubmit(log librespot.Logger, u, clientID, flowID, username, password string) (string, string, string) {
+	host := haHostForLog(u)
+
+	payload, err := json.Marshal(map[string]any{
+		"client_id": clientID,
+		"username":  username,
+		"password":  password,
+	})
+	if err != nil {
+		return "", haErrUnreachable, ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), haLoginHTTPTimeout)
+	defer cancel()
+	status, body, class := haBootstrapRequest(ctx, http.MethodPost, u+"/auth/login_flow/"+flowID, "application/json", payload)
+	if class != "" {
+		log.Warnf("ha login: %s: credential submit failed (%s)", host, haErrUnreachable)
+		return "", haErrUnreachable, ""
+	}
+	var res haLoginFlowResult
+	if err := json.Unmarshal(body, &res); err != nil {
+		log.Warnf("ha login: %s: credential submit unexpected answer (%s)", host, haErrUnreachable)
+		return "", haErrUnreachable, ""
+	}
+	if status == http.StatusForbidden {
+		// "Login blocked: <reason>" - the credentials are accepted but the
+		// user cannot be issued tokens (inactive, or not allowed to
+		// authenticate from this IP). A credential problem, surfaced with HA's
+		// own message.
+		log.Warnf("ha login: %s: login blocked (%s)", host, haErrInvalidCreds)
+		return "", haErrInvalidCreds, haHTTPErrorMessage(body)
+	}
+	if status != http.StatusOK {
+		// 400 (bad client_id, IP change), 404 (unknown flow): a deviation
+		// from the documented flow -> protocol failure.
+		log.Warnf("ha login: %s: credential submit unexpected status (%s)", host, haErrUnreachable)
+		return "", haErrUnreachable, ""
+	}
+	switch res.Type {
+	case "create_entry":
+		if res.Result == "" {
+			log.Warnf("ha login: %s: flow finished without an auth code (%s)", host, haErrUnreachable)
+			return "", haErrUnreachable, ""
+		}
+		return res.Result, "", ""
+	case "form":
+		// Wrong credentials: HA answers HTTP 200 with errors.base set.
+		if res.Errors["base"] == "invalid_auth" {
+			log.Warnf("ha login: %s: credentials rejected (%s)", host, haErrInvalidCreds)
+			return "", haErrInvalidCreds, "invalid_auth"
+		}
+		// An unexpected intermediate step (MFA: select_mfa_module/mfa, or an
+		// invalid_code error there): the bootstrap cannot complete without
+		// the MFA code. A credential problem, with HA's step surfaced.
+		log.Warnf("ha login: %s: unexpected flow step (%s)", host, haErrInvalidCreds)
+		return "", haErrInvalidCreds, fmt.Sprintf("unexpected flow step %q", res.StepID)
+	default:
+		log.Warnf("ha login: %s: credential submit unexpected answer type (%s)", host, haErrUnreachable)
+		return "", haErrUnreachable, ""
+	}
+}
+
+// haExchangeToken is bootstrap step 3: POST <u>/auth/token (form-urlencoded)
+// and exchange the single-use auth code for a 30-minute JWT. The identical
+// client_id of steps 1+2 is required (the code is keyed by (client_id,
+// code)).
+func haExchangeToken(log librespot.Logger, u, clientID, code string) (string, string) {
+	host := haHostForLog(u)
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("client_id", clientID)
+	form.Set("code", code)
+	ctx, cancel := context.WithTimeout(context.Background(), haLoginHTTPTimeout)
+	defer cancel()
+	status, body, class := haBootstrapRequest(ctx, http.MethodPost, u+"/auth/token", "application/x-www-form-urlencoded", []byte(form.Encode()))
+	if class != "" || status != http.StatusOK {
+		log.Warnf("ha login: %s: token exchange failed (%s)", host, haErrUnreachable)
+		return "", haErrUnreachable
+	}
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &tok); err != nil || tok.AccessToken == "" {
+		log.Warnf("ha login: %s: token exchange unexpected answer (%s)", host, haErrUnreachable)
+		return "", haErrUnreachable
+	}
+	return tok.AccessToken, ""
+}
+
+// haWsMintRequest is the HA WebSocket command that mints a long-lived access
+// token (file header step 5). Struct field order is part of the wire
+// contract: lifespan is required by HA (there is no default) and client_name
+// must be unique per user - one LLA per (user, client_name).
+type haWsMintRequest struct {
+	ID         int    `json:"id"`
+	Type       string `json:"type"`
+	ClientName string `json:"client_name"`
+	Lifespan   int    `json:"lifespan"`
+}
+
+// haWsMintResponse is HA's answer to the mint command ({"id":2,"type":
+// "result","success":...}); Result carries the LLA JWT on success, Message
+// the error text on failure. ID is a pointer so frames without an id (async
+// events) can be skipped.
+type haWsMintResponse struct {
+	ID      *int   `json:"id"`
+	Type    string `json:"type"`
+	Success bool   `json:"success"`
+	Result  string `json:"result"`
+	Message string `json:"message"`
+}
+
+// haMintLLA is bootstrap step 5: on an authenticated HA websocket connection
+// (already auth_ok'd) it requests the long-lived access token and returns
+// the minted JWT. HA keeps one LLA per (user, client_name); when HA reports
+// that the stable name already exists, it retries ONCE with a unique name
+// "Mira <UTC YYYYMMDD-HHMM>". Any other failure is a protocol failure ->
+// unreachable. Frames that do not carry the mint request's id (async events)
+// are skipped.
+func haMintLLA(log librespot.Logger, host string, conn *websocket.Conn, overallCtx context.Context) (string, string) {
+	for attempt := range 2 {
+		clientName := haLLAName
+		if attempt > 0 {
+			// The stable name is taken: mint under a unique run-specific name.
+			clientName = fmt.Sprintf("%s %s", haLLAName, time.Now().UTC().Format("20060102-1504"))
+		}
+		msg, err := json.Marshal(haWsMintRequest{
+			ID:         haLLAMsgID,
+			Type:       "auth/long_lived_access_token",
+			ClientName: clientName,
+			Lifespan:   haLLADays,
+		})
+		if err != nil {
+			return "", haErrUnreachable
+		}
+		if err := conn.Write(overallCtx, websocket.MessageText, msg); err != nil {
+			log.Warnf("ha login: %s: mint write failed (%s)", host, haErrUnreachable)
+			return "", haErrUnreachable
+		}
+
+		for {
+			msgType, data, err := conn.Read(overallCtx)
+			if err != nil || msgType != websocket.MessageText {
+				log.Warnf("ha login: %s: mint response failed (%s)", host, haErrUnreachable)
+				return "", haErrUnreachable
+			}
+			var resp haWsMintResponse
+			if err := json.Unmarshal(data, &resp); err != nil {
+				log.Warnf("ha login: %s: malformed mint response (%s)", host, haErrUnreachable)
+				return "", haErrUnreachable
+			}
+			if resp.ID == nil || *resp.ID != haLLAMsgID {
+				continue // an async event for another request
+			}
+			if !resp.Success {
+				if attempt == 0 && strings.Contains(resp.Message, "already exists") {
+					log.Warnf("ha login: %s: LLA name taken, retrying with a unique name", host)
+					break // -> retry once with the unique client_name
+				}
+				log.Warnf("ha login: %s: LLA mint failed (%s)", host, haErrUnreachable)
+				return "", haErrUnreachable
+			}
+			if resp.Result == "" {
+				log.Warnf("ha login: %s: LLA mint returned no token (%s)", host, haErrUnreachable)
+				return "", haErrUnreachable
+			}
+			log.Infof("ha login: long-lived access token minted by %s", host)
+			return resp.Result, ""
+		}
+	}
+	log.Warnf("ha login: %s: LLA name conflict twice (%s)", host, haErrUnreachable)
+	return "", haErrUnreachable
+}
+
+// haAuthWithCredentials bootstraps a fresh long-lived access token against u
+// from username+password (issue #25; see the file header for the full
+// contract): REST login flow steps 1+2 -> single-use auth code, step 3 ->
+// 30-minute JWT, then WS step 4 (auth with the short-lived JWT) and step 5
+// (mint the LLA). It returns the minted LLA and "" on success, or "" and the
+// error class (+ HA's message for invalid_credentials) on failure.
+//
+// SECURITY: u, username and password never reach a log line; only the host
+// and the error class are logged (ticket 9.4 mandatory lesson). The minted
+// token appears only in the login endpoint's JSON response.
+func haAuthWithCredentials(log librespot.Logger, u, username, password string) (string, string, string) {
+	host := haHostForLog(u)
+
+	flow, class := haStartLoginFlow(log, u)
+	if class != "" {
+		return "", class, ""
+	}
+	clientID, _ := haLoginClientIDs(u)
+
+	code, class, message := haFlowSubmit(log, u, clientID, flow.FlowID, username, password)
+	if class != "" {
+		return "", class, message
+	}
+
+	shortToken, class := haExchangeToken(log, u, clientID, code)
+	if class != "" {
+		return "", class, ""
+	}
+
+	conn, overallCtx, cancel, class := haWsDialAndAuth(log, u, shortToken)
+	if class != "" {
+		return "", class, ""
+	}
+	defer cancel()
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "") }()
+
+	msgType, data, err := conn.Read(overallCtx)
+	if err != nil || msgType != websocket.MessageText {
+		log.Warnf("ha login: %s: auth response failed (%s)", host, haErrUnreachable)
+		return "", haErrUnreachable, ""
+	}
+	var authResp struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &authResp); err != nil || authResp.Type != "auth_ok" {
+		// HA just issued this token in step 3: a rejection of it is a
+		// protocol failure, not a credential problem.
+		log.Warnf("ha login: %s: short-lived token rejected (%s)", host, haErrUnreachable)
+		return "", haErrUnreachable, ""
+	}
+
+	token, class := haMintLLA(log, host, conn, overallCtx)
+	return token, class, ""
+}
+
 // handleHaLogin implements POST /api/ha/login (see the file header for the
 // full contract).
 func (s *ConcreteApiServer) handleHaLogin(w http.ResponseWriter, r *http.Request) {
@@ -303,15 +724,26 @@ func (s *ConcreteApiServer) handleHaLogin(w http.ResponseWriter, r *http.Request
 		return
 	}
 	canonical := normalizeHaURL(req.URL)
-	// the token is deliberately VERBATIM - same rule as ParseHaConfig.
-	if canonical == "" || req.Token == "" {
+	if canonical == "" {
 		writeHaJSON(w, http.StatusBadRequest, haLoginErrorBody{OK: false, Error: haErrBadRequest})
 		return
 	}
 
-	token, class := haAuthWithToken(s.log, canonical, req.Token)
+	// Token mode wins when a token is given (the token is deliberately
+	// VERBATIM - same rule as ParseHaConfig); credential mode needs BOTH
+	// username and password (issue #25).
+	var token, class, message string
+	if req.Token != "" {
+		token, class = haAuthWithToken(s.log, canonical, req.Token)
+	} else if req.Username != "" && req.Password != "" {
+		token, class, message = haAuthWithCredentials(s.log, canonical, req.Username, req.Password)
+	} else {
+		writeHaJSON(w, http.StatusBadRequest, haLoginErrorBody{OK: false, Error: haErrBadRequest})
+		return
+	}
+
 	if class != "" {
-		writeHaJSON(w, haStatusForError(class), haLoginErrorBody{OK: false, Error: class})
+		writeHaJSON(w, haStatusForError(class), haLoginErrorBody{OK: false, Error: class, Message: message})
 		return
 	}
 	writeHaJSON(w, http.StatusOK, haLoginSuccess{OK: true, Token: token})
