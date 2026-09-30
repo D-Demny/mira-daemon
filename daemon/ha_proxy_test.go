@@ -151,3 +151,36 @@ func TestHaApiProxy_UpstreamDown(t *testing.T) {
 		t.Errorf("status = %d, want 502 (upstream unreachable)", resp.StatusCode)
 	}
 }
+
+// issue #28: the settings blob carries the URL verbatim as typed in the UI.
+// A bare "host:port" without scheme used to break the proxy's request
+// building (url.Parse rejects it -> HTTP 500 for every /ha-api/ call);
+// ParseHaConfig now canonicalizes it, so the proxy must forward with a
+// scheme-bearing target and inject the blob's token.
+func TestHaApiProxy_BareURLFromBlob(t *testing.T) {
+	t.Parallel()
+	stub, ts := newHaStub(t, http.StatusOK, `{"entity_id":"light.x","state":"on"}`, "application/json")
+
+	srv, base := newTestApiServer(t)
+	// deliberately stale defaults: the (bare-URL) blob must win over them
+	srv.SetHomeAssistantConfig(HomeAssistantConfig{URL: "http://127.0.0.1:1", Token: "stale-token"})
+	// strip the scheme from the stub URL to reproduce the stored bare form
+	host := strings.TrimPrefix(ts.URL, "http://")
+	srv.SetSettingsHandler(&testSettings{blob: []byte(`{"v":3,"ha":{"url":` + jsonString(host) + `,"token":"blob-token","tokenSource":"login"}}`)})
+
+	resp, err := testClient.Get(base + "/ha-api/states/light.x")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (bare blob url must be canonicalized)", resp.StatusCode)
+	}
+	if stub.lastMethod != http.MethodGet || stub.lastPath != "/api/states/light.x" {
+		t.Errorf("upstream = %s %s, want GET /api/states/light.x", stub.lastMethod, stub.lastPath)
+	}
+	if stub.lastAuth != "Bearer blob-token" {
+		t.Errorf("upstream auth = %q, want Bearer blob-token", stub.lastAuth)
+	}
+}

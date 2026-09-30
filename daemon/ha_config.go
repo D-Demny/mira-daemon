@@ -28,18 +28,23 @@ import (
 // Parsing rules (strict, like ParsePiProfiles):
 //   - empty or malformed blob -> nil (defaults)
 //   - no "ha" key (v2 blob, old UI) -> nil (defaults)
-//   - "url" and "username" are trimmed, "password" and "token" are
-//     VERBATIM (a user may legitimately choose a token with leading or
+//   - "url" is canonicalized with normalizeHaURL (the same single
+//     normalizer the login path uses: trimmed, missing scheme defaults to
+//     http, ws(s) mapped to http(s), trailing slash stripped) - the blob is
+//     UI-owned and written verbatim, so a bare "host:port" as typed in the
+//     UI must heal here at parse time (issue #28); an unusable url maps to
+//     nil like an empty one. "username" is trimmed; "password" and "token"
+//     are VERBATIM (a user may legitimately choose a token with leading or
 //     trailing whitespace; the UI writes what it stores)
 //   - tokenSource is validated against the UI enum 'default' | 'manual' |
 //     'login'; any foreign value (corruption, hand-edited blob, future
 //     enum growth the daemon does not know yet) normalizes to 'default'.
 //     'default' = build-time value from config.yml, no login needed.
-//   - a "ha" object whose url trims to empty returns nil: an HA object
-//     without a URL is useless for the proxy (it cannot forward anything),
-//     so the config.yml defaults apply instead. The UI writes url:'' for
-//     "not configured" - that must map to the defaults, not to a broken
-//     runtime config.
+//   - a "ha" object whose url normalizes to empty returns nil: an HA
+//     object without a usable URL is useless for the proxy (it cannot
+//     forward anything), so the config.yml defaults apply instead. The UI
+//     writes url:'' for "not configured" - that must map to the defaults,
+//     not to a broken runtime config.
 
 // HaConfig is the stored Home Assistant connection (ticket 9.4), the same
 // shape the UI persists in the settings blob. Username and Password are
@@ -85,7 +90,13 @@ func ParseHaConfig(blob []byte) *HaConfig {
 	if raw.Ha == nil {
 		return nil
 	}
-	url := strings.TrimSpace(raw.Ha.URL)
+	// issue #28: the blob carries the URL verbatim as typed in the UI - a
+	// bare "host:port" without scheme would break the proxy's request
+	// building (url.Parse rejects it -> HTTP 500 for every /ha-api/ call).
+	// Canonicalize at parse time with the login path's normalizer; an
+	// unusable result falls back to the config.yml defaults like an empty
+	// url. This heals already-installed devices without a re-login.
+	url := normalizeHaURL(raw.Ha.URL)
 	if url == "" {
 		return nil
 	}
