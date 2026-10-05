@@ -185,6 +185,135 @@ func TestMapLibraryV3Page_BadJSON(t *testing.T) {
 	}
 }
 
+// mira-ui#82: the libraryV3 page can carry non-playlist entities (tracks,
+// episodes, events — the query enables YOUR_EPISODES_V2+EVENTS); only
+// spotify:playlist:/spotify:collection: uris may reach me/playlists.
+func TestMapLibraryV3Page_FiltersNonPlaylistEntities(t *testing.T) {
+	t.Parallel()
+	payload := `{
+  "data": {
+    "me": {
+      "libraryV3": {
+        "totalCount": 10,
+        "items": [
+          {
+            "item": {
+              "_uri": "spotify:playlist:mixA",
+              "data": {
+                "__typename": "PlaylistV2",
+                "uri": "spotify:playlist:mixA",
+                "name": "Mix A",
+                "count": 0,
+                "images": {"items": []},
+                "image": {"sources": []},
+                "ownerV2": {"data": {"name": "Max", "id": "o1", "username": "max"}}
+              }
+            }
+          },
+          {
+            "item": {
+              "_uri": "spotify:track:t123",
+              "data": {
+                "__typename": "Track",
+                "uri": "spotify:track:t123",
+                "name": "Some Song",
+                "count": 0,
+                "images": {"items": []},
+                "image": {"sources": []},
+                "ownerV2": {"data": {}}
+              }
+            }
+          },
+          {
+            "item": {
+              "_uri": "spotify:collection:tracks",
+              "data": {
+                "__typename": "PseudoPlaylist",
+                "uri": "spotify:collection:tracks",
+                "name": "Liked Songs",
+                "count": 5,
+                "images": {"items": []},
+                "image": {"sources": [{"url": "https://i.scdn.com/liked.jpg", "width": 640, "height": 640}]},
+                "ownerV2": {"data": {}}
+              }
+            }
+          },
+          {
+            "item": {
+              "_uri": "spotify:episode:ep1",
+              "data": {
+                "__typename": "PodcastEpisode",
+                "uri": "spotify:episode:ep1",
+                "name": "Episode 1",
+                "count": 0,
+                "images": {"items": []},
+                "image": {"sources": []},
+                "ownerV2": {"data": {}}
+              }
+            }
+          },
+          {
+            "item": {
+              "_uri": "spotify:playlist:mixB",
+              "data": {
+                "__typename": "PlaylistV2",
+                "uri": "",
+                "name": "Mix B",
+                "count": 0,
+                "images": {"items": []},
+                "image": {"sources": []},
+                "ownerV2": {"data": {"name": "Max", "id": "o1", "username": "max"}}
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}`
+	resp, targets, err := mapLibraryV3Page([]byte(payload), 50, 0)
+	if err != nil {
+		t.Fatalf("mapLibraryV3Page: %v", err)
+	}
+	// the total may legitimately exceed the filtered item count (tracks and
+	// episodes are counted by Spotify but must not surface as playlists)
+	if resp.Total != 10 {
+		t.Errorf("total = %d, want 10 (unchanged by the filter)", resp.Total)
+	}
+	if len(resp.Items) != 3 {
+		t.Fatalf("items = %d, want 3 (track and episode must be dropped): %+v", len(resp.Items), resp.Items)
+	}
+	for _, pl := range resp.Items {
+		switch {
+		case strings.HasPrefix(pl.URI, "spotify:track:"):
+			t.Errorf("non-playlist entity leaked into me/playlists: %+v", pl)
+		case strings.HasPrefix(pl.URI, "spotify:episode:"):
+			t.Errorf("non-playlist entity leaked into me/playlists: %+v", pl)
+		}
+	}
+	if resp.Items[0].ID != "mixA" || resp.Items[0].Name != "Mix A" {
+		t.Errorf("playlist[0] = %+v", resp.Items[0])
+	}
+	if resp.Items[1].ID != likedCollectionUri || resp.Items[1].Name != "Liked Songs" {
+		t.Errorf("playlist[1] = %+v, want the Liked Songs pseudo-playlist", resp.Items[1])
+	}
+	if resp.Items[1].Tracks.Total != 5 {
+		t.Errorf("liked tracks.total = %d, want 5 (inline count)", resp.Items[1].Tracks.Total)
+	}
+	if resp.Items[2].ID != "mixB" || resp.Items[2].URI != "spotify:playlist:mixB" {
+		t.Errorf("playlist[2] = %+v, want the _uri-resolved playlist", resp.Items[2])
+	}
+	wantTargets := []playlistCountTarget{{idx: 0, uri: "spotify:playlist:mixA"}, {idx: 2, uri: "spotify:playlist:mixB"}}
+	if len(targets) != len(wantTargets) {
+		t.Fatalf("targets = %+v, want %d entries", targets, len(wantTargets))
+	}
+	for i := range wantTargets {
+		if targets[i] != wantTargets[i] {
+			t.Errorf("targets[%d] = %+v, want %+v", i, targets[i], wantTargets[i])
+		}
+	}
+}
+
 func TestParsePlaylistCount(t *testing.T) {
 	t.Parallel()
 	total, err := parsePlaylistCount([]byte(`{"data":{"playlistV2":{"content":{"totalCount":13}}}}`))

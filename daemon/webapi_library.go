@@ -1017,6 +1017,12 @@ func mapLibraryV3Page(data []byte, limit, offset int) (webApiPlaylistsResponse, 
 		if d.Name == "" || uri == "" {
 			continue
 		}
+		// mira-ui#82: the libraryV3 page can mix in non-playlist entities
+		// (tracks/episodes/events — the query enables YOUR_EPISODES_V2+EVENTS);
+		// only playlist contexts belong in me/playlists.
+		if !strings.HasPrefix(uri, "spotify:playlist:") && !strings.HasPrefix(uri, "spotify:collection:") {
+			continue
+		}
 		pl := webApiPlaylist{Name: d.Name, URI: uri, Collaborative: false}
 		if strings.HasPrefix(uri, "spotify:playlist:") {
 			pl.ID = strings.TrimPrefix(uri, "spotify:playlist:")
