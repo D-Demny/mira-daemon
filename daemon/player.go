@@ -116,6 +116,29 @@ type AppPlayer struct {
 	// (issue #15); nil in production → pathfinderQueryEx on the live session.
 	lookupChildEntitiesFn func(ctx context.Context) ([]byte, error)
 
+	// issue #84 (full liked queue after a tap): the page source of the
+	// queue backfill — the same fetchLibraryTracks query the working UI
+	// submenu pages with; nil in production → libraryTracksPage(offset, limit, false).
+	libraryTracksPageFn func(ctx context.Context, offset, limit int) ([]catalogItem, int, error)
+
+	// issue #84: single-flight management of the liked-queue backfill — a
+	// generation token (any supersede/stop bumps it; the running backfill
+	// notices even between two checks) plus the running backfill's cancel
+	// under a small mutex. Cf. the resolver loop's likedPlaylistURIRunning CAS.
+	queueBackfillGen    atomic.Uint64
+	queueBackfillMu     sync.Mutex
+	queueBackfillCancel context.CancelFunc
+
+	// issue #84: pacing of the full-queue backfill, swappable in tests
+	// (zero values = the production defaults below)
+	likedQueueBackfillPace   time.Duration // sleep between add_to_queue sends
+	likedQueueBackfillRetry  time.Duration // first retry delay per failing page/send, doubles
+	likedQueueBackfillBudget time.Duration // overall lifetime of one backfill
+
+	// issue #84: replaces one resolution attempt inside the background
+	// resolver loop; nil in production → fetchAndValidateLikedPlaylistURI.
+	fetchAndValidateLikedPlaylistURIFn func(ctx context.Context) string
+
 	// issue #56: set while the current session is a liked-songs context —
 	// queue expansion of that session pages library tracks even if the
 	// Connect state reports a playlist-shaped context id for it. Cleared on
@@ -1022,6 +1045,15 @@ const (
 // web-client DevTools session on 2026-09-21 (operationName
 // "lookupChildEntities", variables {"uris": ["<playlist uri>"]}).
 //
+// As of 2026-10 this op is ABSENT from Spotify's current web-player build
+// (swept the main bundle + all route chunks — zero hits), so on a fresh
+// install the probe cannot resolve a playlist uri and its hash cannot be
+// re-scraped from any live page. It stays as the last known discovery path:
+// if Spotify ships a replacement lookup (or restores this op) the probe works
+// again without a daemon change; until then the play path degrades to the
+// standalone + queue-backfill fallback (issue #84), and every unresolved tap
+// re-arms the resolver that runs it.
+//
 // Hardcoded on purpose, like pfRecentsHash: this op is deliberately NOT in
 // opHashDefaults. Adding it there would make rotateOnce's haveAllTargets gate
 // reject an entire freshly scraped table whenever the op is absent from the
@@ -1540,7 +1572,9 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		// the user-specific collection form before it are both rejected by
 		// Connect receivers and clear playback, so neither is ever sent. Until
 		// a real uri has resolved, a liked-songs tap falls back to standalone
-		// track playback (the tapped track, or the first library track).
+		// track playback (the tapped track, or the first library track) and —
+		// issue #84 — queues the REST of the collection into the target's
+		// queue in the background, so the whole liked list plays.
 		data, _ := req.Data.(ApiRequestDataPlay)
 		if data.Uri == "" {
 			return nil, fmt.Errorf("play requires a context uri")
@@ -1557,7 +1591,17 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			if resolved == "" {
 				// the real context is not available yet — never send the
 				// pseudo/user-form collection contexts (the receiver rejects
-				// them), play the track standalone instead
+				// them), play the tapped track standalone instead. Re-arm
+				// the background resolver on the way: a run that exhausted
+				// its budget has already exited (the single-flight guard
+				// resets on EVERY exit, budget exhaustion included), so the
+				// tap restarts discovery — healing the dead state if Spotify
+				// ships a working lookup again, and keeping the dealer-push
+				// / me/playlists opportunistic paths warm. The CAS inside
+				// makes duplicate re-arms no-ops.
+				if stop := p.app.likedPlaylistStopCh; stop != nil {
+					go p.resolveLikedPlaylistURIInBackground(stop)
+				}
 				return nil, p.playLikedSongsFallback(ctx, targetId, targetName, data)
 			}
 			sendData.Uri = resolved
@@ -1580,6 +1624,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if err := p.sendDeviceCommand(ctx, targetId, targetName, cmd); err != nil {
 			return nil, err
 		}
+		// issue #84: a new play starts a fresh context — stop the liked-queue
+		// backfill; it must not keep appending onto the queue that just got
+		// replaced. (The fallback's own successful play takes its backfill's
+		// supersede path instead.)
+		p.cancelQueueBackfill()
 		// issue #56: the liked-session flag (queue expansion pages library
 		// tracks even for a playlist-shaped Connect echo) describes the
 		// current session only — every new play supersedes it.
@@ -1754,8 +1803,12 @@ func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
 // (spotify:playlist:<id>), which the background resolver / the opportunistic
 // me/playlists scan persist in state.LikedPlaylistURI. Until it resolves, a
 // liked-songs tap uses the standalone-track fallback instead of sending an
-// unusable context. Spotify's global "Today's Top Hits" playlist is NOT an
-// account-scoped liked-songs context and must not be sent here.
+// unusable context — issue #84: standalone playback of ONE track plus a
+// background backfill that queues the REST of the collection into the target's
+// queue (full liked-list playback without the real uri), and the play path's
+// re-arm keeps the uri discovery alive meanwhile. Spotify's global "Today's
+// Top Hits" playlist is NOT an account-scoped liked-songs context and must
+// not be sent here.
 
 // resolvePlayContextUri maps the bare liked-songs pseudo context to the
 // persisted real per-user playlist uri before the play command envelope is
@@ -1775,6 +1828,11 @@ func (p *AppPlayer) resolvePlayContextUri(uri string) string {
 // tapped track when the offset carries one, otherwise of the first library
 // track via a bounded fetch. It never sends the pseudo/user-form collection
 // contexts and never marks the session as liked — it is a plain track play.
+// issue #84: once that standalone play has gone out, the REST of the
+// collection is queued onto the target's queue in the background (the full-
+// queue backfill below) — this function still returns promptly and only
+// after the tapped track is playing; the play path's re-arm keeps the real
+// playlist-uri discovery alive until it resolves.
 func (p *AppPlayer) playLikedSongsFallback(ctx context.Context, targetId, targetName string, data ApiRequestDataPlay) error {
 	// the standalone fallback is a plain track play: the previous session's
 	// liked flag does not carry over
@@ -1821,7 +1879,205 @@ func (p *AppPlayer) playLikedSongsFallback(ctx context.Context, targetId, target
 	if err := p.sendDeviceCommand(ctx, targetId, targetName, cmd); err != nil {
 		return fmt.Errorf("liked-songs fallback play failed: %w", err)
 	}
+
+	// issue #84: the standalone play has taken — queue the REST of the
+	// collection onto the target's queue in the background (returns promptly;
+	// it supersedes any backfill still running from an earlier tap). The UI's
+	// offset position is a 0-based index into the liked list and the library
+	// page is ordered identically, so "the rest" starts right after the tapped
+	// track. When the fallback fetched the first track itself, nothing else
+	// played yet and "the rest" starts at index 1.
+	startOffset := 1
+	if data.Offset != nil && data.Offset.Uri != "" {
+		startOffset = data.Offset.Position + 1
+	}
+	p.startLikedQueueBackfill(targetId, targetName, startOffset)
 	return nil
+}
+
+// issue #84: the full-queue backfill behind the standalone-playback fallback.
+//
+// startLikedQueueBackfill / cancelQueueBackfill manage single-flight: a new
+// liked tap supersedes the running backfill, and EVERY successful play stops
+// it (the play starts a fresh context; a half-built liked queue must not keep
+// appending onto it). The generation token plus the stored cancel context
+// mirror the resolver loop's likedPlaylistURIRunning CAS pattern.
+//
+// backfillLikedQueue pages fetchLibraryTracks — the SAME pathfinder query the
+// working UI Liked-Songs submenu uses — from startOffset through total and
+// sends each track to the EXPLICIT play target as an add_to_queue command
+// (the ApiRequestTypeAddToQueue shape, but addressed at the device that is
+// playing rather than "the active device", which may have moved since). Paced
+// between sends, bounded by a lifetime deadline, and cut short by any new
+// play: a partial queue is acceptable degradation — playback of the tapped
+// track already succeeded before this started. It never panics and never
+// blocks or errors into the request path.
+func (p *AppPlayer) startLikedQueueBackfill(targetId, targetName string, startOffset int) {
+	lifetime := p.likedQueueBackfillBudget
+	if lifetime <= 0 {
+		lifetime = defaultLikedQueueBackfillLifetime
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), lifetime)
+
+	p.cancelQueueBackfill() // supersede any running backfill (bumps the generation too)
+	gen := p.queueBackfillGen.Load()
+	p.queueBackfillMu.Lock()
+	p.queueBackfillCancel = cancel
+	p.queueBackfillMu.Unlock()
+
+	go p.backfillLikedQueue(ctx, gen, targetId, targetName, startOffset)
+}
+
+// stops the running liked-queue backfill (if any) — see the block comment
+// above for who calls it and why.
+func (p *AppPlayer) cancelQueueBackfill() {
+	p.queueBackfillGen.Add(1)
+	p.queueBackfillMu.Lock()
+	defer p.queueBackfillMu.Unlock()
+	if p.queueBackfillCancel != nil {
+		p.queueBackfillCancel()
+		p.queueBackfillCancel = nil
+	}
+}
+
+func (p *AppPlayer) backfillLikedQueue(ctx context.Context, gen uint64, targetId, targetName string, startOffset int) {
+	pageFn := p.libraryTracksPageFn
+	if pageFn == nil {
+		pageFn = func(c context.Context, offset, limit int) ([]catalogItem, int, error) {
+			return p.libraryTracksPage(c, offset, limit, false)
+		}
+	}
+	stale := func() bool { return p.queueBackfillGen.Load() != gen }
+
+	items, total, err := p.backfillPage(ctx, stale, pageFn, startOffset)
+	if err != nil || len(items) == 0 {
+		p.app.log.Warnf("play: liked-songs queue backfill skipped (first page at offset %d: total=%d err=%v)", startOffset, total, err)
+		return
+	}
+	if total <= startOffset {
+		p.app.log.Warnf("play: liked-songs queue backfill skipped (total %d is not past the start offset %d)", total, startOffset)
+		return
+	}
+	p.app.log.Infof("play: liked-songs queue backfill started (from offset %d, total %d)", startOffset, total)
+
+	pace := p.likedQueueBackfillPace
+	if pace <= 0 {
+		pace = defaultLikedQueueBackfillTrackPace
+	}
+	retryBase := p.likedQueueBackfillRetry
+	if retryBase <= 0 {
+		retryBase = defaultLikedQueueBackfillRetryBase
+	}
+
+	queued := 0
+	offset := startOffset
+	for {
+		pageItems := items
+		offset += len(pageItems)
+		for _, it := range pageItems {
+			if stale() || ctx.Err() != nil {
+				p.app.log.Warnf("play: liked-songs queue backfill done: queued %d of %d (superseded or lifetime bound hit)", queued, total)
+				return
+			}
+			if err := p.backfillSend(ctx, stale, retryBase, targetId, targetName, it.Uri); err != nil {
+				p.app.log.Warnf("play: liked-songs queue backfill done: queued %d of %d (stopped: %v)", queued, total, err)
+				return
+			}
+			queued++
+			if pace > 0 {
+				select {
+				case <-ctx.Done():
+					p.app.log.Warnf("play: liked-songs queue backfill done: queued %d of %d (superseded or lifetime bound hit)", queued, total)
+					return
+				case <-time.After(pace):
+				}
+			}
+		}
+		if offset >= total {
+			break
+		}
+		items, total, err = p.backfillPage(ctx, stale, pageFn, offset)
+		if err != nil || len(items) == 0 {
+			p.app.log.Warnf("play: liked-songs queue backfill done: queued %d of %d (stopped at offset %d: %v)", queued, total, offset, err)
+			return
+		}
+	}
+	p.app.log.Infof("play: liked-songs queue backfill done: queued %d of %d", queued, total)
+}
+
+// backfillPage fetches one backfill page with bounded retries (Spotify rate-
+// limits bursts): a failing page is retried up to likedQueueBackfillRetries
+// extra times with a doubling delay; the lifetime bound or a supersede cuts it
+// short.
+func (p *AppPlayer) backfillPage(ctx context.Context, stale func() bool, pageFn func(context.Context, int, int) ([]catalogItem, int, error), offset int) ([]catalogItem, int, error) {
+	retryBase := p.likedQueueBackfillRetry
+	if retryBase <= 0 {
+		retryBase = defaultLikedQueueBackfillRetryBase
+	}
+	var items []catalogItem
+	var total int
+	var err error
+	err = backoffRetry(ctx, stale, retryBase, func() error {
+		items, total, err = pageFn(ctx, offset, likedQueueBackfillPageLimit)
+		return err
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
+// backfillSend queues one track on the explicit target that is playing — the
+// same command shape as ApiRequestTypeAddToQueue — with the same bounded
+// retry.
+func (p *AppPlayer) backfillSend(ctx context.Context, stale func() bool, retryBase time.Duration, targetId, targetName, uri string) error {
+	cmd := connectCommand{
+		Endpoint: "add_to_queue",
+		Track: &connectQueueTrack{
+			Uri:      uri,
+			Provider: "queue",
+			Metadata: map[string]string{"is_queued": "true"},
+		},
+	}
+	return backoffRetry(ctx, stale, retryBase, func() error {
+		return p.sendDeviceCommand(ctx, targetId, targetName, cmd)
+	})
+}
+
+// errQueueBackfillStopped reports a backfill unit that stopped because it was
+// superseded or its lifetime bound hit, before any attempt could run.
+var errQueueBackfillStopped = errors.New("backfill stopped (superseded or lifetime bound hit)")
+
+// backoffRetry runs fn with bounded retries: on error it waits a doubling
+// delay (starting at base) and retries up to likedQueueBackfillRetries extra
+// times; the context's deadline or a supersede cuts it short.
+func backoffRetry(ctx context.Context, stale func() bool, base time.Duration, fn func() error) error {
+	delay := base
+	var lastErr error
+	for attempt := 0; attempt <= likedQueueBackfillRetries; attempt++ {
+		if stale() || ctx.Err() != nil {
+			break
+		}
+		if lastErr = fn(); lastErr == nil {
+			return nil
+		}
+		if attempt == likedQueueBackfillRetries {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return errQueueBackfillStopped
 }
 
 // cachedLikedPlaylistURI returns the persisted real per-user liked-songs
@@ -2047,6 +2303,17 @@ const (
 	// fetch of the standalone-playback fallback — it must stay well inside the
 	// UI's patience for a play tap even under Spotify rate limiting.
 	likedFallbackFetchTimeout = 3 * time.Second
+
+	// issue #84 (full liked queue): pacing of the queue backfill behind the
+	// fallback — one fetchLibraryTracks page, a short sleep between
+	// add_to_queue sends to keep spclient's quota healthy, bounded retries
+	// with a doubling delay per failing page/send, and a hard lifetime bound
+	// on one backfill run.
+	likedQueueBackfillPageLimit = 50 // fetchLibraryTracks page size
+	likedQueueBackfillRetries   = 3  // extra attempts per failing page/send
+	defaultLikedQueueBackfillTrackPace  = 50 * time.Millisecond
+	defaultLikedQueueBackfillRetryBase  = time.Second
+	defaultLikedQueueBackfillLifetime   = 5 * time.Minute
 )
 
 // resolveLikedPlaylistURIInBackground resolves the REAL per-user liked-songs
@@ -2097,8 +2364,12 @@ func (p *AppPlayer) resolveLikedPlaylistURIInBackground(stop <-chan struct{}) {
 			return // resolved in the meantime (play path or an earlier run)
 		}
 
+		attemptFn := p.fetchAndValidateLikedPlaylistURIFn
+		if attemptFn == nil {
+			attemptFn = p.fetchAndValidateLikedPlaylistURI
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), likedPlaylistAttemptTimeout)
-		uri := p.fetchAndValidateLikedPlaylistURI(ctx)
+		uri := attemptFn(ctx)
 		cancel()
 		if uri != "" {
 			p.setLikedPlaylistURI(uri)

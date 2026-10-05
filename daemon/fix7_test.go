@@ -140,6 +140,11 @@ func TestPlay_LikedSongsResolvedSendsRealPlaylistContext(t *testing.T) {
 func TestPlay_LikedSongsUnresolvedFallsBackToTappedTrack(t *testing.T) {
 	t.Parallel()
 	p, rec := newFix7Player(t) // fresh install: no persisted playlist uri
+	// issue #84: the fallback also queues the REST of the collection in the
+	// background — with an empty library page that backfill sends nothing.
+	p.libraryTracksPageFn = func(context.Context, int, int) ([]catalogItem, int, error) {
+		return nil, 0, nil
+	}
 
 	req, _ := NewApiRequest(ApiRequestTypePlay, ApiRequestDataPlay{
 		Uri:    likedCollectionUri,
@@ -177,6 +182,11 @@ func TestPlay_LikedSongsUnresolvedFallsBackToTappedTrack(t *testing.T) {
 func TestPlay_LikedSongsUnresolvedFallsBackToFirstLibraryTrack(t *testing.T) {
 	t.Parallel()
 	p, rec := newFix7Player(t)
+	// issue #84: the background queue backfill pages through this seam — an
+	// empty page means it sends nothing.
+	p.libraryTracksPageFn = func(context.Context, int, int) ([]catalogItem, int, error) {
+		return nil, 0, nil
+	}
 	p.libraryFirstTrackFn = func(context.Context) (string, error) {
 		return "spotify:track:first-lib", nil
 	}
