@@ -29,6 +29,19 @@ type Config struct {
 	// /ha-api/... on the daemon API server instead. Empty URL = proxy off.
 	HomeAssistant HomeAssistantConfig
 
+	// LikedPlaylistURI is the REAL per-user "Liked Songs" playlist uri
+	// (spotify:playlist:<id>) — a per-account value that CI bakes into
+	// go-librespot-config.yml at firmware image-build time from the
+	// mira-firmware repo secret LIKED_PLAYLIST_URI, the same mechanism as
+	// HomeAssistant.Token (see config.yml), so it never lands in any git repo.
+	// Why it exists: Connect receivers reject the pseudo liked-collection
+	// context, so without a real playlist uri every Liked-Songs tap degrades to
+	// standalone single-track playback (issue #84). When set, the daemon seeds
+	// this value into state.json at player start if the persisted state carries
+	// none (see AppPlayer.seedBakedLikedPlaylistURI). Empty = no baked value;
+	// dealer-push capture and the background resolver stay the discovery paths.
+	LikedPlaylistURI string
+
 	// Raspberry Pi provisioning wizard (epic 10): the daemon execs this
 	// script with SSH_HOST/SSH_USER/SSH_PASS when the settings UI triggers
 	// "Pi automatisch einrichten". Empty path = default rootfs location,

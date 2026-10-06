@@ -41,6 +41,9 @@ type cliConfig struct {
 	Checkin    bool   `koanf:"checkin"`
 	CheckinURL string `koanf:"checkin_url"`
 
+	// issue #84: CI-baked liked-songs playlist URI (see config.yml + daemon.Config)
+	LikedPlaylistURI string `koanf:"liked_playlist_uri"`
+
 	Server struct {
 		Enabled     bool   `koanf:"enabled"`
 		Address     string `koanf:"address"`
@@ -129,6 +132,7 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 	dc.Credentials.SpotifyToken.AccessToken = c.Credentials.SpotifyToken.AccessToken
 	dc.HomeAssistant.URL = c.HomeAssistant.URL
 	dc.HomeAssistant.Token = c.HomeAssistant.Token
+	dc.LikedPlaylistURI = c.LikedPlaylistURI
 	dc.SetupPi = daemon.SetupPiConfig{ScriptPath: c.SetupPi.ScriptPath}
 	return dc
 }

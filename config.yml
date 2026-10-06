@@ -19,6 +19,11 @@ homeassistant:
   url: ""
   token: "" # injected by CI from repo secret HA_TOKEN; committed default intentionally empty (prior value leaked and was revoked 2026-09-18)
 
+# Liked Songs playlist URI (issue #84): injected by CI at firmware image-build
+# time from the mira-firmware repo secret LIKED_PLAYLIST_URI — same mechanism as
+# the homeassistant token above; committed default intentionally empty.
+liked_playlist_uri: ""
+
 checkin: false
 checkin_url: ""
 
