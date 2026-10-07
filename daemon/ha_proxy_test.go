@@ -184,3 +184,38 @@ func TestHaApiProxy_BareURLFromBlob(t *testing.T) {
 		t.Errorf("upstream auth = %q, want Bearer blob-token", stub.lastAuth)
 	}
 }
+
+// Fresh-flash regression (device incident behind build 176): the CI-baked
+// config.yml carries HA_URL as a bare "host:port" without scheme. With no
+// settings blob (a fresh flash wipes the browser localStorage) the proxy
+// fell back to those defaults and died in url.Parse ("first path segment in
+// URL cannot contain colon") -> HTTP 500 for every /ha-api/ call. The blob
+// path is covered by TestHaApiProxy_BareURLFromBlob (issue #28); this pins
+// the config-defaults path: a scheme-less default must be canonicalized at
+// load and forwarded with a scheme-bearing target, 200 not 500.
+func TestHaApiProxy_BareURLFromConfigDefaults(t *testing.T) {
+	t.Parallel()
+	stub, ts := newHaStub(t, http.StatusOK, `{"entity_id":"light.x","state":"on"}`, "application/json")
+
+	srv, base := newTestApiServer(t)
+	// no settings handler registered: the config defaults are the ONLY source
+	// (a fresh flash has no blob)
+	host := strings.TrimPrefix(ts.URL, "http://")
+	srv.SetHomeAssistantConfig(HomeAssistantConfig{URL: host, Token: "cfg-token"})
+
+	resp, err := testClient.Get(base + "/ha-api/states/light.x")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (bare config-default url must be canonicalized)", resp.StatusCode)
+	}
+	if stub.lastMethod != http.MethodGet || stub.lastPath != "/api/states/light.x" {
+		t.Errorf("upstream = %s %s, want GET /api/states/light.x", stub.lastMethod, stub.lastPath)
+	}
+	if stub.lastAuth != "Bearer cfg-token" {
+		t.Errorf("upstream auth = %q, want Bearer cfg-token", stub.lastAuth)
+	}
+}
