@@ -725,6 +725,12 @@ const (
 )
 
 func (s *ConcreteApiServer) SetHomeAssistantConfig(cfg HomeAssistantConfig) {
+	// CI bakes the HA_URL secret verbatim into config.yml — that value is a
+	// bare "host:port" without scheme. The settings-blob path canonicalizes
+	// with normalizeHaURL (ParseHaConfig, issue #28); the config-defaults
+	// path must do the same or every proxied request on a fresh flash dies
+	// in url.Parse ("first path segment ... cannot contain colon") -> 500.
+	cfg.URL = normalizeHaURL(cfg.URL)
 	s.haMu.Lock()
 	s.haCfg = cfg
 	s.haMu.Unlock()
