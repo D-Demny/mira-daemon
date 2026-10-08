@@ -771,6 +771,14 @@ func (p *AppPlayer) deviceDisplayName(id string, d *connectpb.DeviceInfo) string
 
 // snapshots the selectable connect devices from a cluster
 func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
+	// issue #121: log every change of the RAW snapshot Spotify handed us —
+	// BEFORE the self/offline filters below apply — so a "device missing
+	// from the list" report can be checked against the server's own view,
+	// including entries that existed but were dropped as offline here.
+	if line := rawClusterLine(cluster); line != p.state.lastRawClusterLine {
+		p.state.lastRawClusterLine = line
+		p.app.log.Infof("connect cluster snapshot (%d devices): %s", len(cluster.Device), line)
+	}
 	activeDeviceId := cluster.ActiveDeviceId
 	devs := make([]ConnectDevice, 0, len(cluster.Device))
 	for id, d := range cluster.Device {
@@ -819,6 +827,40 @@ func connectDevicesSignature(devs []ConnectDevice) string {
 	var sb strings.Builder
 	for _, d := range devs {
 		fmt.Fprintf(&sb, "%s:%s:%t:%t;", d.Id, d.Name, d.IsActive, d.IsOffline)
+	}
+	return sb.String()
+}
+
+// issue #121: one compact line per device exactly as Spotify delivered it —
+// id, best-known name (friendlyDeviceName falls back to the raw name), type
+// and the offline/active flags the filters in updateConnectDevices act on.
+// Volume is deliberately left out: it churns every heartbeat and would log
+// forever. Sorted by id so the line (and its change detection) is stable.
+func rawClusterLine(cluster *connectpb.Cluster) string {
+	type entry struct {
+		id   string
+		line string
+	}
+	entries := make([]entry, 0, len(cluster.Device))
+	for id, d := range cluster.Device {
+		name := friendlyDeviceName(d)
+		if name == "" {
+			name = d.Name
+		}
+		line := fmt.Sprintf("%s=%q(%s,active=%t", id, name, d.DeviceType, id == cluster.ActiveDeviceId)
+		if d.IsOffline {
+			line += ",offline"
+		}
+		line += ")"
+		entries = append(entries, entry{id: id, line: line})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].id < entries[j].id })
+	var sb strings.Builder
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteString(" | ")
+		}
+		sb.WriteString(e.line)
 	}
 	return sb.String()
 }
