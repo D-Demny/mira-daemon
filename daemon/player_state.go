@@ -36,6 +36,9 @@ type State struct {
 	// connectDeviceNames remembers the last good display name per device id,
 	// since later cluster updates can degrade a device's name to its raw id
 	connectDeviceNames map[string]string
+	// lastRawClusterLine issue #121: the rendered raw (pre-filter) cluster
+	// snapshot that was last logged; change detector for the diagnostic line
+	lastRawClusterLine string
 }
 
 // RemoteState holds information about the playback state of the currently active remote device.
