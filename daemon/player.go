@@ -240,8 +240,13 @@ func (p *AppPlayer) registerAsync(connId string, gen uint64) {
 const connectStateHeartbeatInterval = 4 * time.Minute
 
 // connectDevicePollInterval how often the account-wide Connect device list is
-// re-fetched from the Web API (GET /me/player/devices). issue #127.
-const connectDevicePollInterval = 5 * time.Minute
+// re-fetched from the Web API (GET /me/player/devices). issue #127. Failures
+// (notably Spotify's 429) back off exponentially up to connectDevicePollMax,
+// so a rate-limited account is not hammered and can actually recover.
+const (
+	connectDevicePollInterval = 5 * time.Minute
+	connectDevicePollMax      = 30 * time.Minute
+)
 
 // heartbeatConnectState re-puts our connect state periodically
 func (p *AppPlayer) heartbeatConnectState() {
@@ -2637,8 +2642,11 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 
 	heartbeat := time.NewTicker(connectStateHeartbeatInterval)
 	defer heartbeat.Stop()
-	connectDevicePoll := time.NewTicker(connectDevicePollInterval)
-	defer connectDevicePoll.Stop()
+	// issue #127: timer instead of ticker — the interval backs off after
+	// failures (see connectDevicePollInterval)
+	connectDevicePollTimer := time.NewTimer(connectDevicePollInterval)
+	defer connectDevicePollTimer.Stop()
+	connectDevicePollEvery := connectDevicePollInterval
 
 	for {
 		select {
@@ -2649,10 +2657,21 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			return
 		case <-heartbeat.C:
 			p.heartbeatConnectState()
-		case <-connectDevicePoll.C:
+		case <-connectDevicePollTimer.C:
 			pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			_ = p.refreshKnownConnectDevices(pctx)
+			err := p.refreshKnownConnectDevices(pctx)
 			cancel()
+			if err != nil {
+				if connectDevicePollEvery < connectDevicePollMax {
+					connectDevicePollEvery *= 2
+					if connectDevicePollEvery > connectDevicePollMax {
+						connectDevicePollEvery = connectDevicePollMax
+					}
+				}
+			} else {
+				connectDevicePollEvery = connectDevicePollInterval
+			}
+			connectDevicePollTimer.Reset(connectDevicePollEvery)
 		case pkt, ok := <-apRecv:
 			if !ok {
 				p.app.log.Warnf("accesspoint receiver closed")
