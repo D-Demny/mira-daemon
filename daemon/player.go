@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -237,6 +238,20 @@ func (p *AppPlayer) registerAsync(connId string, gen uint64) {
 
 // connectStateHeartbeatInterval keeps our cluster registration alive
 const connectStateHeartbeatInterval = 4 * time.Minute
+
+// connectDevicePollInterval how often the account-wide Connect device list is
+// re-fetched from the Web API (GET /me/player/devices). issue #127. Failures
+// (notably Spotify's 429) back off exponentially up to connectDevicePollMax,
+// so a rate-limited account is not hammered and can actually recover.
+const (
+	connectDevicePollInterval = 5 * time.Minute
+	connectDevicePollMax      = 30 * time.Minute
+)
+
+// connectDeviceRememberTTL how long a device stays selectable after its last
+// live-cluster sighting; it is the cache fallback while the account-wide Web
+// API list is unavailable (e.g. rate limited). issue #127.
+const connectDeviceRememberTTL = 30 * 24 * time.Hour
 
 // heartbeatConnectState re-puts our connect state periodically
 func (p *AppPlayer) heartbeatConnectState() {
@@ -645,6 +660,26 @@ type ConnectDevice struct {
 	CanTransfer    bool   `json:"can_transfer"`
 }
 
+// knownConnectDevice is one entry of the account-wide Web API device list
+// (GET /me/player/devices), kept by id. issue #127.
+type knownConnectDevice struct {
+	name     string
+	typ      string // Connect device type name ("AVR", "GROUP", ...)
+	isActive bool
+}
+
+// deviceTypeGroup marks multi-room groups from the Web API list; the Connect
+// protocol has no group device type of its own.
+const deviceTypeGroup = "GROUP"
+// rememberedConnectDevice is a live-cluster sighting; it keeps idle speakers
+// and renamed group leaders selectable after they age out of the cluster.
+// issue #127.
+type rememberedConnectDevice struct {
+	name     string
+	typ      string
+	lastSeen time.Time
+}
+
 // defaultDeviceIdFromSettings reads the "default_device_id" field from the
 // UI settings blob. Returns empty string when unset or invalid.
 func defaultDeviceIdFromSettings(raw json.RawMessage) string {
@@ -772,6 +807,7 @@ func (p *AppPlayer) deviceDisplayName(id string, d *connectpb.DeviceInfo) string
 // snapshots the selectable connect devices from a cluster
 func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
 	activeDeviceId := cluster.ActiveDeviceId
+	p.rememberClusterSightings(cluster)
 	devs := make([]ConnectDevice, 0, len(cluster.Device))
 	for id, d := range cluster.Device {
 		if id == p.app.deviceId {
@@ -794,7 +830,102 @@ func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
 			cd.VolumeSteps = d.Capabilities.VolumeSteps
 			cd.VolumeDisabled = d.Capabilities.DisableVolume
 		}
+		// multi-room groups have no device type of their own in the Connect
+		// protocol; when the Web API list identifies the entry as a group,
+		// prefer its name and mark it for the UI's group icon. issue #127
+		if k, ok := p.state.knownConnectDevices[id]; ok && k.typ == deviceTypeGroup {
+			cd.Name = k.name
+			cd.Type = deviceTypeGroup
+		}
 		devs = append(devs, cd)
+	}
+	p.state.clusterDevices = devs
+	p.state.clusterActiveDeviceId = activeDeviceId
+	p.publishConnectDevices()
+}
+
+// rememberClusterSightings records every cluster entry — including offline
+// ghosts — per device id and expires sightings older than
+// connectDeviceRememberTTL. issue #127.
+func (p *AppPlayer) rememberClusterSightings(cluster *connectpb.Cluster) {
+	if p.state.rememberedConnectDevices == nil {
+		p.state.rememberedConnectDevices = map[string]rememberedConnectDevice{}
+	}
+	now := time.Now()
+	for id, d := range cluster.Device {
+		if id == p.app.deviceId {
+			continue
+		}
+		re := rememberedConnectDevice{
+			name:     p.deviceDisplayName(id, d),
+			typ:      d.DeviceType.String(),
+			lastSeen: now,
+		}
+		// multi-room groups have no device type of their own in the Connect
+		// protocol; remember the Web API identification so the UI keeps its
+		// group icon while the entry lives only in the cache. issue #127
+		if k, ok := p.state.knownConnectDevices[id]; ok && k.typ == deviceTypeGroup {
+			re.name = k.name
+			re.typ = deviceTypeGroup
+		}
+		p.state.rememberedConnectDevices[id] = re
+	}
+	cutoff := now.Add(-connectDeviceRememberTTL)
+	for id, re := range p.state.rememberedConnectDevices {
+		if re.lastSeen.Before(cutoff) {
+			delete(p.state.rememberedConnectDevices, id)
+		}
+	}
+}
+
+// publishConnectDevices merges the live cluster snapshot with the account-wide
+// Web API device list and emits an event when the shape changes.
+//
+// The live cluster only carries devices that are currently registered with
+// Spotify; idle speakers age out of it (DEVICES_DISAPPEARED), which made them
+// vanish from the picker. The Web API list keeps them selectable: a transfer
+// to such a device re-registers it, exactly like tapping one in the official
+// app. issue #127.
+// A third source keeps recently seen devices (sightings cache) selectable
+// while the Web API list is unavailable. issue #127.
+func (p *AppPlayer) publishConnectDevices() {
+	devs := make([]ConnectDevice, 0, len(p.state.clusterDevices)+len(p.state.knownConnectDevices)+len(p.state.rememberedConnectDevices))
+	devs = append(devs, p.state.clusterDevices...)
+	inCluster := make(map[string]bool, len(p.state.clusterDevices))
+	for _, d := range p.state.clusterDevices {
+		inCluster[d.Id] = true
+	}
+	for id, k := range p.state.knownConnectDevices {
+		if id == p.app.deviceId || inCluster[id] {
+			continue
+		}
+		active := id == p.state.clusterActiveDeviceId || k.isActive
+		devs = append(devs, ConnectDevice{
+			Id:          id,
+			Name:        k.name,
+			Type:        k.typ,
+			IsActive:    active,
+			IsOffline:   !active,
+			CanTransfer: true,
+		})
+	}
+	for id, re := range p.state.rememberedConnectDevices {
+		if id == p.app.deviceId || inCluster[id] {
+			continue
+		}
+		// a Web API entry for the same id carries fresher account-wide data
+		if _, ok := p.state.knownConnectDevices[id]; ok {
+			continue
+		}
+		active := id == p.state.clusterActiveDeviceId
+		devs = append(devs, ConnectDevice{
+			Id:          id,
+			Name:        re.name,
+			Type:        re.typ,
+			IsActive:    active,
+			IsOffline:   !active,
+			CanTransfer: true,
+		})
 	}
 	// active device first, then alphabetical
 	sort.Slice(devs, func(i, j int) bool {
@@ -813,6 +944,78 @@ func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
 	}
 	p.state.connectDevSig = sig
 	p.app.server.Emit(&ApiEvent{Type: ApiEventTypeConnectDevices, Data: devs})
+}
+
+// refreshKnownConnectDevices fetches the account-wide Connect device list from
+// GET /me/player/devices and republishes the merged picker list. Failures keep
+// the previous list (transient rate limits etc.). issue #127.
+func (p *AppPlayer) refreshKnownConnectDevices(ctx context.Context) error {
+	resp, err := p.sess.WebApi(ctx, http.MethodGet, "me/player/devices", nil, nil, nil)
+	if err != nil {
+		p.app.log.Warnf("connect devices: web api list fetch failed (keeping previous list): %v", err)
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		p.app.log.Warnf("connect devices: web api list returned status %d (keeping previous list)", resp.StatusCode)
+		return fmt.Errorf("web api list returned status %d", resp.StatusCode)
+	}
+	var payload struct {
+		Devices []struct {
+			ID       string `json:"id"`
+			Name     string `json:"name"`
+			Type     string `json:"type"`
+			IsActive bool   `json:"isActive"`
+		} `json:"devices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		p.app.log.Warnf("connect devices: web api list decode failed (keeping previous list): %v", err)
+		return err
+	}
+	known := make(map[string]knownConnectDevice, len(payload.Devices))
+	for _, d := range payload.Devices {
+		if d.ID == "" || d.ID == p.app.deviceId {
+			continue
+		}
+		known[d.ID] = knownConnectDevice{name: d.Name, typ: webApiDeviceTypeName(d.Type), isActive: d.IsActive}
+	}
+	p.state.knownConnectDevices = known
+	p.publishConnectDevices()
+	return nil
+}
+
+// webApiDeviceTypeName maps the Web API's lowercase device types onto the
+// Connect device type names used by the UI (see DeviceTypeIcon). WiiM Amp /
+// Pro Plus register as AVR: they are streamer-amps each driving a speaker, so
+// they render as speakers. issue #127.
+func webApiDeviceTypeName(t string) string {
+	switch strings.ToLower(t) {
+	case "computer":
+		return "COMPUTER"
+	case "chromebook":
+		return "CHROMEBOOK"
+	case "smartphone":
+		return "SMARTPHONE"
+	case "tablet":
+		return "TABLET"
+	case "speaker":
+		return "SPEAKER"
+	case "tv":
+		return "TV"
+	case "avr":
+		return "AVR"
+	case "stb":
+		return "STB"
+	case "audiodongle", "audio_dongle":
+		return "AUDIO_DONGLE"
+	case "gameconsole", "game_console":
+		return "GAME_CONSOLE"
+	case "group":
+		return deviceTypeGroup
+	default:
+		// keep unknown future types recognizable; the UI renders them as speakers
+		return strings.ToUpper(t)
+	}
 }
 
 func connectDevicesSignature(devs []ConnectDevice) string {
@@ -1434,6 +1637,14 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		return resp, nil
 
 	case ApiRequestTypeConnectDevices:
+		return map[string]any{"devices": p.connectDevicesOrEmpty()}, nil
+
+	case ApiRequestTypeConnectRefresh:
+		// on-demand refresh for the UI (Idle Screen mount); failures keep the
+		// previous list and surface as an error status
+		if err := p.refreshKnownConnectDevices(ctx); err != nil {
+			return nil, err
+		}
 		return map[string]any{"devices": p.connectDevicesOrEmpty()}, nil
 
 	case ApiRequestTypeTransfer:
@@ -2499,6 +2710,11 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 
 	heartbeat := time.NewTicker(connectStateHeartbeatInterval)
 	defer heartbeat.Stop()
+	// issue #127: timer instead of ticker — the interval backs off after
+	// failures (see connectDevicePollInterval)
+	connectDevicePollTimer := time.NewTimer(connectDevicePollInterval)
+	defer connectDevicePollTimer.Stop()
+	connectDevicePollEvery := connectDevicePollInterval
 
 	for {
 		select {
@@ -2509,6 +2725,21 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			return
 		case <-heartbeat.C:
 			p.heartbeatConnectState()
+		case <-connectDevicePollTimer.C:
+			pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err := p.refreshKnownConnectDevices(pctx)
+			cancel()
+			if err != nil {
+				if connectDevicePollEvery < connectDevicePollMax {
+					connectDevicePollEvery *= 2
+					if connectDevicePollEvery > connectDevicePollMax {
+						connectDevicePollEvery = connectDevicePollMax
+					}
+				}
+			} else {
+				connectDevicePollEvery = connectDevicePollInterval
+			}
+			connectDevicePollTimer.Reset(connectDevicePollEvery)
 		case pkt, ok := <-apRecv:
 			if !ok {
 				p.app.log.Warnf("accesspoint receiver closed")

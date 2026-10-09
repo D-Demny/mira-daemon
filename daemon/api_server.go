@@ -241,8 +241,11 @@ const (
 	ApiRequestTypeToken               ApiRequestType = "token"
 	ApiRequestTypeObserverStatus      ApiRequestType = "observer_status"
 	ApiRequestTypeConnectDevices      ApiRequestType = "connect_devices"
-	ApiRequestTypeTransfer            ApiRequestType = "transfer"
-	ApiRequestTypeLyrics              ApiRequestType = "lyrics"
+	// triggers an immediate re-fetch of the account-wide Connect device list
+	// (GET /me/player/devices) and returns the merged picker list. issue #127
+	ApiRequestTypeConnectRefresh ApiRequestType = "connect_refresh"
+	ApiRequestTypeTransfer       ApiRequestType = "transfer"
+	ApiRequestTypeLyrics         ApiRequestType = "lyrics"
 )
 
 type ApiEventType string
@@ -1236,6 +1239,20 @@ func (s *ConcreteApiServer) serve() {
 			return
 		}
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeConnectDevices}, w)
+	})
+	m.HandleFunc("/connect/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// no session yet so no list
+		if !s.playerReady.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []any{}})
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeConnectRefresh}, w)
 	})
 	m.HandleFunc("/connect/transfer", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {

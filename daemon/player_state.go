@@ -36,6 +36,20 @@ type State struct {
 	// connectDeviceNames remembers the last good display name per device id,
 	// since later cluster updates can degrade a device's name to its raw id
 	connectDeviceNames map[string]string
+
+	// clusterDevices is the raw live-cluster snapshot (main loop only).
+	// connectDevices is the published merge of it with knownConnectDevices.
+	clusterDevices        []ConnectDevice
+	clusterActiveDeviceId string
+	// knownConnectDevices is the last full account-wide device list from the
+	// Web API (GET /me/player/devices): idle speakers that have aged out of
+	// the live cluster view plus multi-room groups. issue #127.
+	knownConnectDevices map[string]knownConnectDevice
+	// rememberedConnectDevices remembers the last live-cluster sighting per
+	// device id; idle speakers stay selectable for connectDeviceRememberTTL
+	// after they age out of the cluster, even without the Web API list.
+	// issue #127.
+	rememberedConnectDevices map[string]rememberedConnectDevice
 }
 
 // RemoteState holds information about the playback state of the currently active remote device.
