@@ -248,6 +248,11 @@ const (
 	connectDevicePollMax      = 30 * time.Minute
 )
 
+// connectDeviceRememberTTL how long a device stays selectable after its last
+// live-cluster sighting; it is the cache fallback while the account-wide Web
+// API list is unavailable (e.g. rate limited). issue #127.
+const connectDeviceRememberTTL = 30 * 24 * time.Hour
+
 // heartbeatConnectState re-puts our connect state periodically
 func (p *AppPlayer) heartbeatConnectState() {
 	if !p.hasSpotConnId || !p.registered.Load() {
@@ -666,6 +671,14 @@ type knownConnectDevice struct {
 // deviceTypeGroup marks multi-room groups from the Web API list; the Connect
 // protocol has no group device type of its own.
 const deviceTypeGroup = "GROUP"
+// rememberedConnectDevice is a live-cluster sighting; it keeps idle speakers
+// and renamed group leaders selectable after they age out of the cluster.
+// issue #127.
+type rememberedConnectDevice struct {
+	name     string
+	typ      string
+	lastSeen time.Time
+}
 
 // defaultDeviceIdFromSettings reads the "default_device_id" field from the
 // UI settings blob. Returns empty string when unset or invalid.
@@ -794,6 +807,7 @@ func (p *AppPlayer) deviceDisplayName(id string, d *connectpb.DeviceInfo) string
 // snapshots the selectable connect devices from a cluster
 func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
 	activeDeviceId := cluster.ActiveDeviceId
+	p.rememberClusterSightings(cluster)
 	devs := make([]ConnectDevice, 0, len(cluster.Device))
 	for id, d := range cluster.Device {
 		if id == p.app.deviceId {
@@ -830,6 +844,40 @@ func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
 	p.publishConnectDevices()
 }
 
+// rememberClusterSightings records every cluster entry — including offline
+// ghosts — per device id and expires sightings older than
+// connectDeviceRememberTTL. issue #127.
+func (p *AppPlayer) rememberClusterSightings(cluster *connectpb.Cluster) {
+	if p.state.rememberedConnectDevices == nil {
+		p.state.rememberedConnectDevices = map[string]rememberedConnectDevice{}
+	}
+	now := time.Now()
+	for id, d := range cluster.Device {
+		if id == p.app.deviceId {
+			continue
+		}
+		re := rememberedConnectDevice{
+			name:     p.deviceDisplayName(id, d),
+			typ:      d.DeviceType.String(),
+			lastSeen: now,
+		}
+		// multi-room groups have no device type of their own in the Connect
+		// protocol; remember the Web API identification so the UI keeps its
+		// group icon while the entry lives only in the cache. issue #127
+		if k, ok := p.state.knownConnectDevices[id]; ok && k.typ == deviceTypeGroup {
+			re.name = k.name
+			re.typ = deviceTypeGroup
+		}
+		p.state.rememberedConnectDevices[id] = re
+	}
+	cutoff := now.Add(-connectDeviceRememberTTL)
+	for id, re := range p.state.rememberedConnectDevices {
+		if re.lastSeen.Before(cutoff) {
+			delete(p.state.rememberedConnectDevices, id)
+		}
+	}
+}
+
 // publishConnectDevices merges the live cluster snapshot with the account-wide
 // Web API device list and emits an event when the shape changes.
 //
@@ -838,8 +886,10 @@ func (p *AppPlayer) updateConnectDevices(cluster *connectpb.Cluster) {
 // vanish from the picker. The Web API list keeps them selectable: a transfer
 // to such a device re-registers it, exactly like tapping one in the official
 // app. issue #127.
+// A third source keeps recently seen devices (sightings cache) selectable
+// while the Web API list is unavailable. issue #127.
 func (p *AppPlayer) publishConnectDevices() {
-	devs := make([]ConnectDevice, 0, len(p.state.clusterDevices)+len(p.state.knownConnectDevices))
+	devs := make([]ConnectDevice, 0, len(p.state.clusterDevices)+len(p.state.knownConnectDevices)+len(p.state.rememberedConnectDevices))
 	devs = append(devs, p.state.clusterDevices...)
 	inCluster := make(map[string]bool, len(p.state.clusterDevices))
 	for _, d := range p.state.clusterDevices {
@@ -854,6 +904,24 @@ func (p *AppPlayer) publishConnectDevices() {
 			Id:          id,
 			Name:        k.name,
 			Type:        k.typ,
+			IsActive:    active,
+			IsOffline:   !active,
+			CanTransfer: true,
+		})
+	}
+	for id, re := range p.state.rememberedConnectDevices {
+		if id == p.app.deviceId || inCluster[id] {
+			continue
+		}
+		// a Web API entry for the same id carries fresher account-wide data
+		if _, ok := p.state.knownConnectDevices[id]; ok {
+			continue
+		}
+		active := id == p.state.clusterActiveDeviceId
+		devs = append(devs, ConnectDevice{
+			Id:          id,
+			Name:        re.name,
+			Type:        re.typ,
 			IsActive:    active,
 			IsOffline:   !active,
 			CanTransfer: true,

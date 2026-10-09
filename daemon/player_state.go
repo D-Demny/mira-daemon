@@ -45,6 +45,11 @@ type State struct {
 	// Web API (GET /me/player/devices): idle speakers that have aged out of
 	// the live cluster view plus multi-room groups. issue #127.
 	knownConnectDevices map[string]knownConnectDevice
+	// rememberedConnectDevices remembers the last live-cluster sighting per
+	// device id; idle speakers stay selectable for connectDeviceRememberTTL
+	// after they age out of the cluster, even without the Web API list.
+	// issue #127.
+	rememberedConnectDevices map[string]rememberedConnectDevice
 }
 
 // RemoteState holds information about the playback state of the currently active remote device.
