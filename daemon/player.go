@@ -1680,6 +1680,18 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		data, _ := req.Data.(ApiRequestDataMaPlayerSelect)
 		return p.maSelectPlayer(ctx, data.PlayerID)
 
+	case ApiRequestTypeMaPlaylists:
+		// issue #138: MA content menus (pinned contract shapes)
+		return p.maListPlaylists(ctx)
+
+	case ApiRequestTypeMaPlaylistItems:
+		data, _ := req.Data.(ApiRequestDataMaPlaylistItems)
+		return p.maListPlaylistItems(ctx, data.ItemID)
+
+	case ApiRequestTypeMaRecent:
+		limit, _ := req.Data.(int)
+		return p.maListRecent(ctx, limit)
+
 	case ApiRequestTypeResume:
 		// issue #134: MA backend owns playback controls while active
 		if p.maModeActive() {
@@ -1838,6 +1850,13 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		return nil, p.sendActiveDeviceVolume(ctx, target)
 
 	case ApiRequestTypePlay:
+		// issue #138: MA backend owns /player/play while active - the UI sends
+		// tapped items (with optional offset) from its track lists, and maSend
+		// maps them onto the MA queue commands instead of a Connect device.
+		if p.maModeActive() {
+			d, _ := req.Data.(ApiRequestDataPlay)
+			return nil, p.maSend(ctx, "play", d)
+		}
 		// tell the target device to start a context. issue #56: liked songs
 		// play through the REAL per-user playlist uri (spotify:playlist:<id>,
 		// resolved in the background and persisted) — the bare pseudo id AND

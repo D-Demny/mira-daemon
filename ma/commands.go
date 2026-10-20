@@ -132,3 +132,113 @@ func (c *Client) Repeat(ctx context.Context, playerID string, mode string) error
 	})
 	return err
 }
+
+// QueueOptionReplace is the play_media option the daemon always uses
+// (issue #138): a new context replaces the current queue and plays from its
+// first item — the same semantics Spotify Connect's context playback has.
+const QueueOptionReplace = "replace"
+
+// PlayMedia sends player_queues/play_media: play one media URI on the queue
+// that carries the given id (for non-grouped players == the player id). MA
+// 2.10.7 has no players/cmd/play_url — this is THE playback command for items.
+// startItem, when set, must be an exact item ID or URI inside a playlist/
+// album source: the source then starts at that item and queues the rest after
+// it (verified live against 2.10.7's media_resolver exact-match path).
+func (c *Client) PlayMedia(ctx context.Context, queueID, mediaURI, startItem string) error {
+	args := map[string]any{
+		"queue_id": queueID,
+		"media":    []string{mediaURI},
+		"option":   QueueOptionReplace,
+	}
+	if startItem != "" {
+		args["start_item"] = startItem
+	}
+	_, err := c.Call(ctx, "player_queues/play_media", args)
+	return err
+}
+
+// PlayIndex sends player_queues/play_index: start the CURRENT queue at the
+// given item without modifying it — the in-queue skip used when a "Läuft
+// gerade" upcoming-card confirmation maps onto an observed queue entry. index
+// accepts a queue index or, unambiguously, the item's queue_item_id string.
+func (c *Client) PlayIndex(ctx context.Context, queueID, index string) error {
+	_, err := c.Call(ctx, "player_queues/play_index", map[string]any{
+		"queue_id": queueID,
+		"index":    index,
+	})
+	return err
+}
+
+// GetQueue calls player_queues/get for one queue id.
+func (c *Client) GetQueue(ctx context.Context, queueID string) (*PlayerQueue, error) {
+	raw, err := c.Call(ctx, "player_queues/get", map[string]any{"queue_id": queueID})
+	if err != nil {
+		return nil, err
+	}
+	var q PlayerQueue
+	if err := json.Unmarshal(raw, &q); err != nil {
+		return nil, fmt.Errorf("ma: decoding player_queues/get result for %s: %w", queueID, err)
+	}
+	return &q, nil
+}
+
+// Browse calls music/browse at the given path. Path "root" (or "") lists the
+// provider folders; "<provider instance>://playlists" lists that provider's
+// playlists. The result is a heterogeneous list — folders and media items in
+// one struct (see BrowseItem).
+func (c *Client) Browse(ctx context.Context, path string) ([]BrowseItem, error) {
+	raw, err := c.Call(ctx, "music/browse", map[string]any{"path": path})
+	if err != nil {
+		return nil, err
+	}
+	var items []BrowseItem
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("ma: decoding music/browse result for %q: %w", path, err)
+	}
+	return items, nil
+}
+
+// PlaylistTracks calls music/playlists/playlist_tracks for one playlist.
+// Playlists always surface as LIBRARY items (provider "library") regardless
+// of the provider they were synced from — MA resolves the library row to the
+// underlying provider internally (verified live against 2.10.7 for both
+// built-in and Spotify-synced playlists).
+func (c *Client) PlaylistTracks(ctx context.Context, itemID string) ([]TrackItem, error) {
+	raw, err := c.Call(ctx, "music/playlists/playlist_tracks", map[string]any{
+		"item_id":                        itemID,
+		"provider_instance_id_or_domain": "library",
+	})
+	if err != nil {
+		return nil, err
+	}
+	var tracks []TrackItem
+	if err := json.Unmarshal(raw, &tracks); err != nil {
+		return nil, fmt.Errorf("ma: decoding playlist_tracks result for %s: %w", itemID, err)
+	}
+	return tracks, nil
+}
+
+// RecentlyPlayed calls music/recently_played_items (the play log) for track
+// entries only — the log also contains album/artist rows. The mapping is
+// lightweight: name + uri + image, no artist/album metadata (MA 2.10.7
+// limitation; the UI renders title-only cards for it).
+func (c *Client) RecentlyPlayed(ctx context.Context, limit int) ([]TrackItem, error) {
+	raw, err := c.Call(ctx, "music/recently_played_items", map[string]any{
+		"limit":       limit,
+		"media_types": []string{"track"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var items []TrackItem
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("ma: decoding recently_played_items result: %w", err)
+	}
+	tracks := make([]TrackItem, 0, len(items))
+	for _, it := range items {
+		if it.MediaType == "track" && it.URI != "" {
+			tracks = append(tracks, it)
+		}
+	}
+	return tracks, nil
+}

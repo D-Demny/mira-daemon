@@ -133,7 +133,7 @@ func TestApplyMaState_Playing(t *testing.T) {
 	p := newMaTestPlayer(t, nil)
 	pl := maPlayingPlayer()
 
-	p.applyMaState(pl)
+	p.applyMaState(pl, nil)
 
 	rs := p.state.remoteState
 	if rs == nil {
@@ -177,7 +177,7 @@ func TestApplyMaState_Paused(t *testing.T) {
 	pl := maPlayingPlayer()
 	pl.PlaybackState = "paused"
 
-	p.applyMaState(pl)
+	p.applyMaState(pl, nil)
 
 	rs := p.state.remoteState
 	if rs == nil {
@@ -194,14 +194,14 @@ func TestApplyMaState_Paused(t *testing.T) {
 func TestApplyMaState_IdleClearsStaleMedia(t *testing.T) {
 	t.Parallel()
 	p := newMaTestPlayer(t, nil)
-	p.applyMaState(maPlayingPlayer()) // seed a playing state
+	p.applyMaState(maPlayingPlayer(), nil) // seed a playing state
 	if p.state.remoteState == nil {
 		t.Fatal("seed failed")
 	}
 
 	pl := maPlayingPlayer()
 	pl.PlaybackState = "idle" // media intentionally still set (stale)
-	p.applyMaState(pl)
+	p.applyMaState(pl, nil)
 
 	if p.state.remoteState != nil {
 		t.Error("idle poll must clear remoteState")
@@ -218,7 +218,7 @@ func TestApplyMaState_NullMediaClears(t *testing.T) {
 	pl := maPlayingPlayer()
 	pl.CurrentMedia = nil
 
-	p.applyMaState(pl)
+	p.applyMaState(pl, nil)
 	if p.state.remoteState != nil {
 		t.Error("null-media poll must clear remoteState")
 	}
@@ -233,7 +233,7 @@ func TestMaPollTick_ReleasesStateWhenModeOff(t *testing.T) {
 	for _, name := range []string{"source switched to spotify", "ma config removed"} {
 		t.Run(name, func(t *testing.T) {
 			p := newMaTestPlayer(t, maTestSettings("http://h:8095", "ma"))
-			p.applyMaState(maPlayingPlayer())
+			p.applyMaState(maPlayingPlayer(), nil)
 			if p.state.remoteState == nil {
 				t.Fatal("seed failed")
 			}
@@ -537,6 +537,468 @@ func TestMaSend_VerbRouting(t *testing.T) {
 	t.Run("unknown verb is an error", func(t *testing.T) {
 		if err := p.maSend(ctx, "bogus", nil); err == nil {
 			t.Error("unknown verb must fail")
+		}
+	})
+}
+
+// ---------- issue #138: upcoming-queue mapping, play-uri routing, content endpoints ----------
+
+// TestApplyMaState_Queue pins how the polled upcoming queue lands in the
+// shared RemoteState: mapped entries for the "Läuft gerade" pane and the
+// carry-over on a transient fetch failure.
+func TestApplyMaState_Queue(t *testing.T) {
+	t.Parallel()
+
+	t.Run("queue maps to NextTracks and PrevTracks", func(t *testing.T) {
+		p := newMaTestPlayer(t, nil)
+		q := ma.PlayerQueue{
+			PreviousTrack: &ma.QueueItem{
+				QueueItemID: "qi-prev",
+				Name:        "Artist - Prev",
+				MediaItem:   &ma.TrackItem{URI: "spotify--x://track/prev", Name: "Prev", Artists: []ma.ArtistName{{Name: "Artist"}}},
+			},
+			NextTracks: []ma.QueueItem{
+				{
+					// real 2.10.7 shape: pre-composed name with version
+					// suffix, simplified artists, remote artwork
+					QueueItemID: "qi-1",
+					Name:        "A - One (remix)",
+					MediaItem:   &ma.TrackItem{URI: "spotify--x://track/one", Name: "One", Version: "remix", Artists: []ma.ArtistName{{Name: "A"}, {Name: "B"}}},
+					Image:       &ma.MediaImage{Path: "https://cdn.example/one.jpg", RemotelyAccessible: true},
+				},
+				{
+					// no artists, no " - " in the composed name: title-only
+					QueueItemID: "qi-2",
+					Name:        "Local Song",
+					MediaItem:   &ma.TrackItem{URI: "local://track/song"},
+				},
+			},
+		}
+		p.applyMaState(maPlayingPlayer(), &q)
+
+		rs := p.state.remoteState
+		if len(rs.NextTracks) != 2 {
+			t.Fatalf("next tracks: got %d want 2", len(rs.NextTracks))
+		}
+		n1 := rs.NextTracks[0]
+		if n1.TrackId != "qi-1" || n1.Uri != "spotify--x://track/one" || n1.Name != "One" || n1.Artist != "A, B" {
+			t.Errorf("next 0: %+v", n1)
+		}
+		if n1.ImageUrl != "https://cdn.example/one.jpg" {
+			t.Errorf("next 0 image: %q", n1.ImageUrl)
+		}
+		n2 := rs.NextTracks[1]
+		if n2.Name != "Local Song" || n2.Artist != "" {
+			t.Errorf("next 1: %+v", n2)
+		}
+		if len(rs.PrevTracks) != 1 || rs.PrevTracks[0].TrackId != "qi-prev" || rs.PrevTracks[0].Artist != "Artist" {
+			t.Errorf("prev tracks: %+v", rs.PrevTracks)
+		}
+	})
+
+	t.Run("nil queue carries the previous list over", func(t *testing.T) {
+		p := newMaTestPlayer(t, nil)
+		q := ma.PlayerQueue{NextTracks: []ma.QueueItem{{
+			QueueItemID: "qi-1", Name: "A - One",
+			MediaItem: &ma.TrackItem{URI: "spotify--x://track/one", Name: "One"},
+		}}}
+		p.applyMaState(maPlayingPlayer(), &q)
+
+		// transient player_queues/get failure (queue nil) while media is
+		// still active on the same device: keep the pane, don't blank it
+		p.applyMaState(maPlayingPlayer(), nil)
+
+		got := p.state.remoteState.NextTracks
+		if len(got) != 1 || got[0].TrackId != "qi-1" {
+			t.Errorf("carry-over failed: %+v", got)
+		}
+	})
+
+	t.Run("nil queue with a foreign previous device does not leak its list", func(t *testing.T) {
+		p := newMaTestPlayer(t, nil)
+		prev := &RemoteState{DeviceId: "spotify-dev-1", NextTracks: []QueueTrack{{TrackId: "foreign"}}}
+		p.state.remoteState = prev // cluster-owned, different device
+		p.maOwnsRemoteState = false
+
+		p.applyMaState(maPlayingPlayer(), nil)
+
+		if got := p.state.remoteState.NextTracks; len(got) != 0 {
+			t.Errorf("foreign list must not be carried: %+v", got)
+		}
+	})
+}
+
+// TestMaSend_PlayUriRouting pins the /player/play URI mapping in MA mode
+// (issue #138): context+offset -> play_media with start_item, bare uri in
+// the observed queue -> play_index (queue-preserving skip), anything else
+// -> single-item context, no uri -> resume semantics.
+func TestMaSend_PlayUriRouting(t *testing.T) {
+	t.Parallel()
+	srv, last := newMaFakeServer(t)
+	p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+	p.maActivePlayerId = "wiim_uuid:A"
+	ctx := context.Background()
+
+	t.Run("uri with offset uri starts the source at that item", func(t *testing.T) {
+		play := ApiRequestDataPlay{Uri: "library://playlist/61", Offset: &ApiRequestPlayOffset{Position: 3, Uri: "spotify--x://track/xyz"}}
+		if err := p.maSend(ctx, "play", play); err != nil {
+			t.Fatalf("maSend(play): %v", err)
+		}
+		env := *last
+		if env["command"] != "player_queues/play_media" {
+			t.Fatalf("command: got %v want player_queues/play_media", env["command"])
+		}
+		args, _ := env["args"].(map[string]any)
+		if args["queue_id"] != "wiim_uuid:A" || args["option"] != ma.QueueOptionReplace {
+			t.Errorf("args: %+v", args)
+		}
+		media, _ := args["media"].([]any)
+		if len(media) != 1 || media[0] != "library://playlist/61" {
+			t.Errorf("media: %v", args["media"])
+		}
+		if args["start_item"] != "spotify--x://track/xyz" {
+			t.Errorf("start_item: %v", args["start_item"])
+		}
+	})
+
+	t.Run("bare uri matching an observed upcoming track skips in queue", func(t *testing.T) {
+		p.state.remoteState = &RemoteState{
+			DeviceId:   "wiim_uuid:A",
+			NextTracks: []QueueTrack{{TrackId: "qi-7", Uri: "spotify--x://track/abc"}},
+		}
+		if err := p.maSend(ctx, "play", ApiRequestDataPlay{Uri: "spotify--x://track/abc"}); err != nil {
+			t.Fatalf("maSend(play): %v", err)
+		}
+		env := *last
+		if env["command"] != "player_queues/play_index" {
+			t.Fatalf("command: got %v want player_queues/play_index", env["command"])
+		}
+		args, _ := env["args"].(map[string]any)
+		if args["queue_id"] != "wiim_uuid:A" || args["index"] != "qi-7" {
+			t.Errorf("args: %+v", args)
+		}
+	})
+
+	t.Run("bare uri not in the queue plays as single-item context", func(t *testing.T) {
+		p.state.remoteState = &RemoteState{DeviceId: "wiim_uuid:A", NextTracks: []QueueTrack{{TrackId: "qi-7", Uri: "spotify--x://track/other"}}}
+		if err := p.maSend(ctx, "play", ApiRequestDataPlay{Uri: "spotify--x://track/solo"}); err != nil {
+			t.Fatalf("maSend(play): %v", err)
+		}
+		env := *last
+		if env["command"] != "player_queues/play_media" {
+			t.Fatalf("command: got %v want player_queues/play_media", env["command"])
+		}
+		args, _ := env["args"].(map[string]any)
+		if _, ok := args["start_item"]; ok {
+			t.Errorf("no start_item expected: %+v", args)
+		}
+		media, _ := args["media"].([]any)
+		if len(media) != 1 || media[0] != "spotify--x://track/solo" {
+			t.Errorf("media: %v", args["media"])
+		}
+	})
+
+	t.Run("queue entries of a different device never match", func(t *testing.T) {
+		p.state.remoteState = &RemoteState{
+			DeviceId:   "other-player",
+			NextTracks: []QueueTrack{{TrackId: "qi-7", Uri: "spotify--x://track/abc"}},
+		}
+		if err := p.maSend(ctx, "play", ApiRequestDataPlay{Uri: "spotify--x://track/abc"}); err != nil {
+			t.Fatalf("maSend(play): %v", err)
+		}
+		if got := (*last)["command"]; got != "player_queues/play_media" {
+			t.Errorf("foreign queue must not be skipped: command %v", got)
+		}
+	})
+
+	t.Run("play without uri keeps resume semantics", func(t *testing.T) {
+		if err := p.maSend(ctx, "play", ApiRequestDataPlay{}); err != nil {
+			t.Fatalf("maSend(play): %v", err)
+		}
+		env := *last
+		if env["command"] != "players/cmd/play" {
+			t.Fatalf("command: got %v want players/cmd/play", env["command"])
+		}
+	})
+}
+
+// maTestBrowseRoot is the live 2.10.7 root shape: one folder per provider,
+// paths ending in "://".
+const maTestBrowseRoot = `[
+  {"item_id":"root","provider":"builtin","name":"Music Assistant","uri":"builtin://","media_type":"folder","path":"builtin://"},
+  {"item_id":"root","provider":"ambient_sounds","name":"Ambient Sounds","uri":"ambient_sounds://","media_type":"folder","path":"ambient_sounds://"},
+  {"item_id":"root","provider":"spotify","name":"Spotify","uri":"spotify--yofvZfhZ://","media_type":"folder","path":"spotify--yofvZfhZ://"}
+]`
+
+// maTestBrowseBuiltinPlaylists mirrors the live shape: back breadcrumb +
+// library playlist items (covers in metadata.images, not top-level).
+const maTestBrowseBuiltinPlaylists = `[
+  {"item_id":"back","provider":"builtin","name":"..","uri":"builtin://folder/back","media_type":"folder","path":"builtin://"},
+  {"item_id":"1","provider":"library","name":"All favorited tracks","uri":"library://playlist/1","media_type":"playlist",
+   "metadata":{"images":[{"type":"thumb","path":"/data/playlist_metadata_images/1.jpg","provider":"playlist_metadata","remotely_accessible":false}]}},
+  {"item_id":"2","provider":"library","name":"500 Random tracks (from library)","uri":"library://playlist/2","media_type":"playlist",
+   "metadata":{"images":[{"type":"thumb","path":"https://i.scdn.co/image/abc","provider":"spotify--yofvZfhZ","remotely_accessible":true}]}}
+]`
+
+// maTestBrowseSpotifyPlaylists mirrors the live shape of a synced provider.
+const maTestBrowseSpotifyPlaylists = `[
+  {"item_id":"back","provider":"spotify--yofvZfhZ","name":"..","uri":"spotify--yofvZfhZ://folder/back","media_type":"folder","path":"spotify--yofvZfhZ://"},
+  {"item_id":"61","provider":"library","name":"257ers","uri":"library://playlist/61","media_type":"playlist",
+   "metadata":{"images":[{"type":"thumb","path":"https://i.scdn.co/image/xyz","provider":"spotify--yofvZfhZ","remotely_accessible":true}]}}
+]`
+
+// maTestPlaylistTracks mirrors the live playlist_tracks shape (library
+// provider, absolute position, artists list).
+const maTestPlaylistTracks = `[
+  {"item_id":"t1","provider":"spotify--yofvZfhZ","name":"Glide","uri":"spotify--x://track/one","media_type":"track","album":"The World Is Yours",
+   "artists":[{"name":"NEIKED"},{"name":"Portugal. The Man"}],"duration":184,"position":0,
+   "image":{"type":"thumb","path":"https://i.scdn.co/image/a","provider":"spotify--yofvZfhZ","remotely_accessible":true}},
+  {"item_id":"t2","provider":"local","name":"Local Jam","uri":"local://track/jam","media_type":"track","position":1,
+   "image":{"type":"thumb","path":"/data/local/jam.jpg","provider":"local","remotely_accessible":false}},
+  {"item_id":"t3","provider":"spotify--x","name":"","media_type":"track"}
+]`
+
+// maTestRecentItems mirrors the play-log mapping: lightweight entries, and
+// a non-track row that must be filtered out by the client.
+const maTestRecentItems = `[
+  {"item_id":"t9","provider":"spotify--x","name":"Recently One","uri":"spotify--x://track/r1","media_type":"track",
+   "image":{"type":"thumb","path":"https://i.scdn.co/image/r1","provider":"spotify--yofvZfhZ","remotely_accessible":true}},
+  {"item_id":"a1","provider":"spotify--x","name":"Some Album","uri":"spotify--x://album/album","media_type":"album"},
+  {"item_id":"t8","provider":"local","name":"Recently Two","uri":"","media_type":"track"}
+]`
+
+// newMaContentFakeServer serves canned per-command payloads (browse keyed by
+// "music/browse@<path>"); an unrouted command answers 500 - the same answer
+// a provider folder without a playlists collection gives live.
+func newMaContentFakeServer(t *testing.T, routes map[string]string) (*httptest.Server, *map[string]any) {
+	t.Helper()
+	var last map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var env map[string]any
+		_ = json.Unmarshal(b, &env)
+		last = env
+		key, _ := env["command"].(string)
+		if key == "music/browse" {
+			args, _ := env["args"].(map[string]any)
+			path, _ := args["path"].(string)
+			key = "music/browse@" + path
+		}
+		if body, ok := routes[key]; ok {
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &last
+}
+
+func playlistsFromPayload(t *testing.T, payload any) []MaPlaylist {
+	t.Helper()
+	m, ok := payload.(map[string]any)
+	if !ok {
+		t.Fatalf("payload must be an object: %T", payload)
+	}
+	data, _ := json.Marshal(m["playlists"])
+	var typed []MaPlaylist
+	if err := json.Unmarshal(data, &typed); err != nil {
+		t.Fatalf("playlists field: %v", err)
+	}
+	return typed
+}
+
+func tracksFromPayload(t *testing.T, payload any) []MaTrack {
+	t.Helper()
+	m, ok := payload.(map[string]any)
+	if !ok {
+		t.Fatalf("payload must be an object: %T", payload)
+	}
+	data, _ := json.Marshal(m["tracks"])
+	var typed []MaTrack
+	if err := json.Unmarshal(data, &typed); err != nil {
+		t.Fatalf("tracks field: %v", err)
+	}
+	return typed
+}
+
+// TestMaListPlaylists pins the GET /ma/playlists contract (issue #138):
+// flattened library playlists across provider folders, per-folder failures
+// skipped, empty list on unconfigured/unreachable - never an error.
+func TestMaListPlaylists(t *testing.T) {
+	t.Parallel()
+
+	routes := map[string]string{
+		"music/browse@root":                          maTestBrowseRoot,
+		"music/browse@builtin://playlists":           maTestBrowseBuiltinPlaylists,
+		"music/browse@spotify--yofvZfhZ://playlists": maTestBrowseSpotifyPlaylists,
+	}
+
+	t.Run("flattens provider folders into one list", func(t *testing.T) {
+		srv, _ := newMaContentFakeServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+
+		payload, err := p.maListPlaylists(context.Background())
+		if err != nil {
+			t.Fatalf("maListPlaylists: %v", err)
+		}
+		pl := playlistsFromPayload(t, payload)
+		if len(pl) != 3 {
+			t.Fatalf("want 3 playlists (back-breadcrumbs, non-playlists and the 500-ing provider skipped), got %d: %+v", len(pl), pl)
+		}
+		want := []struct{ id, name, uri, img string }{
+			{"1", "All favorited tracks", "library://playlist/1", ""}, // local-only art -> no url
+			{"2", "500 Random tracks (from library)", "library://playlist/2", "https://i.scdn.co/image/abc"},
+			{"61", "257ers", "library://playlist/61", "https://i.scdn.co/image/xyz"},
+		}
+		for i, w := range want {
+			if pl[i].ItemID != w.id || pl[i].Name != w.name || pl[i].URI != w.uri || pl[i].ImageURL != w.img {
+				t.Errorf("playlist %d: got %+v want %+v", i, pl[i], w)
+			}
+		}
+	})
+
+	t.Run("unconfigured yields empty list", func(t *testing.T) {
+		p := newMaTestPlayer(t, nil)
+		payload, err := p.maListPlaylists(context.Background())
+		if err != nil {
+			t.Fatalf("unconfigured must not error: %v", err)
+		}
+		if pl := playlistsFromPayload(t, payload); len(pl) != 0 {
+			t.Errorf("want empty list, got %+v", pl)
+		}
+	})
+
+	t.Run("unreachable yields empty list", func(t *testing.T) {
+		srv, _ := newMaContentFakeServer(t, routes)
+		url := srv.URL
+		srv.Close()
+
+		p := newMaTestPlayer(t, maTestSettings(url, "ma"))
+		payload, err := p.maListPlaylists(context.Background())
+		if err != nil {
+			t.Fatalf("unreachable must not error: %v", err)
+		}
+		if pl := playlistsFromPayload(t, payload); len(pl) != 0 {
+			t.Errorf("want empty list, got %+v", pl)
+		}
+	})
+}
+
+// TestMaListPlaylistItems pins the GET /ma/playlist-items contract (issue
+// #138): playlist-ordered track cards with absolute position; entries
+// without a uri are skipped; empty list on failure.
+func TestMaListPlaylistItems(t *testing.T) {
+	t.Parallel()
+
+	t.Run("maps playlist tracks in order", func(t *testing.T) {
+		srv, _ := newMaContentFakeServer(t, map[string]string{
+			"music/playlists/playlist_tracks": maTestPlaylistTracks,
+		})
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+
+		payload, err := p.maListPlaylistItems(context.Background(), "61")
+		if err != nil {
+			t.Fatalf("maListPlaylistItems: %v", err)
+		}
+		tracks := tracksFromPayload(t, payload)
+		if len(tracks) != 2 { // the uri-less entry is skipped
+			t.Fatalf("want 2 tracks, got %d: %+v", len(tracks), tracks)
+		}
+		t0 := tracks[0]
+		if t0.ID != "t1" || t0.Name != "Glide" || t0.URI != "spotify--x://track/one" ||
+			t0.Album != "The World Is Yours" || t0.Position != 0 || t0.DurationMs != 184000 {
+			t.Errorf("track 0: %+v", t0)
+		}
+		if len(t0.Artists) != 2 || t0.Artists[0] != "NEIKED" || t0.Artists[1] != "Portugal. The Man" {
+			t.Errorf("track 0 artists: %v", t0.Artists)
+		}
+		if t0.ImageURL != "https://i.scdn.co/image/a" {
+			t.Errorf("track 0 image: %q", t0.ImageURL)
+		}
+		if tracks[1].Name != "Local Jam" || tracks[1].Position != 1 || tracks[1].ImageURL != "" { // local art not served
+			t.Errorf("track 1: %+v", tracks[1])
+		}
+	})
+
+	t.Run("lookup failure yields empty list", func(t *testing.T) {
+		srv, _ := newMaContentFakeServer(t, nil) // unrouted -> 500
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+
+		payload, err := p.maListPlaylistItems(context.Background(), "61")
+		if err != nil {
+			t.Fatalf("failure must not error: %v", err)
+		}
+		if tracks := tracksFromPayload(t, payload); len(tracks) != 0 {
+			t.Errorf("want empty list, got %+v", tracks)
+		}
+	})
+
+	t.Run("empty id or unconfigured yields empty list", func(t *testing.T) {
+		p := newMaTestPlayer(t, nil)
+		payload, err := p.maListPlaylistItems(context.Background(), "")
+		if err != nil {
+			t.Fatalf("must not error: %v", err)
+		}
+		if tracks := tracksFromPayload(t, payload); len(tracks) != 0 {
+			t.Errorf("want empty list, got %+v", tracks)
+		}
+	})
+}
+
+// TestMaListRecent pins the GET /ma/recent contract (issue #138): play-log
+// track rows only (album rows and uri-less rows filtered in the client),
+// empty list on failure, limit clamping.
+func TestMaListRecent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("keeps playable track rows only", func(t *testing.T) {
+		srv, last := newMaContentFakeServer(t, map[string]string{
+			"music/recently_played_items": maTestRecentItems,
+		})
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+
+		payload, err := p.maListRecent(context.Background(), 20)
+		if err != nil {
+			t.Fatalf("maListRecent: %v", err)
+		}
+		args, _ := (*last)["args"].(map[string]any)
+		if args["limit"] != float64(20) {
+			t.Errorf("limit arg: %v", args["limit"])
+		}
+		tracks := tracksFromPayload(t, payload)
+		if len(tracks) != 1 {
+			t.Fatalf("want 1 track (album row + uri-less row filtered), got %d: %+v", len(tracks), tracks)
+		}
+		if tracks[0].Name != "Recently One" || tracks[0].URI != "spotify--x://track/r1" ||
+			tracks[0].ImageURL != "https://i.scdn.co/image/r1" {
+			t.Errorf("track 0: %+v", tracks[0])
+		}
+	})
+
+	t.Run("unconfigured yields empty list", func(t *testing.T) {
+		p := newMaTestPlayer(t, nil)
+		payload, err := p.maListRecent(context.Background(), 20)
+		if err != nil {
+			t.Fatalf("must not error: %v", err)
+		}
+		if tracks := tracksFromPayload(t, payload); len(tracks) != 0 {
+			t.Errorf("want empty list, got %+v", tracks)
+		}
+	})
+
+	t.Run("out-of-range limit is clamped to the default", func(t *testing.T) {
+		srv, last := newMaContentFakeServer(t, map[string]string{
+			"music/recently_played_items": "[]",
+		})
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+
+		if _, err := p.maListRecent(context.Background(), 0); err != nil {
+			t.Fatalf("maListRecent: %v", err)
+		}
+		args, _ := (*last)["args"].(map[string]any)
+		if args["limit"] != float64(20) {
+			t.Errorf("clamped limit: got %v want 20", args["limit"])
 		}
 	})
 }
