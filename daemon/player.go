@@ -23,6 +23,7 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/ap"
 	"github.com/devgianlu/go-librespot/dealer"
+	"github.com/devgianlu/go-librespot/ma"
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 	extmetadatapb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
@@ -65,7 +66,16 @@ type AppPlayer struct {
 	// share a Timestamp and must not count as fresh clock evidence
 	lastSampledClusterTs int64
 
-	prefetchTimer *time.Timer
+	// issue #134: Music Assistant observer state (player_ma.go). Touched
+	// exclusively from the Run() goroutine (poll tick + request cases), so
+	// deliberately lock-free - see the player_ma.go header.
+	maActivePlayerId  string // selected MA player, via POST /ma/player/select
+	maOwnsRemoteState bool   // remoteState reflects an MA poll, not a cluster
+	maClient          *ma.Client
+	maClientURL       string
+	maClientToken     string
+	maPollFailing     bool
+	prefetchTimer     *time.Timer
 
 	// lyricsProvider handles fetching lyrics from primary + LRCLIB sources
 	lyricsProvider *LyricsProvider
@@ -353,6 +363,14 @@ func (p *AppPlayer) handleCluster(ctx context.Context, cluster *connectpb.Cluste
 	// snapshot the selectable device list
 	p.updateConnectDevices(cluster)
 
+	// issue #134: while the Music Assistant backend is active, the MA poll
+	// is the single source of truth for remoteState - the Spotify cluster
+	// must neither clobber it nor clear it while MA playback runs. The
+	// device-list cache above stays fresh for a later switch back.
+	if p.maModeActive() {
+		return
+	}
+
 	// "is anything active" signal is ActiveDeviceId
 	switch {
 	case activeDeviceId == p.app.deviceId:
@@ -623,6 +641,8 @@ func (p *AppPlayer) updateRemoteState(ctx context.Context, cluster *connectpb.Cl
 	trackChanged := prevState == nil || prevState.TrackUri != rs.TrackUri
 
 	p.state.remoteState = rs
+	// a cluster-owned state replaces any MA-owned one (issue #134)
+	p.maOwnsRemoteState = false
 	// remember the active device
 	if rs.DeviceId != "" {
 		p.state.lastActiveDeviceId = rs.DeviceId
@@ -671,6 +691,7 @@ type knownConnectDevice struct {
 // deviceTypeGroup marks multi-room groups from the Web API list; the Connect
 // protocol has no group device type of its own.
 const deviceTypeGroup = "GROUP"
+
 // rememberedConnectDevice is a live-cluster sighting; it keeps idle speakers
 // and renamed group leaders selectable after they age out of the cluster.
 // issue #127.
@@ -1651,22 +1672,48 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		data, _ := req.Data.(ApiRequestDataTransfer)
 		return nil, p.sendTransfer(ctx, data.DeviceId)
 
+	case ApiRequestTypeMaDevices:
+		// issue #134: Music Assistant device list (pinned contract shape)
+		return p.maListDevices(ctx)
+
+	case ApiRequestTypeMaPlayerSelect:
+		data, _ := req.Data.(ApiRequestDataMaPlayerSelect)
+		return p.maSelectPlayer(ctx, data.PlayerID)
+
 	case ApiRequestTypeResume:
+		// issue #134: MA backend owns playback controls while active
+		if p.maModeActive() {
+			return nil, p.maSend(ctx, "resume", nil)
+		}
+
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
 			return nil, fmt.Errorf("no target device for resume")
 		}
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "resume"})
 	case ApiRequestTypeResumeLast:
+		// issue #134: resume_last maps to MA's Play (resume semantics)
+		if p.maModeActive() {
+			return nil, p.maSend(ctx, "play", nil)
+		}
+
 		p.transferIfNeeded(ctx)
 		return nil, p.resumeLastDevice(ctx)
 	case ApiRequestTypePause:
+		if p.maModeActive() {
+			return nil, p.maSend(ctx, "pause", nil)
+		}
+
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
 			return nil, fmt.Errorf("no target device for pause")
 		}
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "pause"})
 	case ApiRequestTypePlayPause:
+		if p.maModeActive() {
+			return nil, p.maSend(ctx, "playpause", nil)
+		}
+
 		// pick the endpoint from the last known playback state
 		endpoint := "resume"
 		if rs := p.state.remoteState; rs != nil && rs.IsPlaying && !rs.IsPaused {
@@ -1678,18 +1725,31 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: endpoint})
 	case ApiRequestTypeNext:
+		if p.maModeActive() {
+			return nil, p.maSend(ctx, "next", nil)
+		}
+
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
 			return nil, fmt.Errorf("no target device for next")
 		}
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "skip_next"})
 	case ApiRequestTypePrev:
+		if p.maModeActive() {
+			return nil, p.maSend(ctx, "prev", nil)
+		}
+
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
 			return nil, fmt.Errorf("no target device for prev")
 		}
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "skip_prev"})
 	case ApiRequestTypeSeek:
+		if p.maModeActive() {
+			d, _ := req.Data.(ApiRequestDataSeek)
+			return nil, p.maSend(ctx, "seek", d)
+		}
+
 		data, _ := req.Data.(ApiRequestDataSeek)
 		if data.Relative {
 			return nil, fmt.Errorf("relative seek not supported in observer mode")
@@ -1700,6 +1760,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "seek_to", Value: data.Position})
 	case ApiRequestTypeSetShufflingContext:
+		if p.maModeActive() {
+			d, _ := req.Data.(ApiRequestDataShuffle)
+			return nil, p.maSend(ctx, "shuffle", d)
+		}
+
 		data, _ := req.Data.(ApiRequestDataShuffle)
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
@@ -1707,6 +1772,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, buildShuffleCommand(data))
 	case ApiRequestTypeSetRepeatingContext:
+		if p.maModeActive() {
+			v, _ := req.Data.(bool)
+			return nil, p.maSend(ctx, "repeat_context", v)
+		}
+
 		val, _ := req.Data.(bool)
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
@@ -1714,6 +1784,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		return nil, p.sendDeviceCommand(ctx, targetId, targetName, connectCommand{Endpoint: "set_repeating_context", Value: val})
 	case ApiRequestTypeSetRepeatingTrack:
+		if p.maModeActive() {
+			v, _ := req.Data.(bool)
+			return nil, p.maSend(ctx, "repeat_track", v)
+		}
+
 		val, _ := req.Data.(bool)
 		targetId, targetName, _ := p.resolveTargetDevice()
 		if targetId == "" {
@@ -1729,6 +1804,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		return &ApiResponseVolume{Value: rs.Volume, Max: MaxStateVolume}, nil
 
 	case ApiRequestTypeSetVolume:
+		if p.maModeActive() {
+			d, _ := req.Data.(ApiRequestDataVolume)
+			return nil, p.maSend(ctx, "volume", d)
+		}
+
 		data, _ := req.Data.(ApiRequestDataVolume)
 		rs := p.state.remoteState
 		if rs == nil || rs.DeviceId == "" {
@@ -2714,6 +2794,11 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 	// failures (see connectDevicePollInterval)
 	connectDevicePollTimer := time.NewTimer(connectDevicePollInterval)
 	defer connectDevicePollTimer.Stop()
+
+	// issue #134: 1/s Music Assistant observer poll - a no-op unless the
+	// settings blob selects MA mode (see maPollTick)
+	maPollTimer := time.NewTimer(maPollInterval)
+	defer maPollTimer.Stop()
 	connectDevicePollEvery := connectDevicePollInterval
 
 	for {
@@ -2740,6 +2825,9 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 				connectDevicePollEvery = connectDevicePollInterval
 			}
 			connectDevicePollTimer.Reset(connectDevicePollEvery)
+		case <-maPollTimer.C:
+			p.maPollTick(ctx)
+			maPollTimer.Reset(maPollInterval)
 		case pkt, ok := <-apRecv:
 			if !ok {
 				p.app.log.Warnf("accesspoint receiver closed")
