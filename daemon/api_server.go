@@ -246,6 +246,9 @@ const (
 	ApiRequestTypeConnectRefresh ApiRequestType = "connect_refresh"
 	ApiRequestTypeTransfer       ApiRequestType = "transfer"
 	ApiRequestTypeLyrics         ApiRequestType = "lyrics"
+	// issue #134: Music Assistant backend endpoints (see player_ma.go)
+	ApiRequestTypeMaDevices      ApiRequestType = "ma_devices"
+	ApiRequestTypeMaPlayerSelect ApiRequestType = "ma_player_select"
 )
 
 type ApiEventType string
@@ -353,6 +356,11 @@ type ApiRequestDataPlay struct {
 
 type ApiRequestDataTransfer struct {
 	DeviceId string `json:"device_id"`
+}
+
+// ApiRequestDataMaPlayerSelect is the body of POST /ma/player/select (issue #134).
+type ApiRequestDataMaPlayerSelect struct {
+	PlayerID string `json:"player_id"`
 }
 
 type ApiRequestDataNext struct {
@@ -1269,6 +1277,38 @@ func (s *ConcreteApiServer) serve() {
 			return
 		}
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeTransfer, Data: data}, w)
+	})
+	// issue #134: Music Assistant backend - device list + player selection
+	// (pinned contract, see maListDevices/maSelectPlayer)
+	m.HandleFunc("/ma/devices", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// no session yet so no MA config either
+		if !s.playerReady.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []any{}})
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeMaDevices}, w)
+	})
+	m.HandleFunc("/ma/player/select", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var data ApiRequestDataMaPlayerSelect
+		if err := jsonDecode(r, &data); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(data.PlayerID) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeMaPlayerSelect, Data: data}, w)
 	})
 	// /auth/status must answer before any AppPlayer exists
 	m.HandleFunc("/auth/status", func(w http.ResponseWriter, r *http.Request) {
