@@ -249,6 +249,10 @@ const (
 	// issue #134: Music Assistant backend endpoints (see player_ma.go)
 	ApiRequestTypeMaDevices      ApiRequestType = "ma_devices"
 	ApiRequestTypeMaPlayerSelect ApiRequestType = "ma_player_select"
+	// issue #138: MA content menus (playlists / playlist tracks / recent)
+	ApiRequestTypeMaPlaylists     ApiRequestType = "ma_playlists"
+	ApiRequestTypeMaPlaylistItems ApiRequestType = "ma_playlist_items"
+	ApiRequestTypeMaRecent        ApiRequestType = "ma_recent"
 )
 
 type ApiEventType string
@@ -361,6 +365,13 @@ type ApiRequestDataTransfer struct {
 // ApiRequestDataMaPlayerSelect is the body of POST /ma/player/select (issue #134).
 type ApiRequestDataMaPlayerSelect struct {
 	PlayerID string `json:"player_id"`
+}
+
+// ApiRequestDataMaPlaylistItems is the query of GET /ma/playlist-items
+// (issue #138): the LIBRARY playlist id from /ma/playlists (the numeric
+// part of "library://playlist/<id>").
+type ApiRequestDataMaPlaylistItems struct {
+	ItemID string `json:"item_id"`
 }
 
 type ApiRequestDataNext struct {
@@ -1309,6 +1320,53 @@ func (s *ConcreteApiServer) serve() {
 			return
 		}
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeMaPlayerSelect, Data: data}, w)
+	})
+	// issue #138: Music Assistant content menus - playlists, playlist tracks,
+	// recent (pinned contracts, see maListPlaylists & co. in player_ma.go).
+	// Same no-session short-circuit as /ma/devices: an empty list, never an error.
+	m.HandleFunc("/ma/playlists", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.playerReady.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+			_ = json.NewEncoder(w).Encode(map[string]any{"playlists": []any{}})
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeMaPlaylists}, w)
+	})
+	m.HandleFunc("/ma/playlist-items", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		itemID := strings.TrimSpace(r.URL.Query().Get("id"))
+		if !s.playerReady.Load() || itemID == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+			_ = json.NewEncoder(w).Encode(map[string]any{"tracks": []any{}})
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeMaPlaylistItems, Data: ApiRequestDataMaPlaylistItems{ItemID: itemID}}, w)
+	})
+	m.HandleFunc("/ma/recent", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		limit := 20
+		if v, perr := strconv.Atoi(r.URL.Query().Get("limit")); perr == nil && v >= 1 && v <= 50 {
+			limit = v
+		}
+		if !s.playerReady.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+			_ = json.NewEncoder(w).Encode(map[string]any{"tracks": []any{}})
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeMaRecent, Data: limit}, w)
 	})
 	// /auth/status must answer before any AppPlayer exists
 	m.HandleFunc("/auth/status", func(w http.ResponseWriter, r *http.Request) {

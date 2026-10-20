@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/devgianlu/go-librespot/ma"
@@ -139,14 +140,27 @@ func (p *AppPlayer) maPollTick(ctx context.Context) {
 	}
 	p.maPollFailing = false
 
-	p.applyMaState(pl)
+	// issue #138: upcoming queue for the "Läuft gerade" pane. Fetched only
+	// while media is active (idle players have nothing queued) on the same
+	// 4s poll budget; on a transient fetch failure applyMaState carries the
+	// previous list over instead of blanking the pane.
+	var queue *ma.PlayerQueue
+	if pl.PlaybackState != "idle" && pl.CurrentMedia != nil {
+		q, qerr := client.GetQueue(pctx, p.maActivePlayerId)
+		queue = q
+		if qerr != nil {
+			p.app.log.Debugf("ma: player_queues/get %s failed: %v", p.maActivePlayerId, qerr)
+		}
+	}
+
+	p.applyMaState(pl, queue)
 }
 
 // applyMaState maps one polled MA player into the shared RemoteState -
 // same shape, same clock-timing notes, same events as updateRemoteState -
 // so /observer/status and the event stream stay source-agnostic.
 // issue #134.
-func (p *AppPlayer) applyMaState(pl *ma.Player) {
+func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue) {
 	// Idle, or no media at all, is "nothing playing on this speaker" - the
 	// MA equivalent of the Spotify cluster's empty ActiveDeviceId: clear +
 	// observer_inactive. Gate on PlaybackState FIRST: live players keep a
@@ -188,6 +202,19 @@ func (p *AppPlayer) applyMaState(pl *ma.Player) {
 	rs.ReceivedAtWallMs = now.UnixMilli()
 
 	prevState := p.state.remoteState
+	// issue #138: upcoming queue for the "Läuft gerade" pane. A nil queue
+	// (transient player_queues/get failure while media is active) must not
+	// blank the pane: carry the previous lists over while we still own state
+	// on this device.
+	if queue != nil {
+		rs.NextTracks = maQueueItemsToTracks(queue.NextTracks)
+		if queue.PreviousTrack != nil {
+			rs.PrevTracks = []QueueTrack{maQueueItemToTrack(*queue.PreviousTrack)}
+		}
+	} else if prevState != nil && p.maOwnsRemoteState && prevState.DeviceId == rs.DeviceId {
+		rs.NextTracks = prevState.NextTracks
+		rs.PrevTracks = prevState.PrevTracks
+	}
 	// a state handed over from the other backend (flag unset) counts as a
 	// new track: the UI must re-render title/art/position on the switch
 	trackChanged := prevState == nil || !p.maOwnsRemoteState || prevState.TrackUri != rs.TrackUri
@@ -254,9 +281,18 @@ func (p *AppPlayer) maSend(ctx context.Context, verb string, data any) error {
 	var callErr error
 	switch verb {
 	case "resume", "play":
-		// resume/resume_last carry Spotify Connect semantics ("keep playing
-		// on the target device"); MA's Play is the equivalent - it resumes
-		// an idle player and no-ops a playing one (issue #134 mapping).
+		// resume carries Spotify Connect semantics ("keep playing on the
+		// target device"); MA's Play is the equivalent - it resumes an idle
+		// player and no-ops a playing one (issue #134 mapping).
+		// play may also carry a URI from /player/play (tapped item) and must
+		// route to the queue commands instead (issue #138): maPlayUri.
+		if verb == "play" {
+			play, _ := data.(ApiRequestDataPlay)
+			if play.Uri != "" {
+				callErr = p.maPlayUri(pctx, client, playerID, play)
+				break
+			}
+		}
 		callErr = client.Play(pctx, playerID)
 	case "pause":
 		callErr = client.Pause(pctx, playerID)
@@ -378,4 +414,282 @@ func (p *AppPlayer) maSelectPlayer(ctx context.Context, playerID string) (any, e
 	p.maActivePlayerId = playerID
 	p.app.log.Infof("ma: selected player %s (%s)", playerID, name)
 	return map[string]any{"ok": true}, nil
+}
+
+// maPlayUri routes a /player/play URI in MA mode (issue #138), mapping the
+// Spotify Connect context semantics onto MA queue commands:
+//   - uri + offset.uri: the UI's tracklist confirmations send the parent
+//     list as context and the tapped item as offset - start that source at
+//     the tapped item, queueing the rest behind it (play_media replace +
+//     start_item; verified live against 2.10.7's exact-match resolver).
+//   - bare uri matching an upcoming entry of the observed queue: in-queue
+//     skip via play_index (bug26 semantics - the queue is preserved, the
+//     tapped card jumps to now-playing; MA context_uri is empty so the UI
+//     always takes this bare-uri branch for "Läuft gerade" cards).
+//   - anything else: single-item context.
+func (p *AppPlayer) maPlayUri(ctx context.Context, client *ma.Client, playerID string, play ApiRequestDataPlay) error {
+	if play.Offset != nil && play.Offset.Uri != "" {
+		return client.PlayMedia(ctx, playerID, play.Uri, play.Offset.Uri)
+	}
+	if rs := p.state.remoteState; rs != nil && rs.DeviceId == playerID {
+		for _, t := range rs.NextTracks {
+			if t.TrackId != "" && t.Uri != "" && t.Uri == play.Uri {
+				return client.PlayIndex(ctx, playerID, t.TrackId)
+			}
+		}
+	}
+	return client.PlayMedia(ctx, playerID, play.Uri, "")
+}
+
+// maImageURL picks a UI-fetchable url from an MA image entry: only remotely
+// accessible absolute http(s) paths qualify. MA serves local files through
+// its own media proxy (proxy_id), which the daemon does not route - those
+// entries yield "" and the card falls back to its placeholder rather than
+// serving a dead link (verified against live 2.10.7 image shapes).
+func maImageURL(img *ma.MediaImage) string {
+	if img == nil || !img.RemotelyAccessible {
+		return ""
+	}
+	p := img.Path
+	if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
+		return p
+	}
+	return ""
+}
+
+// maQueueItemToTrack maps one MA queue item into the shared QueueTrack shape
+// (issue #138). MA pre-composes music-item Names as "Artist(s) - Title" with
+// an optional trailing "(version)" suffix and may simplify the nested artists
+// away, so the real title comes from media_item when present and the artist
+// is recovered by suffix-matching it against the composed name - a naive
+// first-" - " split would corrupt titles that themselves contain " - ".
+func maQueueItemToTrack(q ma.QueueItem) QueueTrack {
+	t := QueueTrack{TrackId: q.QueueItemID}
+
+	if mi := q.MediaItem; mi != nil {
+		t.Uri = mi.URI
+		t.Album = mi.Album
+		title := mi.Name
+		if title == "" {
+			title = maStripVersionSuffix(q.Name, mi.Version)
+		}
+		t.Name = title
+		if len(mi.Artists) > 0 {
+			names := make([]string, 0, len(mi.Artists))
+			for _, a := range mi.Artists {
+				if a.Name != "" {
+					names = append(names, a.Name)
+				}
+			}
+			t.Artist = strings.Join(names, ", ")
+		} else if title != "" {
+			base := maStripVersionSuffix(q.Name, mi.Version)
+			if strings.HasSuffix(base, title) {
+				t.Artist = strings.TrimSuffix(base[:len(base)-len(title)], " - ")
+			} else if i := strings.Index(base, " - "); i > 0 {
+				t.Artist = base[:i]
+			}
+		}
+		if img := maImageURL(q.Image); img != "" {
+			t.ImageUrl = img
+		} else if mi.Image != nil {
+			t.ImageUrl = maImageURL(mi.Image)
+		}
+		return t
+	}
+
+	// no media_item: best-effort parse of the composed name
+	if i := strings.Index(q.Name, " - "); i > 0 {
+		t.Artist = q.Name[:i]
+		t.Name = strings.TrimSpace(q.Name[i+3:])
+	} else {
+		t.Name = q.Name
+	}
+	t.ImageUrl = maImageURL(q.Image)
+	return t
+}
+
+// maStripVersionSuffix removes a trailing "(version)" from a composed queue
+// item name ("A - B (remix)" with version "remix" -> "A - B").
+func maStripVersionSuffix(name, version string) string {
+	if version == "" {
+		return name
+	}
+	suffix := "(" + version + ")"
+	if strings.HasSuffix(name, suffix) {
+		return name[:len(name)-len(suffix)]
+	}
+	return name
+}
+
+// maQueueItemsToTracks maps the upcoming queue (issue #138): capped at
+// QueueLimit like the Connect projection and dropping entries with no usable
+// identity - the UI sanitizer would reject them anyway and the pane keys off
+// track_id/uri.
+func maQueueItemsToTracks(items []ma.QueueItem) []QueueTrack {
+	if len(items) > QueueLimit {
+		items = items[:QueueLimit]
+	}
+	out := make([]QueueTrack, 0, len(items))
+	for i := range items {
+		t := maQueueItemToTrack(items[i])
+		if t.Uri == "" && t.Name == "" {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// MaPlaylist is one entry of GET /ma/playlists (issue #138, pinned contract).
+type MaPlaylist struct {
+	ItemID   string `json:"item_id"`
+	Name     string `json:"name"`
+	URI      string `json:"uri"`
+	ImageURL string `json:"image_url"`
+}
+
+// MaTrack is one entry of GET /ma/playlist-items and GET /ma/recent (issue
+// #135, pinned contract): the shared track-card shape.
+type MaTrack struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	URI        string   `json:"uri"`
+	Album      string   `json:"album,omitempty"`
+	Artists    []string `json:"artists"`
+	DurationMs int64    `json:"duration_ms,omitempty"` // source seconds -> ms
+	Position   int      `json:"position"`              // absolute index in the parent playlist
+	ImageURL   string   `json:"image_url,omitempty"`
+}
+
+// maListPlaylists backs GET /ma/playlists (issue #138, pinned contract):
+// 200 {"playlists":[{item_id,name,uri,image_url}]} - the flattened library
+// playlist list. music/browse "root" yields one folder per provider whose
+// Path ends in "://"; "<path>playlists" holds that provider's playlists, and
+// EVERY playlist - built-in and provider-synced alike - is a LIBRARY item
+// with uri "library://playlist/<id>" (verified live against 2.10.7). A
+// provider without a playlists collection answers its browse with a 500 -
+// that folder is skipped, not an error. EMPTY array when MA is unconfigured
+// or the root browse fails (maListDevices contract).
+func (p *AppPlayer) maListPlaylists(ctx context.Context) (any, error) {
+	playlists := []MaPlaylist{}
+	cfg, _ := p.maResolved()
+	if cfg == nil {
+		return map[string]any{"playlists": playlists}, nil
+	}
+
+	pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
+	defer cancel()
+	client := p.maClientFor(cfg)
+
+	root, err := client.Browse(pctx, "root")
+	if err != nil {
+		p.app.log.Warnf("ma: music/browse root failed: %v", err)
+		return map[string]any{"playlists": playlists}, nil
+	}
+	for _, folder := range root {
+		if !strings.HasSuffix(folder.Path, "://") {
+			continue // not a provider folder (breadcrumbs etc.)
+		}
+		items, err := client.Browse(pctx, folder.Path+"playlists")
+		if err != nil {
+			p.app.log.Debugf("ma: music/browse %splaylists failed: %v", folder.Path, err)
+			continue
+		}
+		for _, it := range items {
+			if it.MediaType != "playlist" || it.URI == "" {
+				continue // back-breadcrumb folders and non-playlists
+			}
+			pl := MaPlaylist{ItemID: it.ItemID, Name: it.Name, URI: it.URI}
+			pl.ImageURL = maPlaylistImage(it)
+			playlists = append(playlists, pl)
+		}
+	}
+	return map[string]any{"playlists": playlists}, nil
+}
+
+// maPlaylistImage picks the UI-fetchable cover of a playlist browse entry:
+// playlist items carry no top-level image - covers live in metadata.images
+// (verified live against 2.10.7) and only remotely accessible absolute
+// entries qualify (maImageURL).
+func maPlaylistImage(it ma.BrowseItem) string {
+	if it.Metadata == nil {
+		return ""
+	}
+	for i := range it.Metadata.Images {
+		if url := maImageURL(&it.Metadata.Images[i]); url != "" {
+			return url
+		}
+	}
+	return ""
+}
+
+// maListPlaylistItems backs GET /ma/playlist-items?id=<library playlist id>
+// (issue #138, pinned contract): 200 {"tracks":[...]} in the shared track
+// card shape, in playlist order (Position is the absolute index). Empty list
+// when MA is unconfigured or the lookup fails.
+func (p *AppPlayer) maListPlaylistItems(ctx context.Context, itemID string) (any, error) {
+	tracks := []MaTrack{}
+	cfg, _ := p.maResolved()
+	if cfg == nil || itemID == "" {
+		return map[string]any{"tracks": tracks}, nil
+	}
+
+	pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
+	defer cancel()
+	items, err := p.maClientFor(cfg).PlaylistTracks(pctx, itemID)
+	if err != nil {
+		p.app.log.Warnf("ma: playlist_tracks %s failed: %v", itemID, err)
+		return map[string]any{"tracks": tracks}, nil
+	}
+	for i := range items {
+		it := &items[i]
+		if it.URI == "" {
+			continue
+		}
+		names := make([]string, 0, len(it.Artists))
+		for _, a := range it.Artists {
+			if a.Name != "" {
+				names = append(names, a.Name)
+			}
+		}
+		t := MaTrack{ID: it.ItemID, Name: it.Name, URI: it.URI, Album: it.Album, Artists: names, Position: it.Position}
+		if it.Duration > 0 {
+			t.DurationMs = int64(it.Duration) * 1000
+		}
+		t.ImageURL = maImageURL(it.Image)
+		tracks = append(tracks, t)
+	}
+	return map[string]any{"tracks": tracks}, nil
+}
+
+// maListRecent backs GET /ma/recent (issue #138, pinned contract): the last
+// N played tracks from MA's play log. The play-log mapping is lightweight -
+// title + artwork only, no artists (MA limitation) - so the UI renders
+// title-only cards for this pane in MA mode. Empty list when unconfigured or
+// unreachable; limit is clamped to 1..50 (the UI asks for 20).
+func (p *AppPlayer) maListRecent(ctx context.Context, limit int) (any, error) {
+	tracks := []MaTrack{}
+	if limit < 1 || limit > 50 {
+		limit = 20
+	}
+	cfg, _ := p.maResolved()
+	if cfg == nil {
+		return map[string]any{"tracks": tracks}, nil
+	}
+
+	pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
+	defer cancel()
+	items, err := p.maClientFor(cfg).RecentlyPlayed(pctx, limit)
+	if err != nil {
+		p.app.log.Warnf("ma: recently_played_items failed: %v", err)
+		return map[string]any{"tracks": tracks}, nil
+	}
+	for i := range items {
+		it := &items[i]
+		t := MaTrack{ID: it.ItemID, Name: it.Name, URI: it.URI, Artists: []string{}}
+		t.ImageURL = maImageURL(it.Image)
+		tracks = append(tracks, t)
+	}
+	return map[string]any{"tracks": tracks}, nil
 }
