@@ -550,7 +550,7 @@ type MaPlaylist struct {
 }
 
 // MaTrack is one entry of GET /ma/playlist-items and GET /ma/recent (issue
-// #135, pinned contract): the shared track-card shape.
+// #138, pinned contract): the shared track-card shape.
 type MaTrack struct {
 	ID         string   `json:"id"`
 	Name       string   `json:"name"`
