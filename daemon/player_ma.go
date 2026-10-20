@@ -93,13 +93,24 @@ func (p *AppPlayer) maControlTarget() (*ma.Client, string, error) {
 }
 
 // maPollTick is the 1/s Music Assistant observer poll (issue #134). Run
-// loop only. When MA mode is off or no player is selected, it releases
-// any state a previous MA session left behind so the Spotify cluster path
-// (or idle) owns remoteState again.
+// loop only. When MA mode is off, it releases state a previous MA session
+// left behind so the Spotify cluster path owns remoteState again. When MA
+// mode is on but no player is selected, it releases state from ANY
+// previous source - the stale-ownership gate below would otherwise keep
+// showing a Spotify session observed before the switch, and the UI would
+// stay on the now-playing screen with the Spotify device list instead of
+// falling back to the idle screen with the MA picker. (issue #134)
 func (p *AppPlayer) maPollTick(ctx context.Context) {
 	cfg, src := p.maResolved()
 	if cfg == nil || src != PlaybackSourceMA || p.maActivePlayerId == "" {
-		if p.maOwnsRemoteState {
+		release := p.maOwnsRemoteState
+		// MA mode is the single source of truth: with no player selected
+		// there is nothing observable, so release foreign (e.g. Spotify)
+		// state even when MA never owned remoteState itself.
+		if src == PlaybackSourceMA {
+			release = true
+		}
+		if release {
 			p.maOwnsRemoteState = false
 			p.clearActiveDevice()
 		}

@@ -253,18 +253,46 @@ func TestMaPollTick_ReleasesStateWhenModeOff(t *testing.T) {
 	}
 }
 
-// TestMaPollTick_NoSelectionKeepsPreviousState: an MA mode without a
-// selected player must not clobber existing state.
-func TestMaPollTick_NoSelectionKeepsPreviousState(t *testing.T) {
+// TestMaPollTick_NoSelectionReleasesForeignState: MA mode is the single
+// source of truth - with no player selected, a stale session observed from
+// another source (a Spotify session active before the switch) must be
+// released on the next tick so the UI falls back to the idle screen with
+// the MA picker instead of staying on the now-playing screen with the
+// Spotify device list. The old ownership-only gate kept exactly that stale
+// state visible indefinitely (issue #134 follow-up).
+func TestMaPollTick_NoSelectionReleasesForeignState(t *testing.T) {
 	t.Parallel()
-	p := newMaTestPlayer(t, maTestSettings("http://h:8095", "ma"))
-	prev := &RemoteState{DeviceId: "spotify-dev-1", TrackUri: "spotify:track:x"}
-	p.state.remoteState = prev // cluster-owned
 
-	p.maPollTick(context.Background())
+	for _, tc := range []struct {
+		name     string
+		settings func() []byte
+		owns     bool
+		wantGone bool
+	}{
+		{"MA mode releases spotify-owned state", func() []byte { return maTestSettings("http://h:8095", "ma") }, false, true},
+		{"MA mode releases MA-owned state too", func() []byte { return maTestSettings("http://h:8095", "ma") }, true, true},
+		{"spotify mode keeps cluster-owned state", func() []byte { return maTestSettings("http://h:8095", "spotify") }, false, false},
+		{"spotify mode releases MA-owned state", func() []byte { return maTestSettings("http://h:8095", "spotify") }, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newMaTestPlayer(t, tc.settings())
+			prev := &RemoteState{DeviceId: "spotify-dev-1", TrackUri: "spotify:track:x"}
+			p.state.remoteState = prev // cluster-owned (or MA-owned per case)
+			p.maOwnsRemoteState = tc.owns
 
-	if p.state.remoteState != prev {
-		t.Error("no-selection tick must leave previous state untouched")
+			p.maPollTick(context.Background())
+
+			if tc.wantGone {
+				if p.state.remoteState != nil {
+					t.Errorf("state must be released, got %+v", p.state.remoteState)
+				}
+				if p.maOwnsRemoteState {
+					t.Error("ownership must be cleared")
+				}
+			} else if p.state.remoteState != prev {
+				t.Error("tick must leave previous state untouched")
+			}
+		})
 	}
 }
 
