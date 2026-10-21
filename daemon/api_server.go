@@ -21,6 +21,8 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
 	"github.com/rs/cors"
+
+	"github.com/devgianlu/go-librespot/ma"
 )
 
 const (
@@ -911,6 +913,77 @@ func writeMaNotReady(w http.ResponseWriter) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": "player session not ready"})
 }
 
+// serveMaPreSession answers the /ma/* content endpoints (devices, playlists,
+// playlist-items, recent) directly from Music Assistant while no player
+// session exists yet (issue #138 round 3, defect B'): after a flash the
+// daemon sits in Spotify device-flow pairing for minutes and Run() - the
+// only consumer of the request channel - starts only after it completes, so
+// these endpoints used to 503 the whole window and the playlist menu took
+// 5-10 minutes to appear. The MA config (url+token) persists in the settings
+// blob across the flash, so a throwaway client serves the same read-only
+// data (maMapDevices/maBrowsePlaylists/maMapPlaylistItems/maMapRecentItems
+// are shared with the post-session handlers). Returns false - the caller
+// writes writeMaNotReady (503 + retry semantics) - when MA is unconfigured,
+// not the active playback source, or the fetch fails.
+func (s *ConcreteApiServer) serveMaPreSession(w http.ResponseWriter, kind, itemID string, limit int) bool {
+	h := s.getSettingsHandler()
+	if h == nil {
+		return false
+	}
+	blob := h.GetSettings()
+	cfg := ParseMaConfig(blob)
+	if cfg == nil || playbackSourceFromSettings(blob) != PlaybackSourceMA {
+		return false
+	}
+
+	client := ma.NewClient(cfg.URL, cfg.Token)
+	timeout := maControlTimeout
+	if kind == "playlists" {
+		timeout = maPlaylistWarmTimeout // a cold browse can outlive the control budget (defect B)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var payload map[string]any
+	switch kind {
+	case "devices":
+		players, err := client.ListPlayers(ctx)
+		if err != nil {
+			s.log.Warnf("ma: pre-session players/all failed: %v", err)
+			return false
+		}
+		payload = map[string]any{"devices": maMapDevices(players)}
+	case "playlists":
+		playlists, err := maBrowsePlaylists(ctx, s.log, client)
+		if err != nil {
+			s.log.Warnf("ma: pre-session playlist browse failed: %v", err)
+			return false
+		}
+		payload = map[string]any{"playlists": playlists}
+	case "playlist-items":
+		items, err := client.PlaylistTracks(ctx, itemID)
+		if err != nil {
+			s.log.Warnf("ma: pre-session playlist_tracks %s failed: %v", itemID, err)
+			return false
+		}
+		payload = map[string]any{"tracks": maMapPlaylistItems(items)}
+	case "recent":
+		items, err := client.RecentlyPlayed(ctx, limit, "")
+		if err != nil {
+			s.log.Warnf("ma: pre-session playlog fetch failed: %v", err)
+			return false
+		}
+		payload = map[string]any{"tracks": maMapRecentItems(items)}
+	default:
+		return false
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	_ = json.NewEncoder(w).Encode(payload)
+	return true
+}
+
 func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter) {
 	// pre-session, nobody is reading the channel yet, fail fast
 	if !s.playerReady.Load() {
@@ -1302,15 +1375,19 @@ func (s *ConcreteApiServer) serve() {
 	})
 	// issue #134: Music Assistant backend - device list + player selection
 	// (pinned contract, see maListDevices/maSelectPlayer). The content
-	// endpoints answer 503 pre-session (writeMaNotReady) so UI clients retry
-	// instead of caching a spurious empty list - issue #138 startup race.
+	// endpoints are SERVED PRE-SESSION when MA is configured (serveMaPreSession,
+	// issue #138 round 3 defect B'): the MA config survives the flash in the
+	// settings blob, so only an unconfigured/unreachable MA answers 503 -
+	// UI clients then retry instead of caching a spurious empty list.
 	m.HandleFunc("/ma/devices", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		// no session yet so no MA config either
 		if !s.playerReady.Load() {
+			if s.serveMaPreSession(w, "devices", "", 0) {
+				return
+			}
 			writeMaNotReady(w)
 			return
 		}
@@ -1334,15 +1411,18 @@ func (s *ConcreteApiServer) serve() {
 	})
 	// issue #138: Music Assistant content menus - playlists, playlist tracks,
 	// recent (pinned contracts, see maListPlaylists & co. in player_ma.go).
-	// Pre-session they answer 503 like the rest of the channel-bound API:
-	// a 200 with an empty list would be cached by the UI as "no content"
-	// (startup race after flash - issue #138).
+	// Like /ma/devices they are served pre-session when MA is configured
+	// (round 3 defect B'); the 503 fallback keeps the UI retrying instead of
+	// caching a spurious empty list (startup race after flash).
 	m.HandleFunc("/ma/playlists", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 		if !s.playerReady.Load() {
+			if s.serveMaPreSession(w, "playlists", "", 0) {
+				return
+			}
 			writeMaNotReady(w)
 			return
 		}
@@ -1359,6 +1439,9 @@ func (s *ConcreteApiServer) serve() {
 			return
 		}
 		if !s.playerReady.Load() {
+			if s.serveMaPreSession(w, "playlist-items", itemID, 0) {
+				return
+			}
 			writeMaNotReady(w)
 			return
 		}
@@ -1374,6 +1457,9 @@ func (s *ConcreteApiServer) serve() {
 			limit = v
 		}
 		if !s.playerReady.Load() {
+			if s.serveMaPreSession(w, "recent", "", limit) {
+				return
+			}
 			writeMaNotReady(w)
 			return
 		}
