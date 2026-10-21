@@ -218,6 +218,25 @@ func (c *Client) PlaylistTracks(ctx context.Context, itemID string) ([]TrackItem
 	return tracks, nil
 }
 
+// AlbumTracks calls music/albums/album_tracks for one album. Album sources
+// of a queue surface with their PROVIDER id + instance (not the library row),
+// hence the explicit provider argument (issue #138). The tracks come back in
+// album order (track number / disc).
+func (c *Client) AlbumTracks(ctx context.Context, itemID, provider string) ([]TrackItem, error) {
+	raw, err := c.Call(ctx, "music/albums/album_tracks", map[string]any{
+		"item_id":                        itemID,
+		"provider_instance_id_or_domain": provider,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var tracks []TrackItem
+	if err := json.Unmarshal(raw, &tracks); err != nil {
+		return nil, fmt.Errorf("ma: decoding album_tracks result for %s/%s: %w", provider, itemID, err)
+	}
+	return tracks, nil
+}
+
 // RecentlyPlayed calls music/recently_played_items (the play log) for track
 // entries only — the log also contains album/artist rows. The mapping is
 // lightweight: name + uri + image, no artist/album metadata (MA 2.10.7

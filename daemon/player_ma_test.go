@@ -133,7 +133,7 @@ func TestApplyMaState_Playing(t *testing.T) {
 	p := newMaTestPlayer(t, nil)
 	pl := maPlayingPlayer()
 
-	p.applyMaState(pl, nil)
+	p.applyMaState(pl, nil, nil)
 
 	rs := p.state.remoteState
 	if rs == nil {
@@ -177,7 +177,7 @@ func TestApplyMaState_Paused(t *testing.T) {
 	pl := maPlayingPlayer()
 	pl.PlaybackState = "paused"
 
-	p.applyMaState(pl, nil)
+	p.applyMaState(pl, nil, nil)
 
 	rs := p.state.remoteState
 	if rs == nil {
@@ -194,14 +194,14 @@ func TestApplyMaState_Paused(t *testing.T) {
 func TestApplyMaState_IdleClearsStaleMedia(t *testing.T) {
 	t.Parallel()
 	p := newMaTestPlayer(t, nil)
-	p.applyMaState(maPlayingPlayer(), nil) // seed a playing state
+	p.applyMaState(maPlayingPlayer(), nil, nil) // seed a playing state
 	if p.state.remoteState == nil {
 		t.Fatal("seed failed")
 	}
 
 	pl := maPlayingPlayer()
 	pl.PlaybackState = "idle" // media intentionally still set (stale)
-	p.applyMaState(pl, nil)
+	p.applyMaState(pl, nil, nil)
 
 	if p.state.remoteState != nil {
 		t.Error("idle poll must clear remoteState")
@@ -218,7 +218,7 @@ func TestApplyMaState_NullMediaClears(t *testing.T) {
 	pl := maPlayingPlayer()
 	pl.CurrentMedia = nil
 
-	p.applyMaState(pl, nil)
+	p.applyMaState(pl, nil, nil)
 	if p.state.remoteState != nil {
 		t.Error("null-media poll must clear remoteState")
 	}
@@ -233,7 +233,7 @@ func TestMaPollTick_ReleasesStateWhenModeOff(t *testing.T) {
 	for _, name := range []string{"source switched to spotify", "ma config removed"} {
 		t.Run(name, func(t *testing.T) {
 			p := newMaTestPlayer(t, maTestSettings("http://h:8095", "ma"))
-			p.applyMaState(maPlayingPlayer(), nil)
+			p.applyMaState(maPlayingPlayer(), nil, nil)
 			if p.state.remoteState == nil {
 				t.Fatal("seed failed")
 			}
@@ -543,73 +543,67 @@ func TestMaSend_VerbRouting(t *testing.T) {
 
 // ---------- issue #138: upcoming-queue mapping, play-uri routing, content endpoints ----------
 
-// TestApplyMaState_Queue pins how the polled upcoming queue lands in the
-// shared RemoteState: mapped entries for the "Läuft gerade" pane and the
-// carry-over on a transient fetch failure.
+// TestApplyMaState_Queue pins how the reconstructed upcoming list lands in
+// the shared RemoteState plus the carry-over on a transient fetch failure
+// (issue #138). The queue response carries NO item list - only source +
+// index - so the reconstruction itself lives in maUpcomingTracks and is
+// tested separately; here the queue argument only decides pass-through vs
+// carry-over.
 func TestApplyMaState_Queue(t *testing.T) {
 	t.Parallel()
 
-	t.Run("queue maps to NextTracks and PrevTracks", func(t *testing.T) {
+	t.Run("upcoming lands in NextTracks and PrevTracks stays empty", func(t *testing.T) {
 		p := newMaTestPlayer(t, nil)
 		q := ma.PlayerQueue{
-			PreviousTrack: &ma.QueueItem{
-				QueueItemID: "qi-prev",
-				Name:        "Artist - Prev",
-				MediaItem:   &ma.TrackItem{URI: "spotify--x://track/prev", Name: "Prev", Artists: []ma.ArtistName{{Name: "Artist"}}},
-			},
-			NextTracks: []ma.QueueItem{
-				{
-					// real 2.10.7 shape: pre-composed name with version
-					// suffix, simplified artists, remote artwork
-					QueueItemID: "qi-1",
-					Name:        "A - One (remix)",
-					MediaItem:   &ma.TrackItem{URI: "spotify--x://track/one", Name: "One", Version: "remix", Artists: []ma.ArtistName{{Name: "A"}, {Name: "B"}}},
-					Image:       &ma.MediaImage{Path: "https://cdn.example/one.jpg", RemotelyAccessible: true},
-				},
-				{
-					// no artists, no " - " in the composed name: title-only
-					QueueItemID: "qi-2",
-					Name:        "Local Song",
-					MediaItem:   &ma.TrackItem{URI: "local://track/song"},
-				},
-			},
+			QueueID:      "wiim_uuid:A",
+			Items:        11,
+			State:        "playing",
+			CurrentIndex: new(int(3)),
+			Sources: []ma.QueueSource{{
+				ItemID:    "61",
+				Provider:  "library",
+				Name:      "257ers",
+				URI:       "library://playlist/61",
+				MediaType: "playlist",
+			}},
 		}
-		p.applyMaState(maPlayingPlayer(), &q)
+		upcoming := []QueueTrack{
+			{TrackId: "4", Uri: "spotify--x://track/one", Name: "One", Artist: "A, B",
+				Album: "The World Is Yours", ImageUrl: "https://cdn.example/one.jpg"},
+			{TrackId: "5", Uri: "local://track/song", Name: "Local Song"},
+		}
+		p.applyMaState(maPlayingPlayer(), &q, upcoming)
 
 		rs := p.state.remoteState
 		if len(rs.NextTracks) != 2 {
 			t.Fatalf("next tracks: got %d want 2", len(rs.NextTracks))
 		}
 		n1 := rs.NextTracks[0]
-		if n1.TrackId != "qi-1" || n1.Uri != "spotify--x://track/one" || n1.Name != "One" || n1.Artist != "A, B" {
+		if n1.TrackId != "4" || n1.Uri != "spotify--x://track/one" || n1.Name != "One" || n1.Artist != "A, B" ||
+			n1.Album != "The World Is Yours" || n1.ImageUrl != "https://cdn.example/one.jpg" {
 			t.Errorf("next 0: %+v", n1)
 		}
-		if n1.ImageUrl != "https://cdn.example/one.jpg" {
-			t.Errorf("next 0 image: %q", n1.ImageUrl)
+		if rs.NextTracks[1].Name != "Local Song" || rs.NextTracks[1].Artist != "" {
+			t.Errorf("next 1: %+v", rs.NextTracks[1])
 		}
-		n2 := rs.NextTracks[1]
-		if n2.Name != "Local Song" || n2.Artist != "" {
-			t.Errorf("next 1: %+v", n2)
-		}
-		if len(rs.PrevTracks) != 1 || rs.PrevTracks[0].TrackId != "qi-prev" || rs.PrevTracks[0].Artist != "Artist" {
-			t.Errorf("prev tracks: %+v", rs.PrevTracks)
+		// MA answers no previous track at all - PrevTracks is empty by design
+		if len(rs.PrevTracks) != 0 {
+			t.Errorf("prev tracks must be empty, got %+v", rs.PrevTracks)
 		}
 	})
 
 	t.Run("nil queue carries the previous list over", func(t *testing.T) {
 		p := newMaTestPlayer(t, nil)
-		q := ma.PlayerQueue{NextTracks: []ma.QueueItem{{
-			QueueItemID: "qi-1", Name: "A - One",
-			MediaItem: &ma.TrackItem{URI: "spotify--x://track/one", Name: "One"},
-		}}}
-		p.applyMaState(maPlayingPlayer(), &q)
+		q := ma.PlayerQueue{State: "playing"}
+		list := []QueueTrack{{TrackId: "4", Uri: "spotify--x://track/one", Name: "One"}}
+		p.applyMaState(maPlayingPlayer(), &q, list)
 
 		// transient player_queues/get failure (queue nil) while media is
 		// still active on the same device: keep the pane, don't blank it
-		p.applyMaState(maPlayingPlayer(), nil)
+		p.applyMaState(maPlayingPlayer(), nil, nil)
 
 		got := p.state.remoteState.NextTracks
-		if len(got) != 1 || got[0].TrackId != "qi-1" {
+		if len(got) != 1 || got[0].TrackId != "4" {
 			t.Errorf("carry-over failed: %+v", got)
 		}
 	})
@@ -620,7 +614,7 @@ func TestApplyMaState_Queue(t *testing.T) {
 		p.state.remoteState = prev // cluster-owned, different device
 		p.maOwnsRemoteState = false
 
-		p.applyMaState(maPlayingPlayer(), nil)
+		p.applyMaState(maPlayingPlayer(), nil, nil)
 
 		if got := p.state.remoteState.NextTracks; len(got) != 0 {
 			t.Errorf("foreign list must not be carried: %+v", got)
@@ -753,7 +747,8 @@ const maTestPlaylistTracks = `[
   {"item_id":"t1","provider":"spotify--yofvZfhZ","name":"Glide","uri":"spotify--x://track/one","media_type":"track","album":"The World Is Yours",
    "artists":[{"name":"NEIKED"},{"name":"Portugal. The Man"}],"duration":184,"position":0,
    "image":{"type":"thumb","path":"https://i.scdn.co/image/a","provider":"spotify--yofvZfhZ","remotely_accessible":true}},
-  {"item_id":"t2","provider":"local","name":"Local Jam","uri":"local://track/jam","media_type":"track","position":1,
+  {"item_id":"t2","provider":"local","name":"Local Jam","uri":"local://track/jam","media_type":"track",
+   "album":{"item_id":"al1","provider":"local","name":"Jam Album","uri":"local://album/la"},"position":1,
    "image":{"type":"thumb","path":"/data/local/jam.jpg","provider":"local","remotely_accessible":false}},
   {"item_id":"t3","provider":"spotify--x","name":"","media_type":"track"}
 ]`
@@ -916,7 +911,8 @@ func TestMaListPlaylistItems(t *testing.T) {
 		if t0.ImageURL != "https://i.scdn.co/image/a" {
 			t.Errorf("track 0 image: %q", t0.ImageURL)
 		}
-		if tracks[1].Name != "Local Jam" || tracks[1].Position != 1 || tracks[1].ImageURL != "" { // local art not served
+		if tracks[1].Name != "Local Jam" || tracks[1].Position != 1 || tracks[1].ImageURL != "" || // local art not served
+			tracks[1].Album != "Jam Album" { // album arrives as an OBJECT on live wire - must decode to its name
 			t.Errorf("track 1: %+v", tracks[1])
 		}
 	})
@@ -1001,4 +997,498 @@ func TestMaListRecent(t *testing.T) {
 			t.Errorf("clamped limit: got %v want 20", args["limit"])
 		}
 	})
+}
+
+// ---------- issue #138 part 2: upcoming reconstruction, group devices, transfer ----------
+
+// maTestGroupPlayersJSON mirrors the live 2.10.7 grouping fields: the master
+// carries every member (itself included) with synced_to null; each slave has
+// an empty member list and points at its master via synced_to; a solo player
+// names only itself.
+const maTestGroupPlayersJSON = `[
+  {"player_id":"wiim_uuid:A","name":"WiiM Wohnzimmer","available":true,"playback_state":"playing",
+   "group_members":["wiim_uuid:A","wiim_uuid:B"],"synced_to":null},
+  {"player_id":"wiim_uuid:B","name":"WiiM Kueche","available":true,"playback_state":"paused",
+   "group_members":[],"synced_to":"wiim_uuid:A"},
+  {"player_id":"solo-1","name":"Solo","available":true,"playback_state":"idle",
+   "group_members":["solo-1"],"synced_to":null}
+]`
+
+// TestMaListDevices_GroupEntry pins the synthetic native-group device
+// (issue #138): one extra entry per MASTER with more than one member, named
+// "<master> (Gruppe)", id "group:<master>"; solo players get none.
+func TestMaListDevices_GroupEntry(t *testing.T) {
+	t.Parallel()
+	srv, _ := newMaContentFakeServer(t, map[string]string{"players/all": maTestGroupPlayersJSON})
+	p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+
+	payload, err := p.maListDevices(context.Background())
+	if err != nil {
+		t.Fatalf("maListDevices: %v", err)
+	}
+	devs := devicesFromPayload(t, payload)
+	if len(devs) != 4 { // 3 players + 1 group entry
+		t.Fatalf("want 4 devices, got %d: %+v", len(devs), devs)
+	}
+	g := devs[3]
+	if g.Id != "group:wiim_uuid:A" || g.Name != "WiiM Wohnzimmer (Gruppe)" || !g.Available {
+		t.Errorf("group entry: %+v", g)
+	}
+}
+
+// TestMaSelectPlayer_Resolution pins the selection canonicalization
+// (issue #138): the synthetic group id and a firmware-synced slave both
+// resolve to the group MASTER; unknown ids stay 400. Without an existing
+// selection nothing is transferred - only players/all may be sent.
+func TestMaSelectPlayer_Resolution(t *testing.T) {
+	t.Parallel()
+	routes := map[string]string{"players/all": maTestGroupPlayersJSON}
+
+	t.Run("group id resolves to the master", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+
+		payload, err := p.maSelectPlayer(context.Background(), "group:wiim_uuid:A")
+		if err != nil {
+			t.Fatalf("maSelectPlayer: %v", err)
+		}
+		if m, ok := payload.(map[string]any); !ok || m["ok"] != true {
+			t.Errorf("payload: %+v", payload)
+		}
+		if p.maActivePlayerId != "wiim_uuid:A" {
+			t.Errorf("selection must resolve to the master, got %q", p.maActivePlayerId)
+		}
+		assertOnlyCommands(t, *envs, []string{"players/all"})
+	})
+
+	t.Run("synced slave resolves to the master", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+
+		if _, err := p.maSelectPlayer(context.Background(), "wiim_uuid:B"); err != nil {
+			t.Fatalf("maSelectPlayer: %v", err)
+		}
+		if p.maActivePlayerId != "wiim_uuid:A" {
+			t.Errorf("selection must resolve to the master, got %q", p.maActivePlayerId)
+		}
+		assertOnlyCommands(t, *envs, []string{"players/all"})
+	})
+
+	t.Run("unknown id is a bad request", func(t *testing.T) {
+		srv, _ := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		if _, err := p.maSelectPlayer(context.Background(), "group:does-not-exist"); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("want ErrBadRequest, got %v", err)
+		}
+	})
+}
+
+// maTestQueuePlayingPlaylist is the live 2.10.7 player_queues/get shape: no
+// item list - only count, index, state, current/next item and sources.
+const maTestQueuePlayingPlaylist = `{
+  "queue_id":"wiim_uuid:A","items":3,"current_index":0,"state":"playing",
+  "current_item":{"queue_item_id":"qi-1","name":"NEIKED - Glide",
+    "media_item":{"item_id":"item-1","name":"Glide","uri":"spotify--x://track/abc","album":"The World Is Yours"}},
+  "sources":[{"item_id":"61","provider":"library","name":"257ers",
+    "uri":"library://playlist/61","media_type":"playlist"}]
+}`
+
+// maTestQueuePlayingSingle is a single-item queue: no sources, the current
+// track URI is all there is to replay.
+const maTestQueuePlayingSingle = `{
+  "queue_id":"wiim_uuid:A","items":1,"current_index":0,"state":"playing",
+  "current_item":{"queue_item_id":"qi-9","name":"NEIKED - Glide",
+    "media_item":{"item_id":"item-9","name":"Glide","uri":"spotify--x://track/abc"}}
+}`
+
+// TestMaTransferPlayback pins the user-approved transfer semantics
+// (issue #138): selecting a DIFFERENT target while the old one plays moves
+// the music - replay the same source on the new player from the current
+// track, then pause the old one. Nothing playing = plain re-target; a
+// failed replay aborts the selection and keeps the old target.
+func TestMaTransferPlayback(t *testing.T) {
+	t.Parallel()
+
+	t.Run("playing playlist queue moves to the new target", func(t *testing.T) {
+		routes := map[string]string{"players/all": maTestGroupPlayersJSON, "player_queues/get": maTestQueuePlayingPlaylist, "player_queues/play_media": `{}`}
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		p.maActivePlayerId = "wiim_uuid:A"
+
+		if _, err := p.maSelectPlayer(context.Background(), "solo-1"); err != nil {
+			t.Fatalf("maSelectPlayer: %v", err)
+		}
+		if p.maActivePlayerId != "solo-1" {
+			t.Errorf("selection: %q", p.maActivePlayerId)
+		}
+		assertOnlyCommands(t, *envs, []string{"players/all", "player_queues/get", "player_queues/play_media", "players/cmd/pause"})
+
+		pm := envArgs(t, *envs, "player_queues/play_media")
+		if pm["queue_id"] != "solo-1" || pm["option"] != ma.QueueOptionReplace {
+			t.Errorf("play_media args: %+v", pm)
+		}
+		media, _ := pm["media"].([]any)
+		if len(media) != 1 || media[0] != "library://playlist/61" {
+			t.Errorf("media must be the full source: %v", pm["media"])
+		}
+		if pm["start_item"] != "item-1" {
+			t.Errorf("start_item must be the current track: %v", pm["start_item"])
+		}
+		pause := envArgs(t, *envs, "players/cmd/pause")
+		if pause["player_id"] != "wiim_uuid:A" {
+			t.Errorf("pause args: %+v", pause)
+		}
+	})
+
+	t.Run("single-item queue replays the bare track uri", func(t *testing.T) {
+		routes := map[string]string{"players/all": maTestGroupPlayersJSON, "player_queues/get": maTestQueuePlayingSingle, "player_queues/play_media": `{}`}
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		p.maActivePlayerId = "wiim_uuid:A"
+
+		if _, err := p.maSelectPlayer(context.Background(), "solo-1"); err != nil {
+			t.Fatalf("maSelectPlayer: %v", err)
+		}
+		pm := envArgs(t, *envs, "player_queues/play_media")
+		media, _ := pm["media"].([]any)
+		if len(media) != 1 || media[0] != "spotify--x://track/abc" {
+			t.Errorf("media must be the bare track uri: %v", pm["media"])
+		}
+		if _, ok := pm["start_item"]; ok {
+			t.Errorf("no start_item expected for a single-item queue: %+v", pm)
+		}
+	})
+
+	t.Run("idle queue is a plain re-target", func(t *testing.T) {
+		routes := map[string]string{
+			"players/all":       maTestGroupPlayersJSON,
+			"player_queues/get": `{"queue_id":"wiim_uuid:A","items":0,"state":"idle"}`,
+		}
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		p.maActivePlayerId = "wiim_uuid:A"
+
+		if _, err := p.maSelectPlayer(context.Background(), "solo-1"); err != nil {
+			t.Fatalf("maSelectPlayer: %v", err)
+		}
+		if p.maActivePlayerId != "solo-1" {
+			t.Errorf("selection: %q", p.maActivePlayerId)
+		}
+		assertOnlyCommands(t, *envs, []string{"players/all", "player_queues/get"}) // no play_media, no pause
+	})
+
+	t.Run("re-selecting the same resolved target does not transfer", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, map[string]string{"players/all": maTestGroupPlayersJSON})
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		p.maActivePlayerId = "wiim_uuid:A" // master of the group
+
+		// tapping the slave (or its group entry) resolves to the SAME master:
+		// the music must keep playing untouched
+		if _, err := p.maSelectPlayer(context.Background(), "wiim_uuid:B"); err != nil {
+			t.Fatalf("maSelectPlayer: %v", err)
+		}
+		assertOnlyCommands(t, *envs, []string{"players/all"})
+	})
+
+	t.Run("failed replay aborts the selection and keeps the old target", func(t *testing.T) {
+		routes := map[string]string{"players/all": maTestGroupPlayersJSON, "player_queues/get": maTestQueuePlayingPlaylist}
+		srv, _ := newMaRecordingServer(t, routes) // play_media unrouted -> 500
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		p.maActivePlayerId = "wiim_uuid:A"
+
+		_, err := p.maSelectPlayer(context.Background(), "solo-1")
+		if err == nil {
+			t.Fatal("failed replay must error")
+		}
+		if errors.Is(err, ErrBadRequest) {
+			t.Errorf("a server failure must not look like a client-side 400: %v", err)
+		}
+		if p.maActivePlayerId != "wiim_uuid:A" {
+			t.Errorf("old selection must be kept, got %q", p.maActivePlayerId)
+		}
+	})
+}
+
+// TestMaUpcomingTracks pins the queue-tail reconstruction (issue #138):
+// single-source queue -> everything after the current track in source order,
+// TrackId = absolute queue index (the play_index target); cache per (source,
+// current track); shuffle/multi-source -> honest empty; fetch failure keeps
+// the last good list.
+func TestMaUpcomingTracks(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	routes := map[string]string{"music/playlists/playlist_tracks": maTestPlaylistTracks}
+
+	clientOf := func(p *AppPlayer) *ma.Client {
+		cfg, _ := p.maResolved()
+		return p.maClientFor(cfg)
+	}
+	playlistQueue := func(shuffle bool, sources int) *ma.PlayerQueue {
+		srcs := []ma.QueueSource{{ItemID: "61", Provider: "library", Name: "257ers", URI: "library://playlist/61", MediaType: "playlist"}}
+		if sources == 2 {
+			srcs = append(srcs, ma.QueueSource{ItemID: "tX", Provider: "spotify--x", Name: "Solo", URI: "spotify--x://track/solo", MediaType: "track"})
+		}
+		return &ma.PlayerQueue{CurrentIndex: new(int(0)), ShuffleEnabled: shuffle, Sources: srcs}
+	}
+
+	t.Run("queue tail after the current track with queue-index TrackIds", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		pl := maPlayingPlayer() // CurrentMedia uri = t1 (index 0)
+
+		got := p.maUpcomingTracks(ctx, clientOf(p), pl, playlistQueue(false, 1))
+
+		// t2 "Local Jam" survives; t3 (no uri, no name) is dropped
+		if len(got) != 1 {
+			t.Fatalf("want 1 upcoming track, got %d: %+v", len(got), got)
+		}
+		g := got[0]
+		if g.TrackId != "1" || g.Uri != "local://track/jam" || g.Name != "Local Jam" || g.ImageUrl != "" {
+			t.Errorf("upcoming 0: %+v", g)
+		}
+		calls := 0
+		for _, e := range *envs {
+			if e["command"] == "music/playlists/playlist_tracks" {
+				calls++
+			}
+		}
+		if calls != 1 {
+			t.Errorf("playlist_tracks calls: got %d want 1", calls)
+		}
+	})
+
+	t.Run("caches per (source, current track)", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		pl := maPlayingPlayer()
+		q := playlistQueue(false, 1)
+		first := p.maUpcomingTracks(ctx, clientOf(p), pl, q)
+
+		got := p.maUpcomingTracks(ctx, clientOf(p), pl, q)
+		if len(got) != len(first) {
+			t.Fatalf("cache hit changed the list: %v -> %v", first, got)
+		}
+		calls := 0
+		for _, e := range *envs {
+			if e["command"] == "music/playlists/playlist_tracks" {
+				calls++
+			}
+		}
+		if calls != 1 {
+			t.Errorf("second poll must not re-fetch, got %d calls", calls)
+		}
+	})
+
+	t.Run("track change recomputes the tail", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		pl := maPlayingPlayer()
+		q := playlistQueue(false, 1)
+		_ = p.maUpcomingTracks(ctx, clientOf(p), pl, q) // t1 -> fetch #1
+
+		pl.CurrentMedia.URI = "local://track/jam" // t2 is now current: tail = [t3] -> dropped -> empty
+		got := p.maUpcomingTracks(ctx, clientOf(p), pl, q)
+		if len(got) != 0 {
+			t.Errorf("tail after the second-to-last track must be empty, got %+v", got)
+		}
+		calls := 0
+		for _, e := range *envs {
+			if e["command"] == "music/playlists/playlist_tracks" {
+				calls++
+			}
+		}
+		if calls != 2 {
+			t.Errorf("track change must re-fetch, got %d calls", calls)
+		}
+	})
+
+	t.Run("shuffle on yields empty without fetching", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		got := p.maUpcomingTracks(ctx, clientOf(p), maPlayingPlayer(), playlistQueue(true, 1))
+		if len(got) != 0 {
+			t.Errorf("shuffled queue must be empty, got %+v", got)
+		}
+		if len(*envs) != 0 {
+			t.Errorf("no command may be sent for a shuffled queue: %v", *envs)
+		}
+	})
+
+	t.Run("multi-source queue yields empty without fetching", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		got := p.maUpcomingTracks(ctx, clientOf(p), maPlayingPlayer(), playlistQueue(false, 2))
+		if len(got) != 0 {
+			t.Errorf("multi-source queue must be empty, got %+v", got)
+		}
+		if len(*envs) != 0 {
+			t.Errorf("no command may be sent for a mixed queue: %v", *envs)
+		}
+	})
+
+	t.Run("fetch failure keeps the last good list", func(t *testing.T) {
+		srv, _ := newMaRecordingServer(t, nil) // playlist_tracks unrouted -> 500
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		pl := maPlayingPlayer()
+		q := playlistQueue(false, 1)
+		// prime the cache as a previous successful poll would have
+		p.maUpcomingKey = "library://playlist/61|spotify--x://track/one"
+		p.maUpcomingCached = []QueueTrack{{TrackId: "1", Uri: "local://track/jam", Name: "Local Jam"}}
+
+		got := p.maUpcomingTracks(ctx, clientOf(p), pl, q)
+		if len(got) != 1 || got[0].Name != "Local Jam" {
+			t.Errorf("failure must keep the last good list, got %+v", got)
+		}
+	})
+
+	t.Run("album source calls album_tracks with provider args", func(t *testing.T) {
+		albumRoutes := map[string]string{"music/albums/album_tracks": `[
+		  {"item_id":"at1","name":"A-One","uri":"spotify--x://track/aa","media_type":"track",
+		   "album":{"name":"The Album"},"position":0},
+		  {"item_id":"at2","name":"A-Two","uri":"spotify--x://track/bb","media_type":"track",
+		   "album":{"name":"The Album"},"position":1}
+		]`}
+		srv, envs := newMaRecordingServer(t, albumRoutes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		pl := maPlayingPlayer()
+		pl.CurrentMedia.URI = "spotify--x://track/aa" // at1 current -> tail [A-Two]
+		q := &ma.PlayerQueue{
+			CurrentIndex: new(int(0)),
+			Sources:      []ma.QueueSource{{ItemID: "al9", Provider: "spotify--x", Name: "The Album", URI: "spotify--x://album/al9", MediaType: "album"}},
+		}
+
+		got := p.maUpcomingTracks(ctx, clientOf(p), pl, q)
+
+		if len(got) != 1 || got[0].Name != "A-Two" || got[0].TrackId != "1" || got[0].Album != "The Album" {
+			t.Errorf("album tail: %+v", got)
+		}
+		args := envArgs(t, *envs, "music/albums/album_tracks")
+		if args["item_id"] != "al9" || args["provider_instance_id_or_domain"] != "spotify--x" {
+			t.Errorf("album_tracks args: %+v", args)
+		}
+	})
+}
+
+// TestMaTrackItem_AlbumShapes pins the RC4 wire-shape regression (issue
+// #138): MA 2.10.7 sends the track album as an OBJECT in playlist/queue media
+// payloads and as a plain string elsewhere - one batch may mix both, and a
+// single object-shaped field used to break the ENTIRE unmarshal of the list.
+func TestMaTrackItem_AlbumShapes(t *testing.T) {
+	t.Parallel()
+	batch := `[
+	  {"item_id":"t1","name":"Glide","uri":"spotify--x://track/one",
+	   "album":"The World Is Yours","artists":[{"name":"NEIKED"}],"position":0,
+	   "image":{"type":"thumb","path":"https://i.scdn.co/image/a","provider":"p","remotely_accessible":true}},
+	  {"item_id":"t2","name":"Cobalt","uri":"spotify--x://track/two","position":1,
+	   "album":{"item_id":"al1","name":"Polychrome","uri":"spotify--x://album/al1"},
+	   "metadata":{"images":[{"type":"thumb","path":"https://i.scdn.co/image/b","provider":"p","remotely_accessible":true}]}}
+	]`
+	var tr []ma.TrackItem
+	if err := json.Unmarshal([]byte(batch), &tr); err != nil {
+		t.Fatalf("mixed album shapes must decode: %v", err)
+	}
+	if len(tr) != 2 {
+		t.Fatalf("want 2 tracks, got %d", len(tr))
+	}
+	if tr[0].Album.Name() != "The World Is Yours" {
+		t.Errorf("string album: %q", tr[0].Album.Name())
+	}
+	if tr[1].Album.Name() != "Polychrome" {
+		t.Errorf("object album must decode to its name, got %q", tr[1].Album.Name())
+	}
+	// cover: top-level image first, metadata.images as fallback
+	if url := maImageURL(tr[0].Cover()); url != "https://i.scdn.co/image/a" {
+		t.Errorf("top-level cover: %q", url)
+	}
+	if url := maImageURL(tr[1].Cover()); url != "https://i.scdn.co/image/b" {
+		t.Errorf("metadata cover: %q", url)
+	}
+}
+
+// TestMaPollTick_GroupSelfHeal pins the observer self-heal (issue #138): if
+// the selected player becomes a firmware slave during polling (HA formed the
+// WiiM group around playback), the next tick retargets to its master before
+// touching the queue or applying any state.
+func TestMaPollTick_GroupSelfHeal(t *testing.T) {
+	t.Parallel()
+	slave := `{
+	  "player_id":"wiim_uuid:A","name":"WiiM Kueche","available":true,"playback_state":"playing",
+	  "group_members":[],"synced_to":"wiim_uuid:M"
+	}`
+	srv, envs := newMaRecordingServer(t, map[string]string{"players/get": slave})
+	p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+	p.maActivePlayerId = "wiim_uuid:A"
+
+	p.maPollTick(context.Background())
+
+	if p.maActivePlayerId != "wiim_uuid:M" {
+		t.Errorf("tick must retarget to the master, got %q", p.maActivePlayerId)
+	}
+	assertOnlyCommands(t, *envs, []string{"players/get"}) // no queue fetch on the heal tick
+	if p.state.remoteState != nil {
+		t.Errorf("heal tick must not apply state, got %+v", p.state.remoteState)
+	}
+}
+
+// ---------- helpers for the part-2 tests ----------
+
+// newMaRecordingServer routes canned per-command responses and records every
+// request envelope in order; unrouted commands answer 500 (like a provider
+// without that collection live).
+func newMaRecordingServer(t *testing.T, routes map[string]string) (*httptest.Server, *[]map[string]any) {
+	t.Helper()
+	envs := []map[string]any{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var env map[string]any
+		_ = json.Unmarshal(b, &env)
+		key, _ := env["command"].(string)
+		if key == "music/browse" {
+			args, _ := env["args"].(map[string]any)
+			path, _ := args["path"].(string)
+			key = "music/browse@" + path
+		}
+		envs = append(envs, env)
+		if body, ok := routes[key]; ok {
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &envs
+}
+
+func envCommands(envs []map[string]any) []string {
+	out := make([]string, 0, len(envs))
+	for _, e := range envs {
+		c, _ := e["command"].(string)
+		out = append(out, c)
+	}
+	return out
+}
+
+func assertOnlyCommands(t *testing.T, envs []map[string]any, want []string) {
+	t.Helper()
+	got := envCommands(envs)
+	if len(got) != len(want) {
+		t.Fatalf("commands: got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("command %d: got %q want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func envArgs(t *testing.T, envs []map[string]any, command string) map[string]any {
+	t.Helper()
+	for _, e := range envs {
+		if c, _ := e["command"].(string); c == command {
+			args, _ := e["args"].(map[string]any)
+			return args
+		}
+	}
+	t.Fatalf("command %q never sent (got %v)", command, envCommands(envs))
+	return nil
 }
