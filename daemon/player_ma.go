@@ -448,36 +448,29 @@ func (p *AppPlayer) maResolvePlayerID(id string, players []ma.Player) string {
 
 // maTransferPlayback moves the active playback from oldPlayerID to
 // newPlayerID (issue #138, user-approved transfer semantics - "like
-// Spotify Connect"): it replays the SAME source on the new player starting
-// at the current track, then pauses the old one. The source comes from the
-// old queue's sources[] + current item; a queue without a usable source
-// (single-item playback) falls back to the bare current track URI. "Nothing
-// playing" (idle / no media) is a plain re-target no-op. PlayMedia failure
-// aborts the selection (the caller returns the error and keeps the old
-// target); Pause failure only logs - the music already moved.
+// Spotify Connect"). It delegates the whole job to MA's native
+// player_queues/transfer: that command ungroups a grouped/synced TARGET
+// first (the WiiM case that killed the old hand-rolled replay with 500s -
+// play_media into a grouped queue has no defined behavior), copies the FULL
+// queue (items, sources, repeat/shuffle/crossfade/autoplay state) and
+// resumes on the target at the saved position only when the source was
+// playing. "Nothing playing" (idle / no media) is a plain re-target no-op.
+// A failed transfer aborts the selection (the caller returns the error and
+// keeps the old target).
 func (p *AppPlayer) maTransferPlayback(ctx context.Context, client *ma.Client, oldPlayerID, newPlayerID string) error {
 	q, err := client.GetQueue(ctx, oldPlayerID)
 	if err != nil {
 		p.app.log.Debugf("ma: transfer: queue get %s failed: %v (treating as idle)", oldPlayerID, err)
 		return nil // not observable = nothing active: plain re-target
 	}
-	if q == nil || q.State == "idle" || q.CurrentItem == nil || q.CurrentItem.MediaItem == nil {
+	if q == nil || q.State == "idle" || (q.CurrentItem == nil && q.Items == 0) {
 		return nil
 	}
-	cur := q.CurrentItem.MediaItem
-	mediaURI, startItem := cur.URI, ""
-	if len(q.Sources) == 1 && q.Sources[0].URI != "" {
-		mediaURI = q.Sources[0].URI // replay the full source, not a single track
-		startItem = cur.ItemID      // MA's resolver matches item_id or uri exactly (2.10.7)
-	}
-	if err := client.PlayMedia(ctx, newPlayerID, mediaURI, startItem); err != nil {
-		p.app.log.Warnf("ma: transfer to %s failed: %v", newPlayerID, err)
+	if err := client.TransferQueue(ctx, oldPlayerID, newPlayerID); err != nil {
+		p.app.log.Warnf("ma: transfer %s -> %s failed: %v", oldPlayerID, newPlayerID, err)
 		return fmt.Errorf("could not move playback to the new device")
 	}
-	if err := client.Pause(ctx, oldPlayerID); err != nil {
-		p.app.log.Warnf("ma: transfer: pausing %s failed: %v", oldPlayerID, err)
-	}
-	p.app.log.Infof("ma: moved playback from %s to %s (%s)", oldPlayerID, newPlayerID, mediaURI)
+	p.app.log.Infof("ma: moved active playback from %s to %s (MA queue transfer)", oldPlayerID, newPlayerID)
 	return nil
 }
 
@@ -593,10 +586,12 @@ func (p *AppPlayer) maSend(ctx context.Context, verb string, data any) error {
 		// resume carries Spotify Connect semantics ("keep playing on the
 		// target device"); play may also carry a URI from /player/play
 		// (tapped item) and routes to the queue commands instead (issue #138):
-		// maPlayUri. On an IDLE MA player, both fall back into plain resume -
-		// which replays the PARKED queue position (item 0 on an ended queue),
-		// NOT necessarily the song the UI is showing (issue #138 defect A):
-		// the now-playing play button promises "the displayed track plays".
+		// maPlayUri. On an IDLE MA player, both ask MA for its own resume -
+		// after a hard stop that continues the parked current_item at the
+		// saved resume_pos (NOT from 0), item 0 on an ended queue, first item
+		// when there is no current item; only if the queue is empty does it
+		// fall back to replaying the track the UI shows (issue #138 round 3,
+		// defect A').
 		if verb == "play" {
 			play, _ := data.(ApiRequestDataPlay)
 			if play.Uri != "" {
@@ -605,18 +600,19 @@ func (p *AppPlayer) maSend(ctx context.Context, verb string, data any) error {
 			}
 		}
 		if p.maIsIdle() {
-			callErr = p.maResumeDisplayed(pctx, client, playerID)
+			callErr = p.maResumeStopped(pctx, client, playerID)
 		} else {
 			callErr = client.Play(pctx, playerID)
 		}
 	case "pause":
 		callErr = client.Pause(pctx, playerID)
 	case "playpause":
-		// defect A: idle + play_pause would resume the parked position again -
-		// replay the displayed track instead; a PAUSED player keeps the normal
-		// toggle (resume-from-pause-position IS the shown track there).
+		// idle + play_pause resumes via maResumeStopped (MA-native parked
+		// position first, displayed-track replay as fallback); a PAUSED
+		// player keeps the normal toggle (resume-from-pause-position IS the
+		// shown track there).
 		if p.maIsIdle() {
-			callErr = p.maResumeDisplayed(pctx, client, playerID)
+			callErr = p.maResumeStopped(pctx, client, playerID)
 		} else {
 			callErr = client.PlayPause(pctx, playerID)
 		}
@@ -687,13 +683,31 @@ func (p *AppPlayer) maIsIdle() bool {
 	return p.maLastPlaybackState == "idle"
 }
 
+// maResumeStopped resumes playback on an IDLE MA player (issue #138 round 3,
+// defect A'): it asks MA for its OWN resume, which after a hard stop
+// continues the parked current_item at the saved resume_pos - live-verified
+// on 2.10.7: _handle_stop stores corrected_elapsed_time in queue.resume_pos
+// and keeps current_item, so play-after-stop resumes mid-song instead of
+// restarting it (the old play_index/play_media replay started every song at
+// 0 by construction). An ended queue restarts item 0 and a queue without a
+// current item starts at its first/next entry - both MA-native semantics.
+// Only when the native resume fails (empty queue = QueueEmpty, unreachable
+// server, ...) does it fall back to replaying the track the UI shows
+// (maResumeDisplayed) - keeping the legacy defect-A behavior as a safety net.
+func (p *AppPlayer) maResumeStopped(ctx context.Context, client *ma.Client, playerID string) error {
+	if err := client.Resume(ctx, playerID); err == nil {
+		return nil
+	} else {
+		p.app.log.Debugf("ma: queue resume for %s failed: %v - replaying the displayed track", playerID, err)
+	}
+	return p.maResumeDisplayed(ctx, client, playerID)
+}
+
 // maResumeDisplayed replays the track the UI is currently SHOWING on an idle
-// MA player (issue #138 defect A): the now-playing screen after a stop shows
-// maIdleLastTrack (last live observation or per-queue playlog), while MA's
-// plain resume restarts the queue's PARKED position - item 0 on an ended
-// queue, otherwise whatever current_index points at. The two diverge
-// (verified live: a 27-item autoplay web queue whose parked index does not
-// match the displayed track). Order of attempts:
+// MA player - the FALLBACK of maResumeStopped for when MA's native resume
+// fails (issue #138 defect A / round 3 A'). After a stop the shown track is
+// maIdleLastTrack (last live observation or per-queue playlog); the replay
+// order:
 //  1. shown track is in the LIVE queue -> play_index onto it: the rest of
 //     the queue survives a mid-queue stop (mid-list autoplay additions etc.);
 //  2. not in the queue (ended/stale) -> play_media with the single shown
@@ -722,10 +736,9 @@ func (p *AppPlayer) maResumeDisplayed(ctx context.Context, client *ma.Client, pl
 // 200 {"devices":[...]} from players/all; an EMPTY array - never an error -
 // when MA is unconfigured or unreachable.
 func (p *AppPlayer) maListDevices(ctx context.Context) (any, error) {
-	devs := []MaDevice{}
 	cfg, _ := p.maResolved()
 	if cfg == nil {
-		return map[string]any{"devices": devs}, nil
+		return map[string]any{"devices": []MaDevice{}}, nil
 	}
 
 	pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
@@ -733,22 +746,9 @@ func (p *AppPlayer) maListDevices(ctx context.Context) (any, error) {
 	players, err := p.maClientFor(cfg).ListPlayers(pctx)
 	if err != nil {
 		p.app.log.Warnf("ma: players/all failed: %v", err)
-		return map[string]any{"devices": devs}, nil
+		return map[string]any{"devices": []MaDevice{}}, nil
 	}
-	for _, pl := range players {
-		devs = append(devs, MaDevice{Id: pl.PlayerID, Name: pl.Name, Available: pl.Available})
-	}
-	// issue #138: one synthetic entry per native (firmware-level) group -
-	// the MASTER with more than one member. Selecting it resolves to the
-	// master whose WiiM firmware mirrors playback to the slaves natively;
-	// HA's group-formation automation keeps the group alive around playback
-	// exactly like the Spotify flow (deliberately NOT an MA virtual group).
-	for _, pl := range players {
-		if len(pl.GroupMembers) > 1 {
-			devs = append(devs, MaDevice{Id: maGroupIDPrefix + pl.PlayerID, Name: pl.Name + " (Gruppe)", Available: pl.Available})
-		}
-	}
-	return map[string]any{"devices": devs}, nil
+	return map[string]any{"devices": maMapDevices(players)}, nil
 }
 
 // maSelectPlayer backs POST /ma/player/select (issue #134 + #138, pinned
@@ -756,12 +756,12 @@ func (p *AppPlayer) maListDevices(ctx context.Context) (any, error) {
 // "group:<master>" name of the synthetic native-group entry, or an id that
 // is currently synced to a firmware master (resolves to the master) - else
 // 400. MA must be configured (else 400). Picking a DIFFERENT target than
-// the current selection TRANSFERS the active playback there (replay the
-// same source from the current track + pause the old player; user-approved
-// "Spotify Connect" semantics); picking while nothing plays is a plain
-// re-target. On success it persists the RESOLVED id the same way the daemon
-// remembers the last Spotify device (in-memory per session): the next poll
-// tick observes it within ~1s.
+// the current selection TRANSFERS the active playback there with MA's own
+// player_queues/transfer (see maTransferPlayback; user-approved "Spotify
+// Connect" semantics); picking while nothing plays is a plain re-target. On
+// success it persists the RESOLVED id the same way the daemon remembers the
+// last Spotify device (in-memory per session): the next poll tick observes
+// it within ~1s.
 func (p *AppPlayer) maSelectPlayer(ctx context.Context, playerID string) (any, error) {
 	cfg, _ := p.maResolved()
 	if cfg == nil {
@@ -974,38 +974,11 @@ func (p *AppPlayer) maListPlaylists(ctx context.Context) (any, error) {
 // maFetchPlaylists runs the root + per-provider playlist browse on the given
 // context. Shared by the request path (maControlTimeout budget) and the
 // background warmup (its own budget) - see maListPlaylists for the wire facts.
+// The browse itself lives in maBrowsePlaylists (ma_content.go) so the
+// pre-session API serve (issue #138 round 3, defect B') runs the exact same
+// sequence.
 func (p *AppPlayer) maFetchPlaylists(ctx context.Context, client *ma.Client) ([]MaPlaylist, error) {
-	root, err := client.Browse(ctx, "root")
-	if err != nil {
-		p.app.log.Warnf("ma: music/browse root failed: %v", err)
-		return nil, fmt.Errorf("music assistant playlist browse failed: %w", err)
-	}
-	playlists := []MaPlaylist{}
-	folders, failedFolders := 0, 0
-	for _, folder := range root {
-		if !strings.HasSuffix(folder.Path, "://") {
-			continue // not a provider folder (breadcrumbs etc.)
-		}
-		folders++
-		items, err := client.Browse(ctx, folder.Path+"playlists")
-		if err != nil {
-			p.app.log.Debugf("ma: music/browse %splaylists failed: %v", folder.Path, err)
-			failedFolders++
-			continue
-		}
-		for _, it := range items {
-			if it.MediaType != "playlist" || it.URI == "" {
-				continue // back-breadcrumb folders and non-playlists
-			}
-			pl := MaPlaylist{ItemID: it.ItemID, Name: it.Name, URI: it.URI}
-			pl.ImageURL = maPlaylistImage(it)
-			playlists = append(playlists, pl)
-		}
-	}
-	if folders > 0 && failedFolders == folders {
-		return nil, fmt.Errorf("music assistant playlist browse failed for all %d providers", folders)
-	}
-	return playlists, nil
+	return maBrowsePlaylists(ctx, p.app.log, client)
 }
 
 // maMaybeWarmPlaylists refreshes the playlist cache in the BACKGROUND when it
@@ -1080,10 +1053,9 @@ func maPlaylistImage(it ma.BrowseItem) string {
 // card shape, in playlist order (Position is the absolute index). Empty list
 // when MA is unconfigured or the lookup fails.
 func (p *AppPlayer) maListPlaylistItems(ctx context.Context, itemID string) (any, error) {
-	tracks := []MaTrack{}
 	cfg, _ := p.maResolved()
 	if cfg == nil || itemID == "" {
-		return map[string]any{"tracks": tracks}, nil
+		return map[string]any{"tracks": []MaTrack{}}, nil
 	}
 
 	pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
@@ -1091,27 +1063,9 @@ func (p *AppPlayer) maListPlaylistItems(ctx context.Context, itemID string) (any
 	items, err := p.maClientFor(cfg).PlaylistTracks(pctx, itemID)
 	if err != nil {
 		p.app.log.Warnf("ma: playlist_tracks %s failed: %v", itemID, err)
-		return map[string]any{"tracks": tracks}, nil
+		return map[string]any{"tracks": []MaTrack{}}, nil
 	}
-	for i := range items {
-		it := &items[i]
-		if it.URI == "" {
-			continue
-		}
-		names := make([]string, 0, len(it.Artists))
-		for _, a := range it.Artists {
-			if a.Name != "" {
-				names = append(names, a.Name)
-			}
-		}
-		t := MaTrack{ID: it.ItemID, Name: it.Name, URI: it.URI, Album: it.Album.Name(), Artists: names, Position: it.Position}
-		if it.Duration > 0 {
-			t.DurationMs = int64(it.Duration) * 1000
-		}
-		t.ImageURL = maImageURL(it.Cover())
-		tracks = append(tracks, t)
-	}
-	return map[string]any{"tracks": tracks}, nil
+	return map[string]any{"tracks": maMapPlaylistItems(items)}, nil
 }
 
 // maListRecent backs GET /ma/recent (issue #138, pinned contract): the last
@@ -1122,13 +1076,12 @@ func (p *AppPlayer) maListPlaylistItems(ctx context.Context, itemID string) (any
 // empty "Zuletzt" (same contract as maListPlaylists, issue #138 defect 4);
 // limit is clamped to 1..50 (the UI asks for 20).
 func (p *AppPlayer) maListRecent(ctx context.Context, limit int) (any, error) {
-	tracks := []MaTrack{}
 	if limit < 1 || limit > 50 {
 		limit = 20
 	}
 	cfg, _ := p.maResolved()
 	if cfg == nil {
-		return map[string]any{"tracks": tracks}, nil
+		return map[string]any{"tracks": []MaTrack{}}, nil
 	}
 
 	pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
@@ -1138,11 +1091,5 @@ func (p *AppPlayer) maListRecent(ctx context.Context, limit int) (any, error) {
 		p.app.log.Warnf("ma: recently_played_items failed: %v", err)
 		return nil, fmt.Errorf("music assistant playlog fetch failed: %w", err)
 	}
-	for i := range items {
-		it := &items[i]
-		t := MaTrack{ID: it.ItemID, Name: it.Name, URI: it.URI, Artists: []string{}}
-		t.ImageURL = maImageURL(it.Image)
-		tracks = append(tracks, t)
-	}
-	return map[string]any{"tracks": tracks}, nil
+	return map[string]any{"tracks": maMapRecentItems(items)}, nil
 }

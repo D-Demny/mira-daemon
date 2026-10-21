@@ -173,6 +173,37 @@ func (c *Client) PlayIndex(ctx context.Context, queueID string, index int) error
 	return err
 }
 
+// Resume sends player_queues/resume: continue playback on the queue at its
+// saved position. Verified against 2.10.7's controller.resume: a hard stop
+// parks corrected_elapsed_time in queue.resume_pos and KEEPS current_item,
+// so resume after stop continues that item where it stopped (live-verified:
+// web queue idle with items=8, ended=false, resume_pos=211, current_item set);
+// an ended queue restarts at item 0; a queue without a current item starts at
+// the current index or first item. QueueEmpty (4xx) when the queue has no
+// items - callers fall back to a replay in that case (issue #138 round 3,
+// defect A').
+func (c *Client) Resume(ctx context.Context, queueID string) error {
+	_, err := c.Call(ctx, "player_queues/resume", map[string]any{"queue_id": queueID})
+	return err
+}
+
+// TransferQueue sends player_queues/transfer: move the ENTIRE source queue to
+// the target - all items, the sources, repeat/shuffle/crossfade/autoplay
+// state and the current item with its resume position (issue #138 round 3,
+// defect W). Verified against 2.10.7's controller.transfer_queue: it stops
+// and clears the source, loads all items into the target and resumes there at
+// the saved position only when the source was PLAYING (auto_play default); a
+// grouped/synced TARGET is ungrouped first - the hand-rolled
+// play_media+start_item replay could not do any of that and died with 500s on
+// a WiiM group. Callers keep their own idle/no-media no-op gate.
+func (c *Client) TransferQueue(ctx context.Context, sourceQueueID, targetQueueID string) error {
+	_, err := c.Call(ctx, "player_queues/transfer", map[string]any{
+		"source_queue_id": sourceQueueID,
+		"target_queue_id": targetQueueID,
+	})
+	return err
+}
+
 // GetQueue calls player_queues/get for one queue id.
 func (c *Client) GetQueue(ctx context.Context, queueID string) (*PlayerQueue, error) {
 	raw, err := c.Call(ctx, "player_queues/get", map[string]any{"queue_id": queueID})

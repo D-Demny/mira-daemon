@@ -908,13 +908,14 @@ func TestMaSend_PlayUriRouting(t *testing.T) {
 	})
 }
 
-// TestMaSend_IdleReplay pins the idle-replay semantics (issue #138 defect A):
-// on an IDLE MA player a resume/play tap promises "the displayed track plays"
-// - a plain resume would restart the queue's PARKED position instead. Shown
-// track in the live queue -> play_index onto it; not in the queue -> play_media
-// with the single shown track; everything failed -> plain resume (never a dead
-// tap). PAUSED players keep the plain toggle/resume path untouched, and an
-// idle player that never observed anything plain-resumes.
+// TestMaSend_IdleReplay pins the idle-resume semantics (issue #138 defect A,
+// round 3 A'): on an IDLE MA player a resume/play tap asks MA for its OWN
+// resume, which continues the parked current_item at the saved resume_pos -
+// mid-song after a hard stop, NOT from 0. Only when the native resume fails
+// (empty queue etc.) does it fall back to replaying the DISPLAYED track: in
+// the live queue -> play_index onto it; not in the queue -> play_media with
+// the single shown track; everything failed -> plain resume (never a dead
+// tap). PAUSED players keep the plain toggle/resume path untouched.
 func TestMaSend_IdleReplay(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -934,35 +935,21 @@ func TestMaSend_IdleReplay(t *testing.T) {
 		return p
 	}
 
-	// the displayed uri sits at ABSOLUTE position 3 of the live queue
-	// (current_index 4 -> bounded window from offset 2, match at relative 1)
-	idleInQueueRoutes := map[string]string{
-		"player_queues/get": `{"queue_id":"wiim_uuid:A","items":6,"current_index":4}`,
-		"player_queues/items": `[{"queue_item_id":"qi-2","name":"Before - Song",
-		  "media_item":{"uri":"spotify--x://track/before"}},
-		 {"queue_item_id":"qi-3","name":"NEIKED - Glide",
-		  "media_item":{"item_id":"i-g","name":"Glide","uri":"spotify--x://track/abc"}}]`,
-		"player_queues/play_index": `null`, // success: no start_item arithmetic needed
-	}
-
-	t.Run("idle resume replays the displayed track via play_index", func(t *testing.T) {
-		srv, envs := newMaRecordingServer(t, idleInQueueRoutes)
+	t.Run("idle resume uses MA's native queue resume", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, map[string]string{"player_queues/resume": `null`})
 		p := idleP(t, srv.URL)
 
 		if err := p.maSend(ctx, "resume", nil); err != nil {
 			t.Fatalf("maSend(resume): %v", err)
 		}
-		assertOnlyCommands(t, *envs, []string{
-			"player_queues/get", "player_queues/items", "player_queues/play_index", // no bare play, no play_media
-		})
-		args := envArgs(t, *envs, "player_queues/play_index")
-		idx, ok := args["index"].(float64) // JSON NUMBER - never a string (defect 3)
-		if !ok || int(idx) != 3 {
-			t.Errorf("play_index index must be the number 3, got %T %v", args["index"], args["index"])
+		assertOnlyCommands(t, *envs, []string{"player_queues/resume"}) // no play_index/play_media replay (defect A')
+		args := envArgs(t, *envs, "player_queues/resume")
+		if qid, _ := args["queue_id"].(string); qid != "wiim_uuid:A" {
+			t.Errorf("resume queue_id must be the active player id, got %v", args["queue_id"])
 		}
 	})
 
-	t.Run("idle resume falls back to play_media then plain resume", func(t *testing.T) {
+	t.Run("idle resume falls back to replay then plain resume when native resume fails", func(t *testing.T) {
 		cmds := []string{}
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			b, _ := io.ReadAll(r.Body)
@@ -971,13 +958,15 @@ func TestMaSend_IdleReplay(t *testing.T) {
 			cmd, _ := env["command"].(string)
 			cmds = append(cmds, cmd)
 			switch cmd {
+			case "player_queues/resume":
+				http.Error(w, "boom", http.StatusInternalServerError) // native resume fails -> fallback chain
 			case "player_queues/get":
 				_, _ = w.Write([]byte(`{"queue_id":"wiim_uuid:A","items":1,"current_index":0}`))
 			case "player_queues/items":
 				// no entry carries the displayed uri -> membership probe misses
 				_, _ = w.Write([]byte(`[{"queue_item_id":"qi-x","name":"Other - Song","media_item":{"uri":"spotify--x://track/other"}}]`))
 			case "player_queues/play_media":
-				http.Error(w, "boom", http.StatusInternalServerError) // replay of the shown track fails
+				http.Error(w, "boom", http.StatusInternalServerError) // replay of the shown track fails too
 			default:
 				_, _ = w.Write([]byte(`null`))
 			}
@@ -989,9 +978,10 @@ func TestMaSend_IdleReplay(t *testing.T) {
 			t.Fatalf("maSend(resume): %v", err)
 		}
 		assertCommandSeq(t, cmds, []string{
+			"player_queues/resume",                     // native resume (500s -> fallback)
 			"player_queues/get", "player_queues/items", // membership probe: shown uri absent
-			"player_queues/play_media", // single-shown-track replay (500s)
-			"players/cmd/play",         // last resort: plain resume
+			"player_queues/play_media", // single-shown-track replay (500s too)
+			"players/cmd/play",         // last resort: plain resume (never a dead tap)
 		})
 	})
 
@@ -1009,16 +999,14 @@ func TestMaSend_IdleReplay(t *testing.T) {
 		assertOnlyCommands(t, *envs, []string{"players/cmd/play"}) // no queue resolution at all
 	})
 
-	t.Run("idle playpause replays the displayed track", func(t *testing.T) {
-		srv, envs := newMaRecordingServer(t, idleInQueueRoutes)
+	t.Run("idle playpause uses MA's native queue resume", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, map[string]string{"player_queues/resume": `null`})
 		p := idleP(t, srv.URL)
 
 		if err := p.maSend(ctx, "playpause", nil); err != nil {
 			t.Fatalf("maSend(playpause): %v", err)
 		}
-		assertOnlyCommands(t, *envs, []string{
-			"player_queues/get", "player_queues/items", "player_queues/play_index",
-		})
+		assertOnlyCommands(t, *envs, []string{"player_queues/resume"})
 	})
 
 	t.Run("paused playpause keeps the plain toggle", func(t *testing.T) {
@@ -1035,8 +1023,8 @@ func TestMaSend_IdleReplay(t *testing.T) {
 		assertOnlyCommands(t, *envs, []string{"players/cmd/play_pause"})
 	})
 
-	t.Run("idle resume with nothing shown plain-resumes", func(t *testing.T) {
-		srv, envs := newMaRecordingServer(t, map[string]string{"players/cmd/play": `null`})
+	t.Run("idle resume with nothing shown uses the native resume", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, map[string]string{"player_queues/resume": `null`})
 		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
 		p.maActivePlayerId = "wiim_uuid:A"
 		p.maLastPlaybackState = "idle" // idle with no remoteState (no live observation ever)
@@ -1044,7 +1032,32 @@ func TestMaSend_IdleReplay(t *testing.T) {
 		if err := p.maSend(ctx, "resume", nil); err != nil {
 			t.Fatalf("maSend(resume): %v", err)
 		}
-		assertOnlyCommands(t, *envs, []string{"players/cmd/play"}) // nothing shown: no queue resolution
+		assertOnlyCommands(t, *envs, []string{"player_queues/resume"}) // nothing to replay behind it
+	})
+
+	t.Run("idle resume with nothing shown falls through to plain resume when native resume fails", func(t *testing.T) {
+		cmds := []string{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			var env map[string]any
+			_ = json.Unmarshal(b, &env)
+			cmd, _ := env["command"].(string)
+			cmds = append(cmds, cmd)
+			if cmd == "player_queues/resume" {
+				http.Error(w, "boom", http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write([]byte(`null`))
+		}))
+		t.Cleanup(srv.Close)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		p.maActivePlayerId = "wiim_uuid:A"
+		p.maLastPlaybackState = "idle" // no remoteState: maResumeDisplayed plain-resumes
+
+		if err := p.maSend(ctx, "resume", nil); err != nil {
+			t.Fatalf("maSend(resume): %v", err)
+		}
+		assertCommandSeq(t, cmds, []string{"player_queues/resume", "players/cmd/play"})
 	})
 }
 
@@ -1540,16 +1553,18 @@ const maTestQueuePlayingSingle = `{
     "media_item":{"item_id":"item-9","name":"Glide","uri":"spotify--x://track/abc"}}
 }`
 
-// TestMaTransferPlayback pins the user-approved transfer semantics
-// (issue #138): selecting a DIFFERENT target while the old one plays moves
-// the music - replay the same source on the new player from the current
-// track, then pause the old one. Nothing playing = plain re-target; a
-// failed replay aborts the selection and keeps the old target.
+// TestMaTransferPlayback pins the user-approved transfer semantics (issue
+// #138, round 3 W): selecting a DIFFERENT target while the old one plays
+// moves the music with MA's OWN player_queues/transfer - full queue +
+// position copied to the target, source stopped and cleared (MA ungroups a
+// grouped/synced target first). Nothing playing = plain re-target (no
+// destructive transfer); a failed transfer aborts the selection and keeps
+// the old target.
 func TestMaTransferPlayback(t *testing.T) {
 	t.Parallel()
 
-	t.Run("playing playlist queue moves to the new target", func(t *testing.T) {
-		routes := map[string]string{"players/all": maTestGroupPlayersJSON, "player_queues/get": maTestQueuePlayingPlaylist, "player_queues/play_media": `{}`}
+	t.Run("playing playlist queue transfers to the new target", func(t *testing.T) {
+		routes := map[string]string{"players/all": maTestGroupPlayersJSON, "player_queues/get": maTestQueuePlayingPlaylist, "player_queues/transfer": `null`}
 		srv, envs := newMaRecordingServer(t, routes)
 		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
 		p.maActivePlayerId = "wiim_uuid:A"
@@ -1560,27 +1575,16 @@ func TestMaTransferPlayback(t *testing.T) {
 		if p.maActivePlayerId != "solo-1" {
 			t.Errorf("selection: %q", p.maActivePlayerId)
 		}
-		assertOnlyCommands(t, *envs, []string{"players/all", "player_queues/get", "player_queues/play_media", "players/cmd/pause"})
-
-		pm := envArgs(t, *envs, "player_queues/play_media")
-		if pm["queue_id"] != "solo-1" || pm["option"] != ma.QueueOptionReplace {
-			t.Errorf("play_media args: %+v", pm)
-		}
-		media, _ := pm["media"].([]any)
-		if len(media) != 1 || media[0] != "library://playlist/61" {
-			t.Errorf("media must be the full source: %v", pm["media"])
-		}
-		if pm["start_item"] != "item-1" {
-			t.Errorf("start_item must be the current track: %v", pm["start_item"])
-		}
-		pause := envArgs(t, *envs, "players/cmd/pause")
-		if pause["player_id"] != "wiim_uuid:A" {
-			t.Errorf("pause args: %+v", pause)
+		// native transfer: NO play_media, NO pause (MA stops + clears the source itself)
+		assertOnlyCommands(t, *envs, []string{"players/all", "player_queues/get", "player_queues/transfer"})
+		tr := envArgs(t, *envs, "player_queues/transfer")
+		if tr["source_queue_id"] != "wiim_uuid:A" || tr["target_queue_id"] != "solo-1" {
+			t.Errorf("transfer args: %+v", tr)
 		}
 	})
 
-	t.Run("single-item queue replays the bare track uri", func(t *testing.T) {
-		routes := map[string]string{"players/all": maTestGroupPlayersJSON, "player_queues/get": maTestQueuePlayingSingle, "player_queues/play_media": `{}`}
+	t.Run("single-item queue transfers as well", func(t *testing.T) {
+		routes := map[string]string{"players/all": maTestGroupPlayersJSON, "player_queues/get": maTestQueuePlayingSingle, "player_queues/transfer": `null`}
 		srv, envs := newMaRecordingServer(t, routes)
 		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
 		p.maActivePlayerId = "wiim_uuid:A"
@@ -1588,13 +1592,10 @@ func TestMaTransferPlayback(t *testing.T) {
 		if _, err := p.maSelectPlayer(context.Background(), "solo-1"); err != nil {
 			t.Fatalf("maSelectPlayer: %v", err)
 		}
-		pm := envArgs(t, *envs, "player_queues/play_media")
-		media, _ := pm["media"].([]any)
-		if len(media) != 1 || media[0] != "spotify--x://track/abc" {
-			t.Errorf("media must be the bare track uri: %v", pm["media"])
-		}
-		if _, ok := pm["start_item"]; ok {
-			t.Errorf("no start_item expected for a single-item queue: %+v", pm)
+		assertOnlyCommands(t, *envs, []string{"players/all", "player_queues/get", "player_queues/transfer"})
+		tr := envArgs(t, *envs, "player_queues/transfer")
+		if tr["source_queue_id"] != "wiim_uuid:A" || tr["target_queue_id"] != "solo-1" {
+			t.Errorf("transfer args: %+v", tr)
 		}
 	})
 
@@ -1629,21 +1630,151 @@ func TestMaTransferPlayback(t *testing.T) {
 		assertOnlyCommands(t, *envs, []string{"players/all"})
 	})
 
-	t.Run("failed replay aborts the selection and keeps the old target", func(t *testing.T) {
+	t.Run("failed transfer aborts the selection and keeps the old target", func(t *testing.T) {
 		routes := map[string]string{"players/all": maTestGroupPlayersJSON, "player_queues/get": maTestQueuePlayingPlaylist}
-		srv, _ := newMaRecordingServer(t, routes) // play_media unrouted -> 500
+		srv, _ := newMaRecordingServer(t, routes) // player_queues/transfer unrouted -> 500
 		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
 		p.maActivePlayerId = "wiim_uuid:A"
 
 		_, err := p.maSelectPlayer(context.Background(), "solo-1")
 		if err == nil {
-			t.Fatal("failed replay must error")
+			t.Fatal("failed transfer must error")
 		}
 		if errors.Is(err, ErrBadRequest) {
 			t.Errorf("a server failure must not look like a client-side 400: %v", err)
 		}
 		if p.maActivePlayerId != "wiim_uuid:A" {
 			t.Errorf("old selection must be kept, got %q", p.maActivePlayerId)
+		}
+	})
+}
+
+// maBlobSettings is a SettingsHandler stub serving one fixed settings blob.
+type maBlobSettings struct{ blob []byte }
+
+func (s *maBlobSettings) GetSettings() []byte           { return s.blob }
+func (s *maBlobSettings) PutSettings(body []byte) error { return nil }
+
+// TestMaPreSessionContentServe pins issue #138 round 3 (defect B'): while no
+// player session exists yet - playerReady=false, the Spotify device-flow
+// pairing window after a flash - the /ma/* content endpoints must be served
+// directly from Music Assistant off the persisted settings blob (which
+// survives the flash), not 503. The response shapes are the exact post-
+// session contracts; a non-MA playback source or an unconfigured/failed MA
+// keeps the 503-retry contract so the UI never caches an empty list.
+func TestMaPreSessionContentServe(t *testing.T) {
+	t.Parallel()
+
+	// fake MA with the live 2.10.7 shapes: players, root browse (three
+	// providers - only builtin carries a routed playlists collection, the
+	// other two 500 and must be skipped), playlist tracks, play log
+	masrv, envs := newMaRecordingServer(t, map[string]string{
+		"players/all":                      maTestGroupPlayersJSON,
+		"music/browse@root":                maTestBrowseRoot,
+		"music/browse@builtin://playlists": maTestBrowseBuiltinPlaylists,
+		"music/playlists/playlist_tracks":  `[{"item_id":"t-1","provider":"library","name":"Glide","uri":"spotify--x://track/abc","media_type":"track","position":3,"duration":214,"album":{"item_id":"al","name":"The World Is Yours"},"artists":[{"name":"NEIKED"}]}]`,
+		"music/recently_played_items":      `[{"item_id":"t-9","provider":"library","name":"Take It All","uri":"spotify--x://track/t9","media_type":"track"}]`,
+	})
+
+	stub := &maBlobSettings{blob: maTestSettings(masrv.URL, "ma")}
+	srv, base := newTestApiServer(t)
+	srv.SetSettingsHandler(stub) // playerReady stays false: pre-session path
+
+	getJSON := func(path string, out any) int {
+		t.Helper()
+		resp, err := testClient.Get(base + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if err := json.Unmarshal(b, out); err != nil {
+			t.Fatalf("GET %s: decoding body (%d bytes): %v", path, len(b), err)
+		}
+		return resp.StatusCode
+	}
+
+	t.Run("playlists are served pre-session", func(t *testing.T) {
+		var got struct {
+			Playlists []MaPlaylist `json:"playlists"`
+		}
+		if code := getJSON("/ma/playlists", &got); code != 200 {
+			t.Fatalf("GET /ma/playlists: status %d, want 200 pre-session", code)
+		}
+		if len(got.Playlists) != 2 || got.Playlists[0].Name != "All favorited tracks" || got.Playlists[0].URI != "library://playlist/1" ||
+			got.Playlists[1].Name != "500 Random tracks (from library)" || got.Playlists[1].ImageURL != "https://i.scdn.co/image/abc" {
+			t.Errorf("playlists: %+v", got.Playlists)
+		}
+	})
+
+	t.Run("devices are served pre-session incl. the synthetic group entry", func(t *testing.T) {
+		var got struct {
+			Devices []MaDevice `json:"devices"`
+		}
+		if code := getJSON("/ma/devices", &got); code != 200 {
+			t.Fatalf("GET /ma/devices: status %d, want 200 pre-session", code)
+		}
+		want := map[string]bool{"wiim_uuid:A": false, "wiim_uuid:B": false, "solo-1": false, "group:wiim_uuid:A": false}
+		for _, d := range got.Devices {
+			if _, ok := want[d.Id]; ok {
+				want[d.Id] = true
+			}
+		}
+		for id, seen := range want {
+			if !seen {
+				t.Errorf("devices missing %q: %+v", id, got.Devices)
+			}
+		}
+	})
+
+	t.Run("playlist items are served pre-session with the full track mapping", func(t *testing.T) {
+		var got struct {
+			Tracks []MaTrack `json:"tracks"`
+		}
+		if code := getJSON("/ma/playlist-items?id=61", &got); code != 200 {
+			t.Fatalf("GET /ma/playlist-items: status %d, want 200 pre-session", code)
+		}
+		if len(got.Tracks) != 1 {
+			t.Fatalf("tracks: %+v", got.Tracks)
+		}
+		tr := got.Tracks[0]
+		if tr.URI != "spotify--x://track/abc" || tr.Name != "Glide" || tr.Album != "The World Is Yours" ||
+			len(tr.Artists) != 1 || tr.Artists[0] != "NEIKED" || tr.Position != 3 || tr.DurationMs != 214000 {
+			t.Errorf("track mapping: %+v", tr)
+		}
+	})
+
+	t.Run("recent is served pre-session with the clamped limit forwarded", func(t *testing.T) {
+		var got struct {
+			Tracks []MaTrack `json:"tracks"`
+		}
+		if code := getJSON("/ma/recent?limit=5", &got); code != 200 {
+			t.Fatalf("GET /ma/recent: status %d, want 200 pre-session", code)
+		}
+		if len(got.Tracks) != 1 || got.Tracks[0].URI != "spotify--x://track/t9" {
+			t.Errorf("recent tracks: %+v", got.Tracks)
+		}
+		var lim any
+		for _, e := range *envs {
+			if c, _ := e["command"].(string); c == "music/recently_played_items" {
+				args, _ := e["args"].(map[string]any)
+				lim = args["limit"]
+			}
+		}
+		if lim != float64(5) {
+			t.Errorf("recently_played_items limit: got %v want 5", lim)
+		}
+	})
+
+	t.Run("a non-MA playback source keeps the 503 retry contract", func(t *testing.T) {
+		stub.blob = maTestSettings(masrv.URL, "spotify")
+		var got map[string]any
+		code := getJSON("/ma/playlists", &got)
+		if code != 503 {
+			t.Fatalf("GET /ma/playlists with playbackSource=spotify: status %d, want 503", code)
+		}
+		if got["error"] != "player session not ready" {
+			t.Errorf("503 body: %+v", got)
 		}
 	})
 }
