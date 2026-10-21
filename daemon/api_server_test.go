@@ -155,6 +155,62 @@ func TestNonObserverChannelEndpointReturns503WhenPlayerNotReady(t *testing.T) {
 	}
 }
 
+// /ma/* content endpoints (issues #134/#138)
+
+func TestMaContentEndpointsReturn503WhenPlayerNotReady(t *testing.T) {
+	t.Parallel()
+
+	// pre-session the /ma/* list endpoints must 503 - NOT a 200 with an empty
+	// list: the UI caches 200s and would treat a spurious empty as "no
+	// content" (issue #138 startup race after flash).
+	_, base := newTestApiServer(t)
+
+	for _, path := range []string{
+		"/ma/devices",
+		"/ma/playlists",
+		"/ma/playlist-items?id=library://playlist/42",
+		"/ma/recent",
+		"/ma/recent?limit=5",
+	} {
+		resp, err := testClient.Get(base + path)
+		if err != nil {
+			t.Fatalf("Get %s: %v", path, err)
+		}
+		body, rerr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if rerr != nil {
+			t.Fatalf("Read %s body: %v", path, rerr)
+		}
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("%s with playerReady=false: got %d want 503", path, resp.StatusCode)
+		}
+		var decoded map[string]any
+		if uerr := json.Unmarshal(body, &decoded); uerr != nil || decoded["error"] == nil {
+			t.Errorf("%s pre-ready body: want the JSON error payload, got %q (%v)", path, body, uerr)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != "no-store, no-cache, must-revalidate" {
+			t.Errorf("%s Cache-Control: got %q want no-store", path, cc)
+		}
+	}
+}
+
+func TestMaPlaylistItemsMissingIdReturns400(t *testing.T) {
+	t.Parallel()
+
+	srv, base := newTestApiServer(t)
+	srv.SetPlayerReady(true) // the 400 must hold regardless of readiness
+
+	resp, err := testClient.Get(base + "/ma/playlist-items")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("/ma/playlist-items without id: got %d want 400", resp.StatusCode)
+	}
+}
+
 // /lyrics/{id}
 
 func TestLyrics_ValidResultReturns200WithJSON(t *testing.T) {
