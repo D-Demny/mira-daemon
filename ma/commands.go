@@ -186,6 +186,32 @@ func (c *Client) GetQueue(ctx context.Context, queueID string) (*PlayerQueue, er
 	return &q, nil
 }
 
+// QueueItems calls player_queues/items: the ACTUAL queue contents - at most
+// limit items starting at 0-based offset. Unlike player_queues/get (count +
+// snapshots only), this is the endpoint carrying item entries, and it is the
+// same enumeration MA's own webui renders as the queue view. It is the ONLY
+// correct source of "what plays next" for autoplay/re-queued queues: a queue
+// can diverge from its declared source (live evidence on 2.10.7: a 27-item
+// autoplay queue whose single source playlist holds 3 different tracks), so
+// no source-based reconstruction can match it (issue #138, defect C).
+// Item index fields in the response are RELATIVE to the requested offset -
+// callers must add the offset back for absolute positions.
+func (c *Client) QueueItems(ctx context.Context, queueID string, limit, offset int) ([]QueueItem, error) {
+	raw, err := c.Call(ctx, "player_queues/items", map[string]any{
+		"queue_id": queueID,
+		"limit":    limit,
+		"offset":   offset,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var items []QueueItem
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("ma: decoding player_queues/items result for %s: %w", queueID, err)
+	}
+	return items, nil
+}
+
 // Browse calls music/browse at the given path. Path "root" (or "") lists the
 // provider folders; "<provider instance>://playlists" lists that provider's
 // playlists. The result is a heterogeneous list — folders and media items in

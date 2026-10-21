@@ -179,11 +179,12 @@ type ItemMetadata struct {
 	Images []MediaImage `json:"images"`
 }
 
-// QueueItem is the subset of MA's QueueItem schema (player_queues/get). For
-// music items Name is pre-composed as "Artist(s) - Title" with an optional
-// trailing "(version)" suffix, and MediaItem carries the real metadata when
-// present (its artists list can be simplified away, hence the fallback
-// parsing in the daemon's queue mapping).
+// QueueItem is the subset of MA's QueueItem schema (player_queues/items, and
+// the current/next item snapshots of player_queues/get). For music items
+// Name is pre-composed as "Artist(s) - Title" with an optional trailing
+// "(version)" suffix; MediaItem carries the real metadata when present. The
+// daemon's queue mapping falls back to the pre-composed name line for
+// entries without a MediaItem (see maQueueItemToUpcoming).
 type QueueItem struct {
 	QueueID     string      `json:"queue_id"`
 	QueueItemID string      `json:"queue_item_id"`
@@ -194,9 +195,9 @@ type QueueItem struct {
 }
 
 // QueueSource is the subset of one queue SOURCE media item (player_queues/get
-// `sources[]`): a single-source queue (one playlist or one album) is
-// identified by it and drives the daemon's upcoming-track reconstruction
-// (see daemon/player_ma.go).
+// `sources[]`): a single-source queue is identified by it - the daemon uses
+// it as the playback CONTEXT uri and the idle-replay source (see
+// daemon/player_ma.go). The upcoming list does NOT come from here.
 type QueueSource struct {
 	ItemID    string `json:"item_id"`
 	Provider  string `json:"provider"`
@@ -208,8 +209,9 @@ type QueueSource struct {
 // PlayerQueue is the subset of player_queues/get the observer consumes (live
 // verified against MA 2.10.7): the response carries NO item list - only the
 // item count, the current index, the current/next queue items and the source
-// items. The "Läuft gerade" upcoming pane is therefore reconstructed by the
-// daemon from source + index (see maUpcomingTracks in player_ma.go).
+// items. The "Läuft gerade" upcoming pane is the daemon's own LIVE
+// enumeration of player_queues/items on top of this position (see
+// maUpcomingTracks in player_ma.go).
 type PlayerQueue struct {
 	QueueID        string        `json:"queue_id"`
 	Items          int           `json:"items"`         // total queued item count

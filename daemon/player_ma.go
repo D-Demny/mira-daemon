@@ -45,6 +45,17 @@ const maControlTimeout = 10 * time.Second
 
 const maDeviceType = "MUSIC_ASSISTANT"
 
+// maPlaylistTTL is the refresh cadence of the background playlist warmup -
+// it matches the UI's own 5-minute cache, so a fresh live fetch always wins
+// over serving the warmed copy (issue #138 defect B).
+const maPlaylistTTL = 5 * time.Minute
+
+// maPlaylistWarmTimeout is the budget of one BACKGROUND browse: deliberately
+// much larger than maControlTimeout, because a cold browse can outlive it -
+// that mismatch was exactly defect B. Runs off the request path, so being
+// slow there cannot hold up /ma/playlists.
+const maPlaylistWarmTimeout = 90 * time.Second
+
 // MaDevice is one entry of GET /ma/devices - the pinned contract shape:
 // id/name/availability from MA's players/all (issue #134).
 type MaDevice struct {
@@ -120,6 +131,9 @@ func (p *AppPlayer) maPollTick(ctx context.Context) {
 	}
 
 	client := p.maClientFor(cfg)
+	// issue #138 defect B: keep the playlist cache fresh in the background so
+	// /ma/playlists never has to wait on a cold browse (see maListPlaylists).
+	p.maMaybeWarmPlaylists(client)
 	pctx, cancel := context.WithTimeout(ctx, maPollRequestTimeout)
 	defer cancel()
 
@@ -162,11 +176,11 @@ func (p *AppPlayer) maPollTick(ctx context.Context) {
 		p.maFetchIdleFallback(pctx, client, pl)
 	}
 
-	// issue #138: upcoming queue for the "Läuft gerade" pane. Fetched only
-	// while media is active (idle players have nothing queued) on the same
-	// 4s poll budget; the queue response itself carries NO item list, so the
-	// list is RECONSTRUCTED from source + index below (maUpcomingTracks),
-	// which also keeps the last good list on a transient fetch failure.
+	// issue #138: upcoming queue for the "Läuft gerade" pane - the LIVE queue
+	// tail (maUpcomingTracks enumerates player_queues/items one past the
+	// current position, like MA's own webui), fetched only while media is
+	// active (idle players have nothing queued) on the same 4s poll budget.
+	// It also keeps the last good list on a transient fetch failure.
 	var queue *ma.PlayerQueue
 	if pl.PlaybackState != "idle" && pl.CurrentMedia != nil {
 		q, qerr := client.GetQueue(pctx, p.maActivePlayerId)
@@ -272,9 +286,12 @@ func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue, upcoming 
 	}
 
 	// issue #138 (defects 1+2): refresh the idle-survival last-song source;
-	// a live observation supersedes any playlog fallback.
+	// a live observation supersedes any playlog fallback. Defect A tracks the
+	// raw MA state so controls can tell IDLE (replay the displayed track)
+	// apart from PAUSED (plain resume).
 	p.maLastActiveState = rs
 	p.maIdleLogFallback = nil
+	p.maLastPlaybackState = pl.PlaybackState
 
 	if v := p.app.voice; v != nil {
 		v.notifyPlayback(rs.IsPlaying && !rs.IsPaused)
@@ -387,6 +404,8 @@ func (p *AppPlayer) applyMaIdleState(pl *ma.Player) {
 		p.state.lastActiveDeviceId = rs.DeviceId
 		p.state.lastActiveDeviceName = rs.DeviceName
 	}
+	// issue #138 defect A: this poll is the idle synthesis - record it as such.
+	p.maLastPlaybackState = "idle"
 
 	if v := p.app.voice; v != nil {
 		v.notifyPlayback(false)
@@ -462,115 +481,78 @@ func (p *AppPlayer) maTransferPlayback(ctx context.Context, client *ma.Client, o
 	return nil
 }
 
-// maUpcomingTracks reconstructs the upcoming queue list for the "Läuft
-// gerade" pane (issue #138). MA's player_queues/get carries no item list -
-// only sources[] + current_index - so a single-source queue is re-expanded
-// from its source's ordered track list: the currently playing track is
-// located in it and everything AFTER it becomes the upcoming list. 2.10.7
-// semantics (music/queue media resolver, verified in source): a playlist or
-// album queue holds the FULL ordered track list with at most the prefix
-// before the start item dropped, so "everything after the current position"
-// is exactly the queue tail - for both full and rotated queues.
-// Queues that cannot be reconstructed yield an EMPTY list (not a failure):
-// no/multiple sources, single-track sources, shuffle on (the queue order
-// then differs from the source order and queue indices are not addressable).
-// A failed source fetch keeps the last good list instead of blanking. The
-// result is cached per (source, current track) so the 1/s poll does not
-// re-fetch playlist tracks while one track plays. Run loop only.
+// maUpcomingTracks returns the live queue tail for the "Läuft gerade" pane
+// (issue #138): player_queues/items starting one past the current position -
+// the SAME enumeration MA's own webui renders. The round-1 reconstruction
+// from queue SOURCE + index is gone on purpose: autoplay re-queues diverge
+// from their declared source (live evidence on 2.10.7: a 27-item autoplay
+// queue whose single 3-track source playlist shares no track with the queue
+// tail), so the source list was actively wrong - and shuffled/ended queues
+// yielded nothing at all, while real enumeration answers for all of them.
+// The fetch is cached per (queue id | current index | item count | current
+// uri): the 1/s poll does not re-fetch while one track plays, a track change
+// advances the index and an autoplay batch append bumps the count - both
+// invalidate. A failed fetch keeps the last good list (blank when there was
+// never one). Run loop only.
 func (p *AppPlayer) maUpcomingTracks(ctx context.Context, client *ma.Client, pl *ma.Player, queue *ma.PlayerQueue) []QueueTrack {
-	if queue == nil || pl.CurrentMedia == nil {
-		return p.maUpcomingCached // stale-or-empty; the poll carries the previous list over
+	if queue == nil || pl.CurrentMedia == nil || queue.CurrentIndex == nil {
+		return p.maUpcomingCached // idle / no media / no position: carry over the previous list
 	}
-	if queue.CurrentIndex == nil || len(queue.Sources) != 1 || queue.ShuffleEnabled {
-		return []QueueTrack{} // not reconstructable: honest blank, no fetch
+	cur := *queue.CurrentIndex
+	qid := queue.QueueID
+	if qid == "" {
+		qid = pl.PlayerID // a player's default queue carries its own id
 	}
-	src := queue.Sources[0]
-
-	key := src.URI + "|" + pl.CurrentMedia.URI
+	key := qid + "|" + strconv.Itoa(cur) + "|" + strconv.Itoa(queue.Items) + "|" + pl.CurrentMedia.URI
 	if key == p.maUpcomingKey {
 		return p.maUpcomingCached
 	}
 
-	var (
-		tracks []ma.TrackItem
-		err    error
-	)
-	switch src.MediaType {
-	case "playlist":
-		tracks, err = client.PlaylistTracks(ctx, src.ItemID)
-	case "album":
-		tracks, err = client.AlbumTracks(ctx, src.ItemID, src.Provider)
-	default:
-		return []QueueTrack{} // single track or unknown source type: nothing to expand
-	}
+	items, err := client.QueueItems(ctx, qid, QueueLimit, cur+1)
 	if err != nil {
-		p.app.log.Debugf("ma: upcoming reconstruction %s/%s failed: %v", src.MediaType, src.ItemID, err)
+		p.app.log.Debugf("ma: player_queues/items %s failed: %v", qid, err)
 		return p.maUpcomingCached // keep the last good list on transient failure; retry next tick
 	}
-
-	upcoming := []QueueTrack{}
-	if idx := maIndexOfTrack(tracks, pl.CurrentMedia); idx >= 0 {
-		rest := tracks[idx+1:]
-		if len(rest) > QueueLimit {
-			rest = rest[:QueueLimit]
+	upcoming := make([]QueueTrack, 0, len(items))
+	for i := range items {
+		t := maQueueItemToUpcoming(items[i], cur+1+i) // absolute queue position -> play_index target
+		if t.Uri == "" && t.Name == "" {
+			continue
 		}
-		for j := range rest {
-			t := maTrackToUpcoming(rest[j], *queue.CurrentIndex+1+j, true)
-			if t.Uri != "" || t.Name != "" {
-				upcoming = append(upcoming, t)
-			}
-		}
+		upcoming = append(upcoming, t)
 	}
 	p.maUpcomingKey = key
 	p.maUpcomingCached = upcoming
 	return upcoming
 }
 
-// maIndexOfTrack locates the currently playing track inside an ordered track
-// list: exact URI first (stable per provider instance), case-insensitive
-// title as fallback. -1 when not found (dynamic playlist reshuffle, manual
-// queue edits) - the upcoming pane stays empty then rather than guess.
-func maIndexOfTrack(tracks []ma.TrackItem, cur *ma.CurrentMedia) int {
-	for i := range tracks {
-		if cur.URI != "" && tracks[i].URI == cur.URI {
-			return i
-		}
-	}
-	for i := range tracks {
-		if tracks[i].Name != "" && strings.EqualFold(tracks[i].Name, cur.Title) {
-			return i
-		}
-	}
-	return -1
-}
-
-// maTrackToUpcoming maps one source track into the shared QueueTrack shape
-// for the upcoming pane (issue #138). queueIndex is the entry's absolute
-// position in the QUEUE, not in the source list: it doubles as the play_index
-// target for the in-queue skip (maPlayUri), which accepts a queue index.
-// TrackId is only set when the queue order equals the source order - i.e.
-// shuffle off; shuffled queues get empty TrackIds so in-queue taps fall back
-// to single-item playback instead of mis-jumping. Cover: top-level image
-// first, metadata.images as fallback (library track lists only carry the
-// latter).
-func maTrackToUpcoming(t ma.TrackItem, queueIndex int, addressable bool) QueueTrack {
-	qt := QueueTrack{
-		Uri:      t.URI,
-		Name:     t.Name,
-		Album:    t.Album.Name(),
-		ImageUrl: maImageURL(t.Cover()),
-	}
-	if addressable {
-		qt.TrackId = strconv.Itoa(queueIndex)
-	}
-	if len(t.Artists) > 0 {
-		names := make([]string, 0, len(t.Artists))
-		for _, a := range t.Artists {
-			if a.Name != "" {
-				names = append(names, a.Name)
+// maQueueItemToUpcoming maps one LIVE queue entry into the shared QueueTrack
+// shape of the upcoming pane (issue #138). TrackId is the entry's absolute
+// position in the queue - the play_index target for the in-queue skip
+// (maPlayUri); maPlayUri re-resolves the position from the live queue at tap
+// time anyway, so a stale cache entry can only cost one extra fallback.
+// Media metadata comes from the nested media_item when present; non-media
+// queue entries fall back to the pre-composed "Artist - Title" name line.
+func maQueueItemToUpcoming(it ma.QueueItem, queuePos int) QueueTrack {
+	qt := QueueTrack{ImageUrl: maImageURL(it.Image), TrackId: strconv.Itoa(queuePos)}
+	if mi := it.MediaItem; mi != nil {
+		qt.Uri = mi.URI
+		qt.Name = mi.Name
+		qt.Album = mi.Album.Name()
+		if len(mi.Artists) > 0 {
+			names := make([]string, 0, len(mi.Artists))
+			for _, a := range mi.Artists {
+				if a.Name != "" {
+					names = append(names, a.Name)
+				}
 			}
+			qt.Artist = strings.Join(names, ", ")
 		}
-		qt.Artist = strings.Join(names, ", ")
+		if qt.ImageUrl == "" {
+			qt.ImageUrl = maImageURL(mi.Cover())
+		}
+	} else if it.Name != "" {
+		qt.Name = it.Name
 	}
 	return qt
 }
@@ -609,10 +591,12 @@ func (p *AppPlayer) maSend(ctx context.Context, verb string, data any) error {
 	switch verb {
 	case "resume", "play":
 		// resume carries Spotify Connect semantics ("keep playing on the
-		// target device"); MA's Play is the equivalent - it resumes an idle
-		// player and no-ops a playing one (issue #134 mapping).
-		// play may also carry a URI from /player/play (tapped item) and must
-		// route to the queue commands instead (issue #138): maPlayUri.
+		// target device"); play may also carry a URI from /player/play
+		// (tapped item) and routes to the queue commands instead (issue #138):
+		// maPlayUri. On an IDLE MA player, both fall back into plain resume -
+		// which replays the PARKED queue position (item 0 on an ended queue),
+		// NOT necessarily the song the UI is showing (issue #138 defect A):
+		// the now-playing play button promises "the displayed track plays".
 		if verb == "play" {
 			play, _ := data.(ApiRequestDataPlay)
 			if play.Uri != "" {
@@ -620,11 +604,22 @@ func (p *AppPlayer) maSend(ctx context.Context, verb string, data any) error {
 				break
 			}
 		}
-		callErr = client.Play(pctx, playerID)
+		if p.maIsIdle() {
+			callErr = p.maResumeDisplayed(pctx, client, playerID)
+		} else {
+			callErr = client.Play(pctx, playerID)
+		}
 	case "pause":
 		callErr = client.Pause(pctx, playerID)
 	case "playpause":
-		callErr = client.PlayPause(pctx, playerID)
+		// defect A: idle + play_pause would resume the parked position again -
+		// replay the displayed track instead; a PAUSED player keeps the normal
+		// toggle (resume-from-pause-position IS the shown track there).
+		if p.maIsIdle() {
+			callErr = p.maResumeDisplayed(pctx, client, playerID)
+		} else {
+			callErr = client.PlayPause(pctx, playerID)
+		}
 	case "next":
 		callErr = client.Next(pctx, playerID)
 	case "prev":
@@ -681,6 +676,46 @@ func (p *AppPlayer) maSend(ctx context.Context, verb string, data any) error {
 		p.app.log.Warnf("ma: %s for player %q failed: %v", verb, playerID, callErr)
 	}
 	return callErr
+}
+
+// maIsIdle reports whether the last observed MA playback state of the SELECTED
+// player is idle (issue #138 defect A). Run loop only - maLastPlaybackState
+// is written by the poll's applyMaState / applyMaIdleState and read by
+// maSend - both inside the Run() goroutine, so no synchronization is needed
+// (same convention as the other ma* fields).
+func (p *AppPlayer) maIsIdle() bool {
+	return p.maLastPlaybackState == "idle"
+}
+
+// maResumeDisplayed replays the track the UI is currently SHOWING on an idle
+// MA player (issue #138 defect A): the now-playing screen after a stop shows
+// maIdleLastTrack (last live observation or per-queue playlog), while MA's
+// plain resume restarts the queue's PARKED position - item 0 on an ended
+// queue, otherwise whatever current_index points at. The two diverge
+// (verified live: a 27-item autoplay web queue whose parked index does not
+// match the displayed track). Order of attempts:
+//  1. shown track is in the LIVE queue -> play_index onto it: the rest of
+//     the queue survives a mid-queue stop (mid-list autoplay additions etc.);
+//  2. not in the queue (ended/stale) -> play_media with the single shown
+//     track replaces the exhausted queue with it;
+//  3. everything failed -> plain resume (legacy behavior, never a dead tap).
+func (p *AppPlayer) maResumeDisplayed(ctx context.Context, client *ma.Client, playerID string) error {
+	rs := p.state.remoteState
+	if rs == nil || rs.TrackUri == "" {
+		return client.Play(ctx, playerID) // nothing shown: plain resume
+	}
+	if idx, ok := p.maQueueIndexOf(ctx, client, playerID, rs.TrackUri); ok {
+		if err := client.PlayIndex(ctx, playerID, idx); err == nil {
+			return nil
+		} else {
+			p.app.log.Debugf("ma: replay via play_index %d for %s failed: %v - trying play_media", idx, rs.TrackUri, err)
+		}
+	}
+	if err := client.PlayMedia(ctx, playerID, rs.TrackUri, ""); err != nil {
+		p.app.log.Warnf("ma: replay of displayed track %s failed (%v); falling back to plain resume", rs.TrackUri, err)
+		return client.Play(ctx, playerID)
+	}
+	return nil
 }
 
 // maListDevices backs GET /ma/devices (issue #134, pinned contract):
@@ -771,6 +806,7 @@ func (p *AppPlayer) maSelectPlayer(ctx context.Context, playerID string) (any, e
 		p.maLastActiveState = nil
 		p.maIdleLogFallback = nil
 		p.maIdleLogTriedFor = ""
+		p.maLastPlaybackState = ""
 	}
 
 	p.maActivePlayerId = resolved
@@ -781,12 +817,15 @@ func (p *AppPlayer) maSelectPlayer(ctx context.Context, playerID string) (any, e
 // maPlayUri routes a /player/play URI in MA mode (issue #138), mapping the
 // Spotify Connect context semantics onto MA queue commands:
 //   - uri + offset.uri: the UI's tracklist confirmations send the parent
-//     list as context and the tapped item as offset - start that source at
-//     the tapped item, queueing the rest behind it (play_media replace +
-//     start_item; verified live against 2.10.7's exact-match resolver). A
-//     failure (stale context after a re-queue, item no longer in the source)
-//     falls back to playing the tapped item alone - a tap should land the
-//     song, not raise a toast.
+//     list as context and the tapped item as offset. Defect C: the LIVE
+//     queue is authoritative - when the tapped item sits in it, a true
+//     in-queue skip (play_index) preserves the rest of the queue (incl.
+//     autoplay additions) and works even when the context uri no longer
+//     matches the real queue contents. Only for a tap OUTSIDE the observed
+//     window does it fall back to starting that source at the tapped item
+//     (play_media replace + start_item; verified live against 2.10.7's
+//     exact-match resolver), and a failing fallback plays the tapped item
+//     alone - a tap should land the song, not raise a toast.
 //   - bare uri matching an upcoming entry of the observed queue: in-queue
 //     skip via play_index (bug26 semantics - the queue is preserved, the
 //     tapped card jumps to now-playing). MA 2.10.7's index schema is
@@ -797,6 +836,9 @@ func (p *AppPlayer) maSelectPlayer(ctx context.Context, playerID string) (any, e
 //   - anything else: single-item context.
 func (p *AppPlayer) maPlayUri(ctx context.Context, client *ma.Client, playerID string, play ApiRequestDataPlay) error {
 	if play.Offset != nil && play.Offset.Uri != "" {
+		if idx, ok := p.maQueueIndexOf(ctx, client, playerID, play.Offset.Uri); ok {
+			return client.PlayIndex(ctx, playerID, idx)
+		}
 		err := client.PlayMedia(ctx, playerID, play.Uri, play.Offset.Uri)
 		if err == nil {
 			return nil
@@ -814,6 +856,42 @@ func (p *AppPlayer) maPlayUri(ctx context.Context, client *ma.Client, playerID s
 		}
 	}
 	return client.PlayMedia(ctx, playerID, play.Uri, "")
+}
+
+// maQueueIndexOf resolves a URI to its 0-based position in the player's LIVE
+// queue (issue #138 defect C): one bounded window around the current position
+// instead of the whole queue - the "Läuft gerade" list spans
+// [current, current+QueueLimit) and an idle replay can land a few positions
+// BEFORE it. The response's per-item index fields are relative to the offset,
+// so absolute position = offset + i (verified live against 2.10.7). ok=false
+// (queue or fetch failure, or no match) lets callers keep their legacy path.
+func (p *AppPlayer) maQueueIndexOf(ctx context.Context, client *ma.Client, playerID, uri string) (int, bool) {
+	q, err := client.GetQueue(ctx, playerID)
+	if err != nil || q == nil {
+		return 0, false
+	}
+	base := 0
+	if q.CurrentIndex != nil {
+		base = *q.CurrentIndex
+	}
+	start := base - 2
+	if start < 0 {
+		start = 0
+	}
+	qid := q.QueueID
+	if qid == "" {
+		qid = playerID // a player's default queue carries its own id
+	}
+	items, err := client.QueueItems(ctx, qid, QueueLimit+3, start)
+	if err != nil {
+		return 0, false
+	}
+	for i := range items {
+		if mi := items[i].MediaItem; mi != nil && mi.URI == uri {
+			return start + i, true
+		}
+	}
+	return 0, false
 }
 
 // maImageURL picks a UI-fetchable url from an MA image entry: only remotely
@@ -861,35 +939,55 @@ type MaTrack struct {
 // with uri "library://playlist/<id>" (verified live against 2.10.7). A
 // provider without a playlists collection answers its browse with a 500 -
 // that folder is skipped, not an error. EMPTY array only when MA is
-// unconfigured; when it IS configured and the content cannot be fetched, the
-// handler ERRORS (-> HTTP 5xx) instead: a 200 with an empty list would be
-// cached by the UI as authoritative "no playlists" (issue #138, defect 4 -
-// the pane showed "Keine Playlists" while MA had 145, because a failed or
-// pre-config browse was swallowed into an empty 200). The UI answers the 5xx
-// with its error card + retry.
+// unconfigured (issue #138 defect 4: a 200 with an empty list would be
+// cached by the UI as authoritative "no playlists").
+//
+// Defect B ("playlists load only after a few minutes"): the cold browse can
+// outlive maControlTimeout - all folders fail and the pane sits on an error
+// card while the UI retries every 15s until MA warms up. The browse result
+// is therefore WARMED in the background (maPollTick, every maPlaylistTTL)
+// with a generous timeout, and a failed live fetch serves the LAST GOOD list
+// instead of erroring (stale-while-error). A failed fetch with NO cached
+// list still errors, exactly as before - never an authoritative empty.
 func (p *AppPlayer) maListPlaylists(ctx context.Context) (any, error) {
-	playlists := []MaPlaylist{}
 	cfg, _ := p.maResolved()
 	if cfg == nil {
-		return map[string]any{"playlists": playlists}, nil
+		return map[string]any{"playlists": []MaPlaylist{}}, nil
 	}
 
 	pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
 	defer cancel()
-	client := p.maClientFor(cfg)
+	playlists, err := p.maFetchPlaylists(pctx, p.maClientFor(cfg))
+	if err == nil {
+		p.maUpdatePlaylistCache(playlists)
+		return map[string]any{"playlists": playlists}, nil
+	}
+	if st := p.maStalePlaylists(); len(st) > 0 {
+		p.app.log.Warnf("ma: playlist browse failed (%v); serving the cached list from %s ago",
+			err, time.Since(p.maPlaylistCachedAt).Round(time.Second))
+		return map[string]any{"playlists": st}, nil
+	}
+	p.app.log.Warnf("ma: playlist browse failed with no cached list: %v", err)
+	return nil, fmt.Errorf("music assistant playlist browse failed: %w", err)
+}
 
-	root, err := client.Browse(pctx, "root")
+// maFetchPlaylists runs the root + per-provider playlist browse on the given
+// context. Shared by the request path (maControlTimeout budget) and the
+// background warmup (its own budget) - see maListPlaylists for the wire facts.
+func (p *AppPlayer) maFetchPlaylists(ctx context.Context, client *ma.Client) ([]MaPlaylist, error) {
+	root, err := client.Browse(ctx, "root")
 	if err != nil {
 		p.app.log.Warnf("ma: music/browse root failed: %v", err)
 		return nil, fmt.Errorf("music assistant playlist browse failed: %w", err)
 	}
+	playlists := []MaPlaylist{}
 	folders, failedFolders := 0, 0
 	for _, folder := range root {
 		if !strings.HasSuffix(folder.Path, "://") {
 			continue // not a provider folder (breadcrumbs etc.)
 		}
 		folders++
-		items, err := client.Browse(pctx, folder.Path+"playlists")
+		items, err := client.Browse(ctx, folder.Path+"playlists")
 		if err != nil {
 			p.app.log.Debugf("ma: music/browse %splaylists failed: %v", folder.Path, err)
 			failedFolders++
@@ -907,7 +1005,58 @@ func (p *AppPlayer) maListPlaylists(ctx context.Context) (any, error) {
 	if folders > 0 && failedFolders == folders {
 		return nil, fmt.Errorf("music assistant playlist browse failed for all %d providers", folders)
 	}
-	return map[string]any{"playlists": playlists}, nil
+	return playlists, nil
+}
+
+// maMaybeWarmPlaylists refreshes the playlist cache in the BACKGROUND when it
+// is older than maPlaylistTTL (issue #138 defect B): a single goroutine at a
+// time, on its own context so a slow cold browse (which can outlive
+// maControlTimeout) neither blocks the 1/s poll nor times out. Touched from
+// the run loop; the cache fields are mutex-guarded because the HTTP handler
+// and this goroutine share them.
+func (p *AppPlayer) maMaybeWarmPlaylists(client *ma.Client) {
+	p.maPlaylistMu.Lock()
+	if p.maPlaylistWarming || time.Since(p.maPlaylistCachedAt) < maPlaylistTTL {
+		p.maPlaylistMu.Unlock()
+		return
+	}
+	p.maPlaylistWarming = true
+	p.maPlaylistMu.Unlock()
+
+	wctx, cancel := context.WithTimeout(context.Background(), maPlaylistWarmTimeout)
+	go func() {
+		defer cancel()
+		playlists, err := p.maFetchPlaylists(wctx, client)
+		p.maPlaylistMu.Lock()
+		defer p.maPlaylistMu.Unlock()
+		if err != nil {
+			p.app.log.Warnf("ma: playlist warmup failed: %v", err)
+		} else {
+			p.maPlaylistCache = playlists
+			p.maPlaylistCachedAt = time.Now()
+		}
+		p.maPlaylistWarming = false
+	}()
+}
+
+// maUpdatePlaylistCache records a successful live fetch (request path).
+func (p *AppPlayer) maUpdatePlaylistCache(playlists []MaPlaylist) {
+	p.maPlaylistMu.Lock()
+	defer p.maPlaylistMu.Unlock()
+	p.maPlaylistCache = playlists
+	p.maPlaylistCachedAt = time.Now()
+}
+
+// maStalePlaylists returns the last good list regardless of age (nil/empty
+// when none): serving a stale library beats an error card, but an empty list
+// must never masquerade as content (defect 4 contract).
+func (p *AppPlayer) maStalePlaylists() []MaPlaylist {
+	p.maPlaylistMu.Lock()
+	defer p.maPlaylistMu.Unlock()
+	if len(p.maPlaylistCache) == 0 {
+		return nil
+	}
+	return p.maPlaylistCache
 }
 
 // maPlaylistImage picks the UI-fetchable cover of a playlist browse entry:
