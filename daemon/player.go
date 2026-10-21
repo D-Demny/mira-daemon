@@ -77,10 +77,12 @@ type AppPlayer struct {
 	maPollFailing     bool
 	prefetchTimer     *time.Timer
 
-	// issue #138: cache of the MA upcoming-queue reconstruction - one entry,
-	// keyed by (source uri | current track uri), because the poll runs 1/s
-	// while one track plays but the queue tail only changes per track. Touched
-	// exclusively from the Run() goroutine like the other ma* fields.
+	// issue #138: cache of the MA upcoming-queue list - one entry, keyed by
+	// (queue id | current index | item count | current uri), because the poll
+	// runs 1/s while the live queue tail only changes per track transition;
+	// an autoplay batch append bumps the item count and invalidates (defect
+	// C - the list comes from player_queues/items, see maUpcomingTracks).
+	// Touched exclusively from the Run() goroutine like the other ma* fields.
 	maUpcomingKey    string
 	maUpcomingCached []QueueTrack
 
@@ -90,9 +92,21 @@ type AppPlayer struct {
 	// playlog entry for a selection that started idle (never seen live). Both
 	// are reset when the selection CHANGES so each speaker's "last song" comes
 	// from its own state/log. Touched exclusively from the Run() goroutine.
-	maLastActiveState *RemoteState
-	maIdleLogFallback *RemoteState
-	maIdleLogTriedFor string // player id already asked for a playlog (failure guard)
+	maLastActiveState   *RemoteState
+	maIdleLogFallback   *RemoteState
+	maIdleLogTriedFor   string // player id already asked for a playlog (failure guard)
+	maLastPlaybackState string // raw MA playback state of the selection ("idle"/"paused"/...) - defect A
+
+	// issue #138 (defect B): the flattened playlist list, WARMED in the
+	// background so /ma/playlists never has to wait on a cold browse and can
+	// serve it stale-while-error. Unlike the other ma* fields this one is
+	// shared between the Run() goroutine (warmup) and the request path
+	// (handler + its warmup goroutine) - guarded by maPlaylistMu, same
+	// precedent as queueExpandMu.
+	maPlaylistMu       sync.Mutex
+	maPlaylistCache    []MaPlaylist
+	maPlaylistCachedAt time.Time
+	maPlaylistWarming  bool
 
 	// lyricsProvider handles fetching lyrics from primary + LRCLIB sources
 	lyricsProvider *LyricsProvider
