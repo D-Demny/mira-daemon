@@ -1,5 +1,10 @@
 package ma
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // Player is the subset of the MA Player schema the daemon consumes
 // (issue #134): the observer needs playback state, position, volume and
 // the current media; /ma/devices needs id/name/availability. Everything
@@ -26,6 +31,16 @@ type Player struct {
 	// STALE after the player went idle: MA keeps the last item - callers
 	// must gate on PlaybackState first, not on this pointer).
 	CurrentMedia *CurrentMedia `json:"current_media"`
+
+	// Native multi-room grouping (WiiM firmware level; verified live against
+	// 2.10.7's wiim provider): the group MASTER carries every member - itself
+	// included - in GroupMembers with SyncedTo nil, each SLAVE has an empty
+	// GroupMembers and points to its master via SyncedTo. The daemon uses
+	// this to synthesize one "group" device in /ma/devices and to resolve
+	// commands for a slave or the group to the firmware master (the master
+	// mirrors playback to the slaves natively).
+	GroupMembers []string `json:"group_members"`
+	SyncedTo     *string  `json:"synced_to"` // master player id, nil when not grouped
 }
 
 // CurrentMedia is the subset of MA's PlayerMedia schema the observer maps
@@ -70,18 +85,73 @@ type ArtistName struct {
 // decode into it. Fields a command omits stay zero-valued - play-log mappings
 // in particular carry no album/artists/position (MA 2.10.7 limitation).
 type TrackItem struct {
-	ItemID    string       `json:"item_id"`
-	Provider  string       `json:"provider"`
-	Name      string       `json:"name"`
-	URI       string       `json:"uri"`
-	MediaType string       `json:"media_type"`
-	Album     string       `json:"album"`
-	Version   string       `json:"version"`
-	Artists   []ArtistName `json:"artists"`
-	Duration  int          `json:"duration"` // seconds
-	Position  int          `json:"position"` // absolute index in the parent playlist (playlist_tracks only)
-	Image     *MediaImage  `json:"image"`
+	ItemID    string         `json:"item_id"`
+	Provider  string         `json:"provider"`
+	Name      string         `json:"name"`
+	URI       string         `json:"uri"`
+	MediaType string         `json:"media_type"`
+	Album     AlbumRef       `json:"album"`
+	Version   string         `json:"version"`
+	Artists   []ArtistName   `json:"artists"`
+	Duration  int            `json:"duration"` // seconds
+	Position  int            `json:"position"` // absolute index in the parent playlist (playlist_tracks only)
+	Image     *MediaImage    `json:"image"`
+	Metadata  *MediaMetadata `json:"metadata"`
 }
+
+// MediaMetadata is the subset of a media item's metadata blob the daemon
+// consumes (issue #138): images. Queue items carry their image top-level,
+// but LIBRARY track lists (playlist_tracks / album_tracks) nest the cover
+// under metadata.images only (verified live against 2.10.7), so upcoming
+// cards and playlist track cards read it from here via TrackItem.Cover.
+type MediaMetadata struct {
+	Images []MediaImage `json:"images"`
+}
+
+// Cover returns the item's image entry: top-level first, then the first
+// metadata image; nil when neither is present.
+func (t TrackItem) Cover() *MediaImage {
+	if t.Image != nil {
+		return t.Image
+	}
+	if t.Metadata != nil && len(t.Metadata.Images) > 0 {
+		return &t.Metadata.Images[0]
+	}
+	return nil
+}
+
+// AlbumRef is MA's media-item album field, which arrives as a plain NAME
+// string in some responses but as a FULL album object in playlist-track and
+// queue-media payloads (verified live against 2.10.7 - the object shape
+// breaks plain string unmarshalling of the whole TrackItem, issue #138).
+// Both shapes decode to the album name; Name() yields "" when absent.
+type AlbumRef struct {
+	name string
+}
+
+// UnmarshalJSON implements json.Unmarshaler: a JSON string or an object
+// carrying a "name" field.
+func (a *AlbumRef) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 || string(b) == "null" {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		a.name = s
+		return nil
+	}
+	var o struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(b, &o); err != nil {
+		return fmt.Errorf("ma: unknown album field shape %q", b)
+	}
+	a.name = o.Name
+	return nil
+}
+
+// Name returns the decoded album name.
+func (a AlbumRef) Name() string { return a.name }
 
 // BrowseItem is the union subset of music/browse results used for playlist
 // discovery: provider FOLDERS carry Path (and ItemID "back" as breadcrumb,
@@ -123,13 +193,31 @@ type QueueItem struct {
 	Image       *MediaImage `json:"image"`
 }
 
-// PlayerQueue is the subset of player_queues/get the observer maps into
-// RemoteState: the upcoming queue (NextTracks) feeds the "Läuft gerade"
-// pane; PreviousTrack maps to PrevTracks for parity with the Connect
-// projection.
+// QueueSource is the subset of one queue SOURCE media item (player_queues/get
+// `sources[]`): a single-source queue (one playlist or one album) is
+// identified by it and drives the daemon's upcoming-track reconstruction
+// (see daemon/player_ma.go).
+type QueueSource struct {
+	ItemID    string `json:"item_id"`
+	Provider  string `json:"provider"`
+	Name      string `json:"name"`
+	URI       string `json:"uri"`
+	MediaType string `json:"media_type"` // "playlist" | "album" | ...
+}
+
+// PlayerQueue is the subset of player_queues/get the observer consumes (live
+// verified against MA 2.10.7): the response carries NO item list - only the
+// item count, the current index, the current/next queue items and the source
+// items. The "Läuft gerade" upcoming pane is therefore reconstructed by the
+// daemon from source + index (see maUpcomingTracks in player_ma.go).
 type PlayerQueue struct {
-	QueueID       string      `json:"queue_id"`
-	CurrentTrack  *QueueItem  `json:"current_track"`
-	PreviousTrack *QueueItem  `json:"previous_track"`
-	NextTracks    []QueueItem `json:"next_tracks"`
+	QueueID        string        `json:"queue_id"`
+	Items          int           `json:"items"`         // total queued item count
+	CurrentIndex   *int          `json:"current_index"` // 0-based position of CurrentItem
+	State          string        `json:"state"`         // "playing" | "paused" | "stopped" ...
+	Ended          bool          `json:"ended"`
+	ShuffleEnabled bool          `json:"shuffle_enabled"`
+	CurrentItem    *QueueItem    `json:"current_item"`
+	NextItem       *QueueItem    `json:"next_item"` // nil at the end of the queue
+	Sources        []QueueSource `json:"sources"`
 }

@@ -77,6 +77,13 @@ type AppPlayer struct {
 	maPollFailing     bool
 	prefetchTimer     *time.Timer
 
+	// issue #138: cache of the MA upcoming-queue reconstruction - one entry,
+	// keyed by (source uri | current track uri), because the poll runs 1/s
+	// while one track plays but the queue tail only changes per track. Touched
+	// exclusively from the Run() goroutine like the other ma* fields.
+	maUpcomingKey    string
+	maUpcomingCached []QueueTrack
+
 	// lyricsProvider handles fetching lyrics from primary + LRCLIB sources
 	lyricsProvider *LyricsProvider
 

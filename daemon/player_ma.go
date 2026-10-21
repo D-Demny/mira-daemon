@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -140,10 +141,23 @@ func (p *AppPlayer) maPollTick(ctx context.Context) {
 	}
 	p.maPollFailing = false
 
+	// issue #138: native group self-heal - if the observed player became a
+	// firmware slave since selection (an HA automation formed the WiiM group
+	// around playback while we looked at it), retarget to its master: in a
+	// NATIVE group the music lives on the master and mirrors to the slaves,
+	// so the slave's own state is not the truth. The next tick polls the
+	// master; control already resolves through maResolvePlayerID.
+	if pl.SyncedTo != nil && *pl.SyncedTo != "" && *pl.SyncedTo != p.maActivePlayerId {
+		p.app.log.Infof("ma: player %s is synced to %s - following the group master", pl.PlayerID, *pl.SyncedTo)
+		p.maActivePlayerId = *pl.SyncedTo
+		return
+	}
+
 	// issue #138: upcoming queue for the "Läuft gerade" pane. Fetched only
 	// while media is active (idle players have nothing queued) on the same
-	// 4s poll budget; on a transient fetch failure applyMaState carries the
-	// previous list over instead of blanking the pane.
+	// 4s poll budget; the queue response itself carries NO item list, so the
+	// list is RECONSTRUCTED from source + index below (maUpcomingTracks),
+	// which also keeps the last good list on a transient fetch failure.
 	var queue *ma.PlayerQueue
 	if pl.PlaybackState != "idle" && pl.CurrentMedia != nil {
 		q, qerr := client.GetQueue(pctx, p.maActivePlayerId)
@@ -153,14 +167,14 @@ func (p *AppPlayer) maPollTick(ctx context.Context) {
 		}
 	}
 
-	p.applyMaState(pl, queue)
+	p.applyMaState(pl, queue, p.maUpcomingTracks(pctx, client, pl, queue))
 }
 
 // applyMaState maps one polled MA player into the shared RemoteState -
 // same shape, same clock-timing notes, same events as updateRemoteState -
 // so /observer/status and the event stream stay source-agnostic.
 // issue #134.
-func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue) {
+func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue, upcoming []QueueTrack) {
 	// Idle, or no media at all, is "nothing playing on this speaker" - the
 	// MA equivalent of the Spotify cluster's empty ActiveDeviceId: clear +
 	// observer_inactive. Gate on PlaybackState FIRST: live players keep a
@@ -204,16 +218,16 @@ func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue) {
 	prevState := p.state.remoteState
 	// issue #138: upcoming queue for the "Läuft gerade" pane. A nil queue
 	// (transient player_queues/get failure while media is active) must not
-	// blank the pane: carry the previous lists over while we still own state
-	// on this device.
+	// blank the pane: carry the previous list over while we still own state
+	// on this device. A NON-nil queue with an empty upcoming list is real
+	// "nothing queued behind" (single-track source, shuffled order, ...) -
+	// the pane goes blank on purpose there. MA reports no previous track at
+	// all (no previous_track field on the wire, verified against 2.10.7), so
+	// PrevTracks stays empty by design.
 	if queue != nil {
-		rs.NextTracks = maQueueItemsToTracks(queue.NextTracks)
-		if queue.PreviousTrack != nil {
-			rs.PrevTracks = []QueueTrack{maQueueItemToTrack(*queue.PreviousTrack)}
-		}
+		rs.NextTracks = upcoming
 	} else if prevState != nil && p.maOwnsRemoteState && prevState.DeviceId == rs.DeviceId {
 		rs.NextTracks = prevState.NextTracks
-		rs.PrevTracks = prevState.PrevTracks
 	}
 	// a state handed over from the other backend (flag unset) counts as a
 	// new track: the UI must re-render title/art/position on the switch
@@ -246,6 +260,183 @@ func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue) {
 			Data: rs,
 		})
 	}
+}
+
+// maGroupIDPrefix marks the synthetic /ma/devices entry of a native
+// (firmware-level) group; selecting it resolves to the group master, whose
+// WiiM firmware mirrors playback to every slave natively (issue #138 - the
+// "Wiim Wohnzimmer (Gruppe)" the user asked for; deliberately NOT an MA
+// virtual group: in a native group the music plays once and syncs at the
+// firmware level, which is what the WiiM sync software already does).
+const maGroupIDPrefix = "group:"
+
+// maResolvePlayerID canonicalizes a selected MA player id (issue #138):
+// a "group:<id>" name (the synthetic group entry) resolves to the master it
+// names; a player currently synced to a firmware master resolves to that
+// master, because in a native WiiM group only the master can play - slaves
+// just mirror. Unknown ids (and dissolved groups) yield "". Run loop only.
+func (p *AppPlayer) maResolvePlayerID(id string, players []ma.Player) string {
+	if strings.HasPrefix(id, maGroupIDPrefix) {
+		id = strings.TrimPrefix(id, maGroupIDPrefix)
+	}
+	for _, pl := range players {
+		if pl.PlayerID != id {
+			continue
+		}
+		if pl.SyncedTo != nil && *pl.SyncedTo != "" {
+			return *pl.SyncedTo
+		}
+		return id
+	}
+	return ""
+}
+
+// maTransferPlayback moves the active playback from oldPlayerID to
+// newPlayerID (issue #138, user-approved transfer semantics - "like
+// Spotify Connect"): it replays the SAME source on the new player starting
+// at the current track, then pauses the old one. The source comes from the
+// old queue's sources[] + current item; a queue without a usable source
+// (single-item playback) falls back to the bare current track URI. "Nothing
+// playing" (idle / no media) is a plain re-target no-op. PlayMedia failure
+// aborts the selection (the caller returns the error and keeps the old
+// target); Pause failure only logs - the music already moved.
+func (p *AppPlayer) maTransferPlayback(ctx context.Context, client *ma.Client, oldPlayerID, newPlayerID string) error {
+	q, err := client.GetQueue(ctx, oldPlayerID)
+	if err != nil {
+		p.app.log.Debugf("ma: transfer: queue get %s failed: %v (treating as idle)", oldPlayerID, err)
+		return nil // not observable = nothing active: plain re-target
+	}
+	if q == nil || q.State == "idle" || q.CurrentItem == nil || q.CurrentItem.MediaItem == nil {
+		return nil
+	}
+	cur := q.CurrentItem.MediaItem
+	mediaURI, startItem := cur.URI, ""
+	if len(q.Sources) == 1 && q.Sources[0].URI != "" {
+		mediaURI = q.Sources[0].URI // replay the full source, not a single track
+		startItem = cur.ItemID      // MA's resolver matches item_id or uri exactly (2.10.7)
+	}
+	if err := client.PlayMedia(ctx, newPlayerID, mediaURI, startItem); err != nil {
+		p.app.log.Warnf("ma: transfer to %s failed: %v", newPlayerID, err)
+		return fmt.Errorf("could not move playback to the new device")
+	}
+	if err := client.Pause(ctx, oldPlayerID); err != nil {
+		p.app.log.Warnf("ma: transfer: pausing %s failed: %v", oldPlayerID, err)
+	}
+	p.app.log.Infof("ma: moved playback from %s to %s (%s)", oldPlayerID, newPlayerID, mediaURI)
+	return nil
+}
+
+// maUpcomingTracks reconstructs the upcoming queue list for the "Läuft
+// gerade" pane (issue #138). MA's player_queues/get carries no item list -
+// only sources[] + current_index - so a single-source queue is re-expanded
+// from its source's ordered track list: the currently playing track is
+// located in it and everything AFTER it becomes the upcoming list. 2.10.7
+// semantics (music/queue media resolver, verified in source): a playlist or
+// album queue holds the FULL ordered track list with at most the prefix
+// before the start item dropped, so "everything after the current position"
+// is exactly the queue tail - for both full and rotated queues.
+// Queues that cannot be reconstructed yield an EMPTY list (not a failure):
+// no/multiple sources, single-track sources, shuffle on (the queue order
+// then differs from the source order and queue indices are not addressable).
+// A failed source fetch keeps the last good list instead of blanking. The
+// result is cached per (source, current track) so the 1/s poll does not
+// re-fetch playlist tracks while one track plays. Run loop only.
+func (p *AppPlayer) maUpcomingTracks(ctx context.Context, client *ma.Client, pl *ma.Player, queue *ma.PlayerQueue) []QueueTrack {
+	if queue == nil || pl.CurrentMedia == nil {
+		return p.maUpcomingCached // stale-or-empty; the poll carries the previous list over
+	}
+	if queue.CurrentIndex == nil || len(queue.Sources) != 1 || queue.ShuffleEnabled {
+		return []QueueTrack{} // not reconstructable: honest blank, no fetch
+	}
+	src := queue.Sources[0]
+
+	key := src.URI + "|" + pl.CurrentMedia.URI
+	if key == p.maUpcomingKey {
+		return p.maUpcomingCached
+	}
+
+	var (
+		tracks []ma.TrackItem
+		err    error
+	)
+	switch src.MediaType {
+	case "playlist":
+		tracks, err = client.PlaylistTracks(ctx, src.ItemID)
+	case "album":
+		tracks, err = client.AlbumTracks(ctx, src.ItemID, src.Provider)
+	default:
+		return []QueueTrack{} // single track or unknown source type: nothing to expand
+	}
+	if err != nil {
+		p.app.log.Debugf("ma: upcoming reconstruction %s/%s failed: %v", src.MediaType, src.ItemID, err)
+		return p.maUpcomingCached // keep the last good list on transient failure; retry next tick
+	}
+
+	upcoming := []QueueTrack{}
+	if idx := maIndexOfTrack(tracks, pl.CurrentMedia); idx >= 0 {
+		rest := tracks[idx+1:]
+		if len(rest) > QueueLimit {
+			rest = rest[:QueueLimit]
+		}
+		for j := range rest {
+			t := maTrackToUpcoming(rest[j], *queue.CurrentIndex+1+j, true)
+			if t.Uri != "" || t.Name != "" {
+				upcoming = append(upcoming, t)
+			}
+		}
+	}
+	p.maUpcomingKey = key
+	p.maUpcomingCached = upcoming
+	return upcoming
+}
+
+// maIndexOfTrack locates the currently playing track inside an ordered track
+// list: exact URI first (stable per provider instance), case-insensitive
+// title as fallback. -1 when not found (dynamic playlist reshuffle, manual
+// queue edits) - the upcoming pane stays empty then rather than guess.
+func maIndexOfTrack(tracks []ma.TrackItem, cur *ma.CurrentMedia) int {
+	for i := range tracks {
+		if cur.URI != "" && tracks[i].URI == cur.URI {
+			return i
+		}
+	}
+	for i := range tracks {
+		if tracks[i].Name != "" && strings.EqualFold(tracks[i].Name, cur.Title) {
+			return i
+		}
+	}
+	return -1
+}
+
+// maTrackToUpcoming maps one source track into the shared QueueTrack shape
+// for the upcoming pane (issue #138). queueIndex is the entry's absolute
+// position in the QUEUE, not in the source list: it doubles as the play_index
+// target for the in-queue skip (maPlayUri), which accepts a queue index.
+// TrackId is only set when the queue order equals the source order - i.e.
+// shuffle off; shuffled queues get empty TrackIds so in-queue taps fall back
+// to single-item playback instead of mis-jumping. Cover: top-level image
+// first, metadata.images as fallback (library track lists only carry the
+// latter).
+func maTrackToUpcoming(t ma.TrackItem, queueIndex int, addressable bool) QueueTrack {
+	qt := QueueTrack{
+		Uri:      t.URI,
+		Name:     t.Name,
+		Album:    t.Album.Name(),
+		ImageUrl: maImageURL(t.Cover()),
+	}
+	if addressable {
+		qt.TrackId = strconv.Itoa(queueIndex)
+	}
+	if len(t.Artists) > 0 {
+		names := make([]string, 0, len(t.Artists))
+		for _, a := range t.Artists {
+			if a.Name != "" {
+				names = append(names, a.Name)
+			}
+		}
+		qt.Artist = strings.Join(names, ", ")
+	}
+	return qt
 }
 
 // maVolumeToState maps MA's 0..100 level into the shared 0..MaxStateVolume
@@ -376,14 +567,30 @@ func (p *AppPlayer) maListDevices(ctx context.Context) (any, error) {
 	for _, pl := range players {
 		devs = append(devs, MaDevice{Id: pl.PlayerID, Name: pl.Name, Available: pl.Available})
 	}
+	// issue #138: one synthetic entry per native (firmware-level) group -
+	// the MASTER with more than one member. Selecting it resolves to the
+	// master whose WiiM firmware mirrors playback to the slaves natively;
+	// HA's group-formation automation keeps the group alive around playback
+	// exactly like the Spotify flow (deliberately NOT an MA virtual group).
+	for _, pl := range players {
+		if len(pl.GroupMembers) > 1 {
+			devs = append(devs, MaDevice{Id: maGroupIDPrefix + pl.PlayerID, Name: pl.Name + " (Gruppe)", Available: pl.Available})
+		}
+	}
 	return map[string]any{"devices": devs}, nil
 }
 
-// maSelectPlayer backs POST /ma/player/select (issue #134, pinned contract):
-// the player must exist in players/all (else 400), MA must be configured
-// (else 400). On success it persists the selection the same way the daemon
-// remembers the last Spotify device (in-memory per session) and starts
-// observing: the next poll tick applies the MA state within ~1s.
+// maSelectPlayer backs POST /ma/player/select (issue #134 + #138, pinned
+// contract): the id must resolve via players/all - a bare player id, the
+// "group:<master>" name of the synthetic native-group entry, or an id that
+// is currently synced to a firmware master (resolves to the master) - else
+// 400. MA must be configured (else 400). Picking a DIFFERENT target than
+// the current selection TRANSFERS the active playback there (replay the
+// same source from the current track + pause the old player; user-approved
+// "Spotify Connect" semantics); picking while nothing plays is a plain
+// re-target. On success it persists the RESOLVED id the same way the daemon
+// remembers the last Spotify device (in-memory per session): the next poll
+// tick observes it within ~1s.
 func (p *AppPlayer) maSelectPlayer(ctx context.Context, playerID string) (any, error) {
 	cfg, _ := p.maResolved()
 	if cfg == nil {
@@ -392,27 +599,38 @@ func (p *AppPlayer) maSelectPlayer(ctx context.Context, playerID string) (any, e
 
 	pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
 	defer cancel()
-	players, err := p.maClientFor(cfg).ListPlayers(pctx)
+	client := p.maClientFor(cfg)
+	players, err := client.ListPlayers(pctx)
 	if err != nil {
 		p.app.log.Warnf("ma: players/all failed during player select: %v", err)
 		return nil, fmt.Errorf("music assistant unreachable: %w", err)
 	}
 
-	var name string
-	found := false
+	resolved := p.maResolvePlayerID(playerID, players)
+	if resolved == "" {
+		return nil, ErrBadRequest
+	}
+	name := playerID
 	for _, pl := range players {
-		if pl.PlayerID == playerID {
-			found = true
+		if pl.PlayerID == resolved {
 			name = pl.Name
 			break
 		}
 	}
-	if !found {
-		return nil, ErrBadRequest
+
+	// issue #138 (user-approved): transfer the active playback to the new
+	// target - "like Spotify Connect", the music follows the selection. Only
+	// when a DIFFERENT player is currently selected: re-selecting the same
+	// resolved target (tapping a slave or its group entry while the master
+	// already plays) must not restart the music.
+	if old := p.maActivePlayerId; old != "" && old != resolved {
+		if err := p.maTransferPlayback(pctx, client, old, resolved); err != nil {
+			return nil, err
+		}
 	}
 
-	p.maActivePlayerId = playerID
-	p.app.log.Infof("ma: selected player %s (%s)", playerID, name)
+	p.maActivePlayerId = resolved
+	p.app.log.Infof("ma: selected player %s (%s)", resolved, name)
 	return map[string]any{"ok": true}, nil
 }
 
@@ -455,90 +673,6 @@ func maImageURL(img *ma.MediaImage) string {
 		return p
 	}
 	return ""
-}
-
-// maQueueItemToTrack maps one MA queue item into the shared QueueTrack shape
-// (issue #138). MA pre-composes music-item Names as "Artist(s) - Title" with
-// an optional trailing "(version)" suffix and may simplify the nested artists
-// away, so the real title comes from media_item when present and the artist
-// is recovered by suffix-matching it against the composed name - a naive
-// first-" - " split would corrupt titles that themselves contain " - ".
-func maQueueItemToTrack(q ma.QueueItem) QueueTrack {
-	t := QueueTrack{TrackId: q.QueueItemID}
-
-	if mi := q.MediaItem; mi != nil {
-		t.Uri = mi.URI
-		t.Album = mi.Album
-		title := mi.Name
-		if title == "" {
-			title = maStripVersionSuffix(q.Name, mi.Version)
-		}
-		t.Name = title
-		if len(mi.Artists) > 0 {
-			names := make([]string, 0, len(mi.Artists))
-			for _, a := range mi.Artists {
-				if a.Name != "" {
-					names = append(names, a.Name)
-				}
-			}
-			t.Artist = strings.Join(names, ", ")
-		} else if title != "" {
-			base := maStripVersionSuffix(q.Name, mi.Version)
-			if strings.HasSuffix(base, title) {
-				t.Artist = strings.TrimSuffix(base[:len(base)-len(title)], " - ")
-			} else if i := strings.Index(base, " - "); i > 0 {
-				t.Artist = base[:i]
-			}
-		}
-		if img := maImageURL(q.Image); img != "" {
-			t.ImageUrl = img
-		} else if mi.Image != nil {
-			t.ImageUrl = maImageURL(mi.Image)
-		}
-		return t
-	}
-
-	// no media_item: best-effort parse of the composed name
-	if i := strings.Index(q.Name, " - "); i > 0 {
-		t.Artist = q.Name[:i]
-		t.Name = strings.TrimSpace(q.Name[i+3:])
-	} else {
-		t.Name = q.Name
-	}
-	t.ImageUrl = maImageURL(q.Image)
-	return t
-}
-
-// maStripVersionSuffix removes a trailing "(version)" from a composed queue
-// item name ("A - B (remix)" with version "remix" -> "A - B").
-func maStripVersionSuffix(name, version string) string {
-	if version == "" {
-		return name
-	}
-	suffix := "(" + version + ")"
-	if strings.HasSuffix(name, suffix) {
-		return name[:len(name)-len(suffix)]
-	}
-	return name
-}
-
-// maQueueItemsToTracks maps the upcoming queue (issue #138): capped at
-// QueueLimit like the Connect projection and dropping entries with no usable
-// identity - the UI sanitizer would reject them anyway and the pane keys off
-// track_id/uri.
-func maQueueItemsToTracks(items []ma.QueueItem) []QueueTrack {
-	if len(items) > QueueLimit {
-		items = items[:QueueLimit]
-	}
-	out := make([]QueueTrack, 0, len(items))
-	for i := range items {
-		t := maQueueItemToTrack(items[i])
-		if t.Uri == "" && t.Name == "" {
-			continue
-		}
-		out = append(out, t)
-	}
-	return out
 }
 
 // MaPlaylist is one entry of GET /ma/playlists (issue #138, pinned contract).
@@ -653,11 +787,11 @@ func (p *AppPlayer) maListPlaylistItems(ctx context.Context, itemID string) (any
 				names = append(names, a.Name)
 			}
 		}
-		t := MaTrack{ID: it.ItemID, Name: it.Name, URI: it.URI, Album: it.Album, Artists: names, Position: it.Position}
+		t := MaTrack{ID: it.ItemID, Name: it.Name, URI: it.URI, Album: it.Album.Name(), Artists: names, Position: it.Position}
 		if it.Duration > 0 {
 			t.DurationMs = int64(it.Duration) * 1000
 		}
-		t.ImageURL = maImageURL(it.Image)
+		t.ImageURL = maImageURL(it.Cover())
 		tracks = append(tracks, t)
 	}
 	return map[string]any{"tracks": tracks}, nil
