@@ -900,6 +900,17 @@ func readAmbientLux() (int, bool) {
 	return v, true
 }
 
+// writeMaNotReady answers the /ma/* content endpoints (devices, playlists,
+// playlist-items, recent) before the player session exists. A 503 - not a
+// 200 with an empty list - so UI clients treat it as "retry later" instead
+// of caching a spurious empty list; see issue #138 startup race after flash.
+func writeMaNotReady(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": "player session not ready"})
+}
+
 func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter) {
 	// pre-session, nobody is reading the channel yet, fail fast
 	if !s.playerReady.Load() {
@@ -1290,7 +1301,9 @@ func (s *ConcreteApiServer) serve() {
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeTransfer, Data: data}, w)
 	})
 	// issue #134: Music Assistant backend - device list + player selection
-	// (pinned contract, see maListDevices/maSelectPlayer)
+	// (pinned contract, see maListDevices/maSelectPlayer). The content
+	// endpoints answer 503 pre-session (writeMaNotReady) so UI clients retry
+	// instead of caching a spurious empty list - issue #138 startup race.
 	m.HandleFunc("/ma/devices", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1298,9 +1311,7 @@ func (s *ConcreteApiServer) serve() {
 		}
 		// no session yet so no MA config either
 		if !s.playerReady.Load() {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []any{}})
+			writeMaNotReady(w)
 			return
 		}
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeMaDevices}, w)
@@ -1323,16 +1334,16 @@ func (s *ConcreteApiServer) serve() {
 	})
 	// issue #138: Music Assistant content menus - playlists, playlist tracks,
 	// recent (pinned contracts, see maListPlaylists & co. in player_ma.go).
-	// Same no-session short-circuit as /ma/devices: an empty list, never an error.
+	// Pre-session they answer 503 like the rest of the channel-bound API:
+	// a 200 with an empty list would be cached by the UI as "no content"
+	// (startup race after flash - issue #138).
 	m.HandleFunc("/ma/playlists", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 		if !s.playerReady.Load() {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-			_ = json.NewEncoder(w).Encode(map[string]any{"playlists": []any{}})
+			writeMaNotReady(w)
 			return
 		}
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeMaPlaylists}, w)
@@ -1343,10 +1354,12 @@ func (s *ConcreteApiServer) serve() {
 			return
 		}
 		itemID := strings.TrimSpace(r.URL.Query().Get("id"))
-		if !s.playerReady.Load() || itemID == "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-			_ = json.NewEncoder(w).Encode(map[string]any{"tracks": []any{}})
+		if itemID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if !s.playerReady.Load() {
+			writeMaNotReady(w)
 			return
 		}
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeMaPlaylistItems, Data: ApiRequestDataMaPlaylistItems{ItemID: itemID}}, w)
@@ -1361,9 +1374,7 @@ func (s *ConcreteApiServer) serve() {
 			limit = v
 		}
 		if !s.playerReady.Load() {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-			_ = json.NewEncoder(w).Encode(map[string]any{"tracks": []any{}})
+			writeMaNotReady(w)
 			return
 		}
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeMaRecent, Data: limit}, w)
