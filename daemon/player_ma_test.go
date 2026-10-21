@@ -188,10 +188,12 @@ func TestApplyMaState_Paused(t *testing.T) {
 	}
 }
 
-// TestApplyMaState_IdleClearsStaleMedia: live MA players keep a non-null
-// (stale) current_media after going idle, so PlaybackState gates first;
-// an idle poll must clear the observed state and release ownership.
-func TestApplyMaState_IdleClearsStaleMedia(t *testing.T) {
+// TestApplyMaState_IdleKeepsSelection (issue #138, defects 1+2): live MA
+// players keep a non-null (stale) current_media after going idle, so
+// PlaybackState gates first. An idle poll of the selected player must NOT
+// drop to the device picker: it synthesizes a paused RemoteState carrying
+// the last known track, keeping ownership and the device addressable.
+func TestApplyMaState_IdleKeepsSelection(t *testing.T) {
 	t.Parallel()
 	p := newMaTestPlayer(t, nil)
 	p.applyMaState(maPlayingPlayer(), nil, nil) // seed a playing state
@@ -203,24 +205,93 @@ func TestApplyMaState_IdleClearsStaleMedia(t *testing.T) {
 	pl.PlaybackState = "idle" // media intentionally still set (stale)
 	p.applyMaState(pl, nil, nil)
 
-	if p.state.remoteState != nil {
-		t.Error("idle poll must clear remoteState")
+	rs := p.state.remoteState
+	if rs == nil {
+		t.Fatal("idle poll must keep remoteState (device stays selected)")
 	}
-	if p.maOwnsRemoteState {
-		t.Error("ownership must be released on idle")
+	if rs.DeviceId != "wiim_uuid:A" || rs.IsPlaying || !rs.IsPaused {
+		t.Errorf("idle state: %+v", rs)
+	}
+	if rs.TrackUri != "spotify--x://track/abc" || rs.TrackName != "Glide" ||
+		rs.TrackArtist != "NEIKED/Portugal. The Man" || rs.Duration != 184000 {
+		t.Errorf("last track must be shown: %+v", rs)
+	}
+	if len(rs.NextTracks) != 0 {
+		t.Errorf("idle queue has nothing upcoming: %+v", rs.NextTracks)
+	}
+	if !p.maOwnsRemoteState {
+		t.Error("ownership must be kept on idle")
+	}
+	if p.maLastActiveState == nil || p.maLastActiveState.TrackUri != "spotify--x://track/abc" {
+		t.Errorf("live state must be remembered for the idle display, got %+v", p.maLastActiveState)
 	}
 }
 
-// TestApplyMaState_NullMediaClears: no media at all is also an idle signal.
-func TestApplyMaState_NullMediaClears(t *testing.T) {
+// TestApplyMaState_NullMediaKeepsSelection (issue #138, defect 1): no media
+// at all is also an idle signal - and a selection that was never seen live
+// (fresh app start) still keeps the device selected with a title-less
+// paused card until the poll tick's playlog fetch fills the last song.
+func TestApplyMaState_NullMediaKeepsSelection(t *testing.T) {
 	t.Parallel()
 	p := newMaTestPlayer(t, nil)
 	pl := maPlayingPlayer()
 	pl.CurrentMedia = nil
 
 	p.applyMaState(pl, nil, nil)
-	if p.state.remoteState != nil {
-		t.Error("null-media poll must clear remoteState")
+
+	rs := p.state.remoteState
+	if rs == nil {
+		t.Fatal("null-media poll must keep remoteState (device stays selected)")
+	}
+	if rs.DeviceId != "wiim_uuid:A" || !rs.IsPaused || rs.IsPlaying || rs.TrackUri != "" {
+		t.Errorf("title-less idle state: %+v", rs)
+	}
+}
+
+// TestMaPollTick_IdleFetchesPerQueuePlaylog (issue #138, defect 1): an idle
+// selection with no live state fetches the speaker's OWN last played track
+// once (per-queue playlog filter) and shows it in the synthesized paused
+// state; a second tick does not re-fetch.
+func TestMaPollTick_IdleFetchesPerQueuePlaylog(t *testing.T) {
+	t.Parallel()
+	idle := `{
+	  "player_id":"wiim_uuid:A","name":"WiiM Kueche","available":true,"playback_state":"idle",
+	  "group_members":["wiim_uuid:A"],"synced_to":null,
+	  "current_media":{"uri":"stale://track/x","title":"Stale","artist":"","album":"","image_url":"","duration":10}
+}`
+	recent := `[{"item_id":"t9","provider":"spotify--x","name":"Last Song","uri":"spotify--x://track/last","media_type":"track",
+	  "artists":[{"name":"DJ"}],"album":"Mix","duration":200,
+	  "image":{"type":"thumb","path":"https://i.scdn.co/image/r1","provider":"spotify--x","remotely_accessible":true}}]`
+	srv, envs := newMaRecordingServer(t, map[string]string{
+		"players/get":                 idle,
+		"music/recently_played_items": recent,
+	})
+	p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+	p.maActivePlayerId = "wiim_uuid:A"
+
+	p.maPollTick(context.Background())
+
+	rs := p.state.remoteState
+	if rs == nil || !rs.IsPaused || rs.TrackUri != "spotify--x://track/last" || rs.TrackName != "Last Song" {
+		t.Fatalf("idle state must show the playlog last song: %+v", rs)
+	}
+	if rs.Duration != 200000 {
+		t.Errorf("duration: got %d want 200000", rs.Duration)
+	}
+
+	p.maPollTick(context.Background()) // tried-guard: no second fetch
+
+	fetched := 0
+	for _, e := range *envs {
+		if c, _ := e["command"].(string); c == "music/recently_played_items" {
+			fetched++
+		}
+	}
+	if fetched != 1 {
+		t.Errorf("per-queue playlog must be fetched exactly once, got %d", fetched)
+	}
+	if args := envArgs(t, *envs, "music/recently_played_items"); args["queue_id"] != "wiim_uuid:A" {
+		t.Errorf("queue_id filter must carry the player's own id: %v", args["queue_id"])
 	}
 }
 
@@ -590,11 +661,16 @@ func TestApplyMaState_Queue(t *testing.T) {
 		if len(rs.PrevTracks) != 0 {
 			t.Errorf("prev tracks must be empty, got %+v", rs.PrevTracks)
 		}
+		// issue #138 defect 3: a single-source queue exposes its URI so the UI
+		// can tap upcoming tracks with context+offset instead of raw indices
+		if rs.ContextUri != "library://playlist/61" {
+			t.Errorf("context uri must expose the single queue source, got %q", rs.ContextUri)
+		}
 	})
 
 	t.Run("nil queue carries the previous list over", func(t *testing.T) {
 		p := newMaTestPlayer(t, nil)
-		q := ma.PlayerQueue{State: "playing"}
+		q := ma.PlayerQueue{State: "playing", Sources: []ma.QueueSource{{URI: "library://playlist/61"}}}
 		list := []QueueTrack{{TrackId: "4", Uri: "spotify--x://track/one", Name: "One"}}
 		p.applyMaState(maPlayingPlayer(), &q, list)
 
@@ -605,6 +681,9 @@ func TestApplyMaState_Queue(t *testing.T) {
 		got := p.state.remoteState.NextTracks
 		if len(got) != 1 || got[0].TrackId != "4" {
 			t.Errorf("carry-over failed: %+v", got)
+		}
+		if ctx := p.state.remoteState.ContextUri; ctx != "library://playlist/61" {
+			t.Errorf("context uri must carry over with the queue, got %q", ctx)
 		}
 	})
 
@@ -654,11 +733,10 @@ func TestMaSend_PlayUriRouting(t *testing.T) {
 			t.Errorf("start_item: %v", args["start_item"])
 		}
 	})
-
 	t.Run("bare uri matching an observed upcoming track skips in queue", func(t *testing.T) {
 		p.state.remoteState = &RemoteState{
 			DeviceId:   "wiim_uuid:A",
-			NextTracks: []QueueTrack{{TrackId: "qi-7", Uri: "spotify--x://track/abc"}},
+			NextTracks: []QueueTrack{{TrackId: "4", Uri: "spotify--x://track/abc"}},
 		}
 		if err := p.maSend(ctx, "play", ApiRequestDataPlay{Uri: "spotify--x://track/abc"}); err != nil {
 			t.Fatalf("maSend(play): %v", err)
@@ -668,8 +746,66 @@ func TestMaSend_PlayUriRouting(t *testing.T) {
 			t.Fatalf("command: got %v want player_queues/play_index", env["command"])
 		}
 		args, _ := env["args"].(map[string]any)
-		if args["queue_id"] != "wiim_uuid:A" || args["index"] != "qi-7" {
-			t.Errorf("args: %+v", args)
+		if args["queue_id"] != "wiim_uuid:A" {
+			t.Errorf("queue_id: %+v", args)
+		}
+		// MA 2.10.7's play_index schema is int | str: the queue position MUST
+		// be a JSON number (a string resolves as queue_item_id -> 400 "Item N
+		// not found in queue", issue #138 defect 3)
+		idx, ok := args["index"].(float64) // JSON numbers decode to float64
+		if !ok || int(idx) != 4 {
+			t.Errorf("index must be the JSON number 4, got %T %v", args["index"], args["index"])
+		}
+	})
+
+	t.Run("non-numeric track id falls through to single-item playback", func(t *testing.T) {
+		p.state.remoteState = &RemoteState{
+			DeviceId:   "wiim_uuid:A",
+			NextTracks: []QueueTrack{{TrackId: "uuid-ish-id", Uri: "spotify--x://track/abc"}},
+		}
+		if err := p.maSend(ctx, "play", ApiRequestDataPlay{Uri: "spotify--x://track/abc"}); err != nil {
+			t.Fatalf("maSend(play): %v", err)
+		}
+		if got := (*last)["command"]; got != "player_queues/play_media" {
+			t.Errorf("non-numeric id must not hit play_index: command %v", got)
+		}
+	})
+
+	t.Run("offset playback failure falls back to the single tapped item", func(t *testing.T) {
+		// dedicated server: the first play_media 500s (stale context), the
+		// second answers ok - mirroring the live re-queue race.
+		calls := 0
+		var got map[string]any
+		srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			var env map[string]any
+			_ = json.Unmarshal(b, &env)
+			got = env
+			calls++
+			if calls == 1 {
+				http.Error(w, "boom", http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write([]byte(`null`))
+		}))
+		t.Cleanup(srv2.Close)
+		p2 := newMaTestPlayer(t, maTestSettings(srv2.URL, "ma"))
+		p2.maActivePlayerId = "wiim_uuid:A"
+
+		play := ApiRequestDataPlay{Uri: "library://playlist/61", Offset: &ApiRequestPlayOffset{Position: 3, Uri: "spotify--x://track/xyz"}}
+		if err := p2.maSend(ctx, "play", play); err != nil {
+			t.Fatalf("maSend(play): %v", err)
+		}
+		if calls != 2 {
+			t.Fatalf("expected offset attempt + single-item fallback (2 calls), got %d", calls)
+		}
+		args, _ := got["args"].(map[string]any)
+		media, _ := args["media"].([]any)
+		if len(media) != 1 || media[0] != "spotify--x://track/xyz" {
+			t.Errorf("fallback must play the tapped item alone: %+v", args)
+		}
+		if _, ok := args["start_item"]; ok {
+			t.Errorf("fallback must not keep a start_item: %+v", args)
 		}
 	})
 
@@ -819,7 +955,7 @@ func tracksFromPayload(t *testing.T, payload any) []MaTrack {
 
 // TestMaListPlaylists pins the GET /ma/playlists contract (issue #138):
 // flattened library playlists across provider folders, per-folder failures
-// skipped, empty list on unconfigured/unreachable - never an error.
+// skipped; unconfigured yields an empty list, a configured-but-failing browse errors (-> HTTP 500) so the UI retries instead of caching an empty list (defect 4).
 func TestMaListPlaylists(t *testing.T) {
 	t.Parallel()
 
@@ -864,18 +1000,24 @@ func TestMaListPlaylists(t *testing.T) {
 		}
 	})
 
-	t.Run("unreachable yields empty list", func(t *testing.T) {
+	t.Run("configured but unreachable errors", func(t *testing.T) {
 		srv, _ := newMaContentFakeServer(t, routes)
 		url := srv.URL
 		srv.Close()
 
 		p := newMaTestPlayer(t, maTestSettings(url, "ma"))
-		payload, err := p.maListPlaylists(context.Background())
-		if err != nil {
-			t.Fatalf("unreachable must not error: %v", err)
+		if _, err := p.maListPlaylists(context.Background()); err == nil {
+			t.Fatal("configured + failed root browse must error (issue #138 defect 4)")
 		}
-		if pl := playlistsFromPayload(t, payload); len(pl) != 0 {
-			t.Errorf("want empty list, got %+v", pl)
+	})
+
+	t.Run("all provider folders failing errors", func(t *testing.T) {
+		srv, _ := newMaContentFakeServer(t, map[string]string{
+			"music/browse@root": maTestBrowseRoot, // no <provider>://playlists route -> every folder 500s
+		})
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		if _, err := p.maListPlaylists(context.Background()); err == nil {
+			t.Fatal("all-folder failure must error, not yield an empty list")
 		}
 	})
 }
@@ -944,7 +1086,7 @@ func TestMaListPlaylistItems(t *testing.T) {
 
 // TestMaListRecent pins the GET /ma/recent contract (issue #138): play-log
 // track rows only (album rows and uri-less rows filtered in the client),
-// empty list on failure, limit clamping.
+// a configured-but-failing playlog fetch errors (defect 4), limit clamping.
 func TestMaListRecent(t *testing.T) {
 	t.Parallel()
 
@@ -969,6 +1111,14 @@ func TestMaListRecent(t *testing.T) {
 		if tracks[0].Name != "Recently One" || tracks[0].URI != "spotify--x://track/r1" ||
 			tracks[0].ImageURL != "https://i.scdn.co/image/r1" {
 			t.Errorf("track 0: %+v", tracks[0])
+		}
+	})
+
+	t.Run("configured but failing fetch errors", func(t *testing.T) {
+		srv, _ := newMaContentFakeServer(t, nil) // unrouted -> 500
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		if _, err := p.maListRecent(context.Background(), 20); err == nil {
+			t.Fatal("configured + failed playlog fetch must error (issue #138 defect 4)")
 		}
 	})
 
@@ -1080,6 +1230,58 @@ func TestMaSelectPlayer_Resolution(t *testing.T) {
 		if _, err := p.maSelectPlayer(context.Background(), "group:does-not-exist"); !errors.Is(err, ErrBadRequest) {
 			t.Errorf("want ErrBadRequest, got %v", err)
 		}
+	})
+}
+
+// TestMaSelectPlayer_ResetsLastSongSources (issue #138, defect 1): the
+// last-song sources are per speaker - a CHANGED target re-derives them (fresh
+// per-queue playlog on the first idle poll), re-selecting the same target
+// keeps them.
+func TestMaSelectPlayer_ResetsLastSongSources(t *testing.T) {
+	t.Parallel()
+	routes := map[string]string{"players/all": maTestGroupPlayersJSON}
+
+	newP := func(t *testing.T, url string) *AppPlayer {
+		p := newMaTestPlayer(t, maTestSettings(url, "ma"))
+		p.maActivePlayerId = "wiim_uuid:A"
+		p.maLastActiveState = &RemoteState{DeviceId: "wiim_uuid:A", TrackUri: "spotify--x://track/old"}
+		p.maIdleLogFallback = &RemoteState{DeviceId: "wiim_uuid:A"}
+		p.maIdleLogTriedFor = "wiim_uuid:A"
+		return p
+	}
+
+	t.Run("changed target clears the old speaker's sources", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newP(t, srv.URL)
+
+		if _, err := p.maSelectPlayer(context.Background(), "solo-1"); err != nil {
+			t.Fatalf("maSelectPlayer: %v", err)
+		}
+		if p.maActivePlayerId != "solo-1" {
+			t.Errorf("target: got %q want solo-1", p.maActivePlayerId)
+		}
+		if p.maLastActiveState != nil || p.maIdleLogFallback != nil || p.maIdleLogTriedFor != "" {
+			t.Errorf("changed target must reset last-song sources: %+v / %+v / %q", p.maLastActiveState, p.maIdleLogFallback, p.maIdleLogTriedFor)
+		}
+		assertOnlyCommands(t, *envs, []string{"players/all", "player_queues/get"}) // queue get 500s -> treated as idle -> plain re-target
+	})
+
+	t.Run("same target keeps the sources", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newP(t, srv.URL)
+
+		if _, err := p.maSelectPlayer(context.Background(), "solo-1"); err != nil { // different target first
+			t.Fatalf("maSelectPlayer: %v", err)
+		}
+		p.maLastActiveState = &RemoteState{DeviceId: "solo-1", TrackUri: "spotify--x://track/new"}
+
+		if _, err := p.maSelectPlayer(context.Background(), "solo-1"); err != nil {
+			t.Fatalf("maSelectPlayer (again): %v", err)
+		}
+		if p.maLastActiveState == nil || p.maLastActiveState.TrackUri != "spotify--x://track/new" {
+			t.Errorf("re-selecting the same target must keep the sources, got %+v", p.maLastActiveState)
+		}
+		assertOnlyCommands(t, *envs, []string{"players/all", "player_queues/get", "players/all"})
 	})
 }
 

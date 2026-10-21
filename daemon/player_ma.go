@@ -153,6 +153,15 @@ func (p *AppPlayer) maPollTick(ctx context.Context) {
 		return
 	}
 
+	// issue #138 (defect 1): a selection that starts IDLE has no live state
+	// to display - fetch the speaker's OWN playlog once (per-queue filter,
+	// read-only) so the synthesized paused state can show its last song. The
+	// tried-guard keeps a failing lookup from re-hitting MA every second.
+	if (pl.PlaybackState == "idle" || pl.CurrentMedia == nil) &&
+		p.maIdleLogTriedFor != p.maActivePlayerId && p.maIdleLastTrack(p.maActivePlayerId) == nil {
+		p.maFetchIdleFallback(pctx, client, pl)
+	}
+
 	// issue #138: upcoming queue for the "Läuft gerade" pane. Fetched only
 	// while media is active (idle players have nothing queued) on the same
 	// 4s poll budget; the queue response itself carries NO item list, so the
@@ -181,8 +190,17 @@ func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue, upcoming 
 	// STALE non-null current_media after going idle (verified against
 	// 2.10.7), so the media pointer alone is not an idle signal.
 	if pl.PlaybackState == "idle" || pl.CurrentMedia == nil {
-		p.maOwnsRemoteState = false
-		p.clearActiveDevice()
+		// issue #138 (defects 1+2): a SELECTED player going idle/stopped is
+		// still the user's device. Clearing state dropped the UI to the
+		// device picker - "select an idle speaker" and "stop on the speaker"
+		// both became dead ends from which no music could start. Keep the
+		// selection: synthesize a PAUSED RemoteState carrying the last known
+		// track (live observation, else per-queue playlog). New music starts
+		// from the Playlists/Zuletzt panes against this same selection; the
+		// now-playing play button resumes via players/cmd/play (a clean
+		// no-op on a cleared queue). The picker returns only when MA mode or
+		// the selection itself goes away - see the maPollTick early return.
+		p.applyMaIdleState(pl)
 		return
 	}
 
@@ -226,8 +244,17 @@ func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue, upcoming 
 	// PrevTracks stays empty by design.
 	if queue != nil {
 		rs.NextTracks = upcoming
+		// issue #138 (defect 3): expose the single queue source as context_uri:
+		// the UI's upcoming-card taps then take the OFFSET branch ({uri:
+		// source, offset:{uri: tapped}}) and maPlayUri plays it via play_media
+		// + start_item - exact-match resolution, no index arithmetic.
+		if len(queue.Sources) == 1 {
+			rs.ContextUri = queue.Sources[0].URI
+		}
 	} else if prevState != nil && p.maOwnsRemoteState && prevState.DeviceId == rs.DeviceId {
+		// transient player_queues/get failure: carry list AND its context
 		rs.NextTracks = prevState.NextTracks
+		rs.ContextUri = prevState.ContextUri
 	}
 	// a state handed over from the other backend (flag unset) counts as a
 	// new track: the UI must re-render title/art/position on the switch
@@ -244,6 +271,11 @@ func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue, upcoming 
 		p.state.lastActiveDeviceName = rs.DeviceName
 	}
 
+	// issue #138 (defects 1+2): refresh the idle-survival last-song source;
+	// a live observation supersedes any playlog fallback.
+	p.maLastActiveState = rs
+	p.maIdleLogFallback = nil
+
 	if v := p.app.voice; v != nil {
 		v.notifyPlayback(rs.IsPlaying && !rs.IsPaused)
 	}
@@ -259,6 +291,110 @@ func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue, upcoming 
 			Type: ApiEventTypeObserverStateChanged,
 			Data: rs,
 		})
+	}
+}
+
+// maIdleLastTrack returns the last-song display source for an IDLE poll of
+// this player (issue #138, defects 1+2): the last LIVE observation on it
+// (maLastActiveState), else the lazily fetched per-queue playlog entry
+// (maIdleLogFallback), else nil. Run loop only.
+func (p *AppPlayer) maIdleLastTrack(id string) *RemoteState {
+	if lrs := p.maLastActiveState; lrs != nil && lrs.DeviceId == id {
+		return lrs
+	}
+	if lrs := p.maIdleLogFallback; lrs != nil && lrs.DeviceId == id {
+		return lrs
+	}
+	return nil
+}
+
+// maFetchIdleFallback fills maIdleLogFallback with the speaker's own last
+// played track from MA's play log (per-queue filter - a player's default
+// queue carries its own id). One read-only call per selection: a failure and
+// an empty log both set the tried-guard, so the poll tick neither hammers a
+// failing server nor re-fetches for nothing; the result may be title-less, in
+// which case the idle state still keeps the device addressable. Run loop only.
+func (p *AppPlayer) maFetchIdleFallback(pctx context.Context, client *ma.Client, pl *ma.Player) {
+	entries, err := client.RecentlyPlayed(pctx, 1, pl.PlayerID)
+	if err != nil {
+		p.app.log.Debugf("ma: recently_played_items for idle player %s failed: %v", pl.PlayerID, err)
+		p.maIdleLogTriedFor = pl.PlayerID
+		return
+	}
+	rs := &RemoteState{DeviceId: pl.PlayerID, DeviceName: pl.Name, DeviceType: maDeviceType}
+	if len(entries) > 0 {
+		e := entries[0]
+		names := make([]string, 0, len(e.Artists))
+		for _, a := range e.Artists {
+			if a.Name != "" {
+				names = append(names, a.Name)
+			}
+		}
+		rs.TrackUri = e.URI
+		rs.TrackName = e.Name
+		rs.TrackArtist = strings.Join(names, ", ")
+		rs.TrackAlbum = e.Album.Name()
+		rs.TrackImageUrl = maImageURL(e.Cover())
+		if e.Duration > 0 {
+			rs.Duration = int64(e.Duration) * 1000
+		}
+	}
+	p.maIdleLogFallback = rs
+	p.maIdleLogTriedFor = pl.PlayerID
+}
+
+// applyMaIdleState maps one IDLE poll of the SELECTED player into a
+// synthesized PAUSED RemoteState (issue #138, defects 1+2 - see
+// applyMaState): the speaker keeps showing as the current device with its
+// last known song, matching what MA's own webui shows after a stop ("the
+// song is merely paused"). The position freezes at the last observed value;
+// NextTracks stay EMPTY on purpose - an idle queue has nothing upcoming and
+// new music starts from the content panes. No noteClusterTiming: the
+// synthetic timestamps are local, not server clock evidence. Run loop only.
+func (p *AppPlayer) applyMaIdleState(pl *ma.Player) {
+	rs := &RemoteState{
+		DeviceId:    pl.PlayerID,
+		DeviceName:  pl.Name,
+		DeviceType:  maDeviceType,
+		IsPlaying:   false,
+		IsPaused:    true,
+		Volume:      maVolumeToState(pl.VolumeLevel),
+		VolumeSteps: 100,
+	}
+	now := time.Now()
+	rs.ReceivedAt = now
+	rs.ReceivedAtWallMs = now.UnixMilli()
+	rs.Timestamp = now.UnixMilli()
+
+	if last := p.maIdleLastTrack(pl.PlayerID); last != nil {
+		rs.TrackUri = last.TrackUri
+		rs.TrackName = last.TrackName
+		rs.TrackArtist = last.TrackArtist
+		rs.TrackAlbum = last.TrackAlbum
+		rs.TrackImageUrl = last.TrackImageUrl
+		rs.Duration = last.Duration
+		rs.PositionAsOfTimestamp = last.PositionAsOfTimestamp
+	}
+
+	prevState := p.state.remoteState
+	// same changed-track semantics as the active path: a stop mid-playback
+	// (same uri, state flipped) re-renders via ObserverStateChanged
+	trackChanged := prevState == nil || !p.maOwnsRemoteState || prevState.TrackUri != rs.TrackUri
+
+	p.state.remoteState = rs
+	p.maOwnsRemoteState = true
+	if rs.DeviceId != "" {
+		p.state.lastActiveDeviceId = rs.DeviceId
+		p.state.lastActiveDeviceName = rs.DeviceName
+	}
+
+	if v := p.app.voice; v != nil {
+		v.notifyPlayback(false)
+	}
+	if trackChanged {
+		p.app.server.Emit(&ApiEvent{Type: ApiEventTypeObserverTrackChanged, Data: rs})
+	} else {
+		p.app.server.Emit(&ApiEvent{Type: ApiEventTypeObserverStateChanged, Data: rs})
 	}
 }
 
@@ -629,6 +765,14 @@ func (p *AppPlayer) maSelectPlayer(ctx context.Context, playerID string) (any, e
 		}
 	}
 
+	// issue #138 (defect 1): last-song sources are per speaker - a changed
+	// target re-derives them (fresh per-queue playlog on the first idle poll).
+	if p.maActivePlayerId != resolved {
+		p.maLastActiveState = nil
+		p.maIdleLogFallback = nil
+		p.maIdleLogTriedFor = ""
+	}
+
 	p.maActivePlayerId = resolved
 	p.app.log.Infof("ma: selected player %s (%s)", resolved, name)
 	return map[string]any{"ok": true}, nil
@@ -639,20 +783,33 @@ func (p *AppPlayer) maSelectPlayer(ctx context.Context, playerID string) (any, e
 //   - uri + offset.uri: the UI's tracklist confirmations send the parent
 //     list as context and the tapped item as offset - start that source at
 //     the tapped item, queueing the rest behind it (play_media replace +
-//     start_item; verified live against 2.10.7's exact-match resolver).
+//     start_item; verified live against 2.10.7's exact-match resolver). A
+//     failure (stale context after a re-queue, item no longer in the source)
+//     falls back to playing the tapped item alone - a tap should land the
+//     song, not raise a toast.
 //   - bare uri matching an upcoming entry of the observed queue: in-queue
 //     skip via play_index (bug26 semantics - the queue is preserved, the
-//     tapped card jumps to now-playing; MA context_uri is empty so the UI
-//     always takes this bare-uri branch for "Läuft gerade" cards).
+//     tapped card jumps to now-playing). MA 2.10.7's index schema is
+//     int | str and a STRING is resolved as a queue_item_id (uuids only), so
+//     the computed queue position must go over the wire as a JSON NUMBER -
+//     the previous string encoding 400'd with "Item N not found in queue"
+//     (issue #138, defect 3).
 //   - anything else: single-item context.
 func (p *AppPlayer) maPlayUri(ctx context.Context, client *ma.Client, playerID string, play ApiRequestDataPlay) error {
 	if play.Offset != nil && play.Offset.Uri != "" {
-		return client.PlayMedia(ctx, playerID, play.Uri, play.Offset.Uri)
+		err := client.PlayMedia(ctx, playerID, play.Uri, play.Offset.Uri)
+		if err == nil {
+			return nil
+		}
+		p.app.log.Debugf("ma: play_media %s@%s failed: %v - falling back to single item", play.Uri, play.Offset.Uri, err)
+		return client.PlayMedia(ctx, playerID, play.Offset.Uri, "")
 	}
 	if rs := p.state.remoteState; rs != nil && rs.DeviceId == playerID {
 		for _, t := range rs.NextTracks {
 			if t.TrackId != "" && t.Uri != "" && t.Uri == play.Uri {
-				return client.PlayIndex(ctx, playerID, t.TrackId)
+				if idx, perr := strconv.Atoi(t.TrackId); perr == nil {
+					return client.PlayIndex(ctx, playerID, idx)
+				}
 			}
 		}
 	}
@@ -703,8 +860,13 @@ type MaTrack struct {
 // EVERY playlist - built-in and provider-synced alike - is a LIBRARY item
 // with uri "library://playlist/<id>" (verified live against 2.10.7). A
 // provider without a playlists collection answers its browse with a 500 -
-// that folder is skipped, not an error. EMPTY array when MA is unconfigured
-// or the root browse fails (maListDevices contract).
+// that folder is skipped, not an error. EMPTY array only when MA is
+// unconfigured; when it IS configured and the content cannot be fetched, the
+// handler ERRORS (-> HTTP 5xx) instead: a 200 with an empty list would be
+// cached by the UI as authoritative "no playlists" (issue #138, defect 4 -
+// the pane showed "Keine Playlists" while MA had 145, because a failed or
+// pre-config browse was swallowed into an empty 200). The UI answers the 5xx
+// with its error card + retry.
 func (p *AppPlayer) maListPlaylists(ctx context.Context) (any, error) {
 	playlists := []MaPlaylist{}
 	cfg, _ := p.maResolved()
@@ -719,15 +881,18 @@ func (p *AppPlayer) maListPlaylists(ctx context.Context) (any, error) {
 	root, err := client.Browse(pctx, "root")
 	if err != nil {
 		p.app.log.Warnf("ma: music/browse root failed: %v", err)
-		return map[string]any{"playlists": playlists}, nil
+		return nil, fmt.Errorf("music assistant playlist browse failed: %w", err)
 	}
+	folders, failedFolders := 0, 0
 	for _, folder := range root {
 		if !strings.HasSuffix(folder.Path, "://") {
 			continue // not a provider folder (breadcrumbs etc.)
 		}
+		folders++
 		items, err := client.Browse(pctx, folder.Path+"playlists")
 		if err != nil {
 			p.app.log.Debugf("ma: music/browse %splaylists failed: %v", folder.Path, err)
+			failedFolders++
 			continue
 		}
 		for _, it := range items {
@@ -738,6 +903,9 @@ func (p *AppPlayer) maListPlaylists(ctx context.Context) (any, error) {
 			pl.ImageURL = maPlaylistImage(it)
 			playlists = append(playlists, pl)
 		}
+	}
+	if folders > 0 && failedFolders == folders {
+		return nil, fmt.Errorf("music assistant playlist browse failed for all %d providers", folders)
 	}
 	return map[string]any{"playlists": playlists}, nil
 }
@@ -800,8 +968,10 @@ func (p *AppPlayer) maListPlaylistItems(ctx context.Context, itemID string) (any
 // maListRecent backs GET /ma/recent (issue #138, pinned contract): the last
 // N played tracks from MA's play log. The play-log mapping is lightweight -
 // title + artwork only, no artists (MA limitation) - so the UI renders
-// title-only cards for this pane in MA mode. Empty list when unconfigured or
-// unreachable; limit is clamped to 1..50 (the UI asks for 20).
+// title-only cards for this pane in MA mode. Empty list when unconfigured; a
+// fetch failure ERRORS (-> HTTP 5xx) so the UI retries instead of caching an
+// empty "Zuletzt" (same contract as maListPlaylists, issue #138 defect 4);
+// limit is clamped to 1..50 (the UI asks for 20).
 func (p *AppPlayer) maListRecent(ctx context.Context, limit int) (any, error) {
 	tracks := []MaTrack{}
 	if limit < 1 || limit > 50 {
@@ -814,10 +984,10 @@ func (p *AppPlayer) maListRecent(ctx context.Context, limit int) (any, error) {
 
 	pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
 	defer cancel()
-	items, err := p.maClientFor(cfg).RecentlyPlayed(pctx, limit)
+	items, err := p.maClientFor(cfg).RecentlyPlayed(pctx, limit, "")
 	if err != nil {
 		p.app.log.Warnf("ma: recently_played_items failed: %v", err)
-		return map[string]any{"tracks": tracks}, nil
+		return nil, fmt.Errorf("music assistant playlog fetch failed: %w", err)
 	}
 	for i := range items {
 		it := &items[i]

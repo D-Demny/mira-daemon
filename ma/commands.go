@@ -158,10 +158,14 @@ func (c *Client) PlayMedia(ctx context.Context, queueID, mediaURI, startItem str
 }
 
 // PlayIndex sends player_queues/play_index: start the CURRENT queue at the
-// given item without modifying it — the in-queue skip used when a "Läuft
-// gerade" upcoming-card confirmation maps onto an observed queue entry. index
-// accepts a queue index or, unambiguously, the item's queue_item_id string.
-func (c *Client) PlayIndex(ctx context.Context, queueID, index string) error {
+// given 0-based item position without modifying it — the in-queue skip used
+// when a "Läuft gerade" upcoming-card confirmation maps onto an observed
+// queue entry. The 2.10.7 schema for index is int | str: a JSON STRING is
+// resolved as a queue_item_id, and item ids are uuids — numeric position
+// strings never match, so they 400 with "Item N not found in queue". The
+// position MUST therefore be sent as a JSON number (verified against the
+// live schema; issue #138).
+func (c *Client) PlayIndex(ctx context.Context, queueID string, index int) error {
 	_, err := c.Call(ctx, "player_queues/play_index", map[string]any{
 		"queue_id": queueID,
 		"index":    index,
@@ -240,12 +244,19 @@ func (c *Client) AlbumTracks(ctx context.Context, itemID, provider string) ([]Tr
 // RecentlyPlayed calls music/recently_played_items (the play log) for track
 // entries only — the log also contains album/artist rows. The mapping is
 // lightweight: name + uri + image, no artist/album metadata (MA 2.10.7
-// limitation; the UI renders title-only cards for it).
-func (c *Client) RecentlyPlayed(ctx context.Context, limit int) ([]TrackItem, error) {
-	raw, err := c.Call(ctx, "music/recently_played_items", map[string]any{
+// limitation; the UI renders title-only cards for it). queueID, when set,
+// restricts the log to ONE queue (a player's default queue carries the
+// player's own id) - the per-speaker "last played" lookup the idle-survival
+// state uses (issue #138).
+func (c *Client) RecentlyPlayed(ctx context.Context, limit int, queueID string) ([]TrackItem, error) {
+	args := map[string]any{
 		"limit":       limit,
 		"media_types": []string{"track"},
-	})
+	}
+	if queueID != "" {
+		args["queue_id"] = queueID
+	}
+	raw, err := c.Call(ctx, "music/recently_played_items", args)
 	if err != nil {
 		return nil, err
 	}
