@@ -84,6 +84,16 @@ type AppPlayer struct {
 	maUpcomingKey    string
 	maUpcomingCached []QueueTrack
 
+	// issue #138 (defects 1+2): the last-song source for a SELECTED MA
+	// player that goes idle/stopped. maLastActiveState is refreshed on every
+	// live (non-idle) poll; maIdleLogFallback is the lazily fetched per-queue
+	// playlog entry for a selection that started idle (never seen live). Both
+	// are reset when the selection CHANGES so each speaker's "last song" comes
+	// from its own state/log. Touched exclusively from the Run() goroutine.
+	maLastActiveState *RemoteState
+	maIdleLogFallback *RemoteState
+	maIdleLogTriedFor string // player id already asked for a playlog (failure guard)
+
 	// lyricsProvider handles fetching lyrics from primary + LRCLIB sources
 	lyricsProvider *LyricsProvider
 
