@@ -52,12 +52,6 @@ func (c *Client) Pause(ctx context.Context, playerID string) error {
 	return err
 }
 
-// PlayPause sends players/cmd/play_pause (toggle).
-func (c *Client) PlayPause(ctx context.Context, playerID string) error {
-	_, err := c.Call(ctx, "players/cmd/play_pause", playerArgs(playerID))
-	return err
-}
-
 // Next sends players/cmd/next.
 func (c *Client) Next(ctx context.Context, playerID string) error {
 	_, err := c.Call(ctx, "players/cmd/next", playerArgs(playerID))
@@ -298,17 +292,21 @@ func (c *Client) AlbumTracks(ctx context.Context, itemID, provider string) ([]Tr
 	return tracks, nil
 }
 
-// RecentlyPlayed calls music/recently_played_items (the play log) for track
-// entries only — the log also contains album/artist rows. The mapping is
-// lightweight: name + uri + image, no artist/album metadata (MA 2.10.7
-// limitation; the UI renders title-only cards for it). queueID, when set,
-// restricts the log to ONE queue (a player's default queue carries the
-// player's own id) - the per-speaker "last played" lookup the idle-survival
-// state uses (issue #138).
-func (c *Client) RecentlyPlayed(ctx context.Context, limit int, queueID string) ([]TrackItem, error) {
+// RecentlyPlayed calls music/recently_played_items (the play log). mediaTypes
+// restricts the log rows (empty = MA default: all types); fullyPlayedOnly
+// mirrors MA's API DEFAULT (true): with it set, an entry only counts once
+// the item played to the END - a skipped item never lands in the list at
+// all. Pass false explicitly for the "Zuletzt" pane and the per-speaker
+// last-song lookup so partially played items surface immediately (issue
+// #138 round 4, defect B'). The client still re-filters to track/playlist rows
+// with a non-empty uri (the log also contains album/artist rows).
+func (c *Client) RecentlyPlayed(ctx context.Context, limit int, queueID string, mediaTypes []string, fullyPlayedOnly bool) ([]TrackItem, error) {
 	args := map[string]any{
-		"limit":       limit,
-		"media_types": []string{"track"},
+		"limit":             limit,
+		"fully_played_only": fullyPlayedOnly,
+	}
+	if len(mediaTypes) > 0 {
+		args["media_types"] = mediaTypes
 	}
 	if queueID != "" {
 		args["queue_id"] = queueID
@@ -323,7 +321,7 @@ func (c *Client) RecentlyPlayed(ctx context.Context, limit int, queueID string) 
 	}
 	tracks := make([]TrackItem, 0, len(items))
 	for _, it := range items {
-		if it.MediaType == "track" && it.URI != "" {
+		if (it.MediaType == "track" || it.MediaType == "playlist") && it.URI != "" {
 			tracks = append(tracks, it)
 		}
 	}

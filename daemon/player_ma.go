@@ -332,7 +332,11 @@ func (p *AppPlayer) maIdleLastTrack(id string) *RemoteState {
 // failing server nor re-fetches for nothing; the result may be title-less, in
 // which case the idle state still keeps the device addressable. Run loop only.
 func (p *AppPlayer) maFetchIdleFallback(pctx context.Context, client *ma.Client, pl *ma.Player) {
-	entries, err := client.RecentlyPlayed(pctx, 1, pl.PlayerID)
+	// issue #138 round 4, defect B': fullyPlayedOnly=false - a speaker that
+	// was paused/stopped mid-song is "last played" exactly like one whose
+	// song finished; tracks only (a playlist row here would mislabel the
+	// synthesized now-playing card).
+	entries, err := client.RecentlyPlayed(pctx, 1, pl.PlayerID, []string{"track"}, false)
 	if err != nil {
 		p.app.log.Debugf("ma: recently_played_items for idle player %s failed: %v", pl.PlayerID, err)
 		p.maIdleLogTriedFor = pl.PlayerID
@@ -586,12 +590,12 @@ func (p *AppPlayer) maSend(ctx context.Context, verb string, data any) error {
 		// resume carries Spotify Connect semantics ("keep playing on the
 		// target device"); play may also carry a URI from /player/play
 		// (tapped item) and routes to the queue commands instead (issue #138):
-		// maPlayUri. On an IDLE MA player, both ask MA for its own resume -
-		// after a hard stop that continues the parked current_item at the
-		// saved resume_pos (NOT from 0), item 0 on an ended queue, first item
-		// when there is no current item; only if the queue is empty does it
-		// fall back to replaying the track the UI shows (issue #138 round 3,
-		// defect A').
+		// maPlayUri. A NOT-playing MA player (idle OR paused) asks MA for its
+		// OWN resume - after a hard stop that continues the parked current_item
+		// at the saved resume_pos (NOT from 0), item 0 on an ended queue, first
+		// item when there is no current item; while PAUSED it unpause-forwards
+		// at the same position (issue #138 round 4, defect A'). Only if the
+		// queue is empty does it fall back to replaying the track the UI shows.
 		if verb == "play" {
 			play, _ := data.(ApiRequestDataPlay)
 			if play.Uri != "" {
@@ -599,22 +603,33 @@ func (p *AppPlayer) maSend(ctx context.Context, verb string, data any) error {
 				break
 			}
 		}
-		if p.maIsIdle() {
-			callErr = p.maResumeStopped(pctx, client, playerID)
-		} else {
-			callErr = client.Play(pctx, playerID)
+		if p.maLastPlaybackState == "playing" {
+			// already playing: no-op mirroring MA's own "Ignore PLAY request" -
+			// the queue resume would reload the current item at the same
+			// position (an audible stream restart for a no-op tap).
+			break
 		}
+		callErr = p.maResumeStopped(pctx, client, playerID)
 	case "pause":
+		// players/cmd/pause redirects to the pause-aware player_queues/pause,
+		// which stores queue.resume_pos - keep the legacy command (issue #138).
 		callErr = client.Pause(pctx, playerID)
 	case "playpause":
-		// idle + play_pause resumes via maResumeStopped (MA-native parked
-		// position first, displayed-track replay as fallback); a PAUSED
-		// player keeps the normal toggle (resume-from-pause-position IS the
-		// shown track there).
-		if p.maIsIdle() {
-			callErr = p.maResumeStopped(pctx, client, playerID)
+		// issue #138 round 4, defect A': the legacy players/cmd/play_pause is
+		// NOT pause-aware on this stack - on a PAUSED queue player, cmd/play
+		// skips its queue-resume branch and falls through to the generic resume
+		// path whose final step is player.play_media(current media): it
+		// RESTARTS the track at 0 (verified byte-identical in MA 2.10.7 and
+		// main, controllers/players/controller.py cmd_play / _handle_cmd_play).
+		// Pause stays on the legacy command (it redirects to the pause-aware
+		// queue pause); unpause goes through player_queues/resume, which IS
+		// pause-aware: it replays the parked current item at the stored
+		// resume_pos.
+		if p.maLastPlaybackState == "playing" {
+			callErr = client.Pause(pctx, playerID)
 		} else {
-			callErr = client.PlayPause(pctx, playerID)
+			// idle OR paused: MA-native resume from the parked position
+			callErr = p.maResumeStopped(pctx, client, playerID)
 		}
 	case "next":
 		callErr = client.Next(pctx, playerID)
@@ -683,13 +698,17 @@ func (p *AppPlayer) maIsIdle() bool {
 	return p.maLastPlaybackState == "idle"
 }
 
-// maResumeStopped resumes playback on an IDLE MA player (issue #138 round 3,
-// defect A'): it asks MA for its OWN resume, which after a hard stop
-// continues the parked current_item at the saved resume_pos - live-verified
-// on 2.10.7: _handle_stop stores corrected_elapsed_time in queue.resume_pos
-// and keeps current_item, so play-after-stop resumes mid-song instead of
-// restarting it (the old play_index/play_media replay started every song at
-// 0 by construction). An ended queue restarts item 0 and a queue without a
+// maResumeStopped resumes playback on a NOT-playing MA player (idle OR
+// paused - issue #138 round 3, defect A'; extended to paused in round 4): it
+// asks MA for its OWN queue resume, which after a hard stop continues the
+// parked current_item at the saved resume_pos - live-verified on 2.10.7:
+// _handle_stop stores corrected_elapsed_time in queue.resume_pos and keeps
+// current_item, so play-after-stop resumes mid-song instead of restarting it
+// (the old play_index/play_media replay started every song at 0 by
+// construction). While PAUSED it forward-resumes at the same position: pause
+// stores resume_pos the same way, and _watch_pause auto-stops ~30 s after a
+// pause with stop storing resume_pos too - so every paused window is covered
+// by the native path. An ended queue restarts item 0 and a queue without a
 // current item starts at its first/next entry - both MA-native semantics.
 // Only when the native resume fails (empty queue = QueueEmpty, unreachable
 // server, ...) does it fall back to replaying the track the UI shows
@@ -929,6 +948,10 @@ type MaTrack struct {
 	DurationMs int64    `json:"duration_ms,omitempty"` // source seconds -> ms
 	Position   int      `json:"position"`              // absolute index in the parent playlist
 	ImageURL   string   `json:"image_url,omitempty"`
+	// issue #138 round 4, defect B': set only for the "Zuletzt" playlist rows
+	// (recent items); absent for tracks and playlist-items - the UI opens a
+	// playlist tracklist on the former and plays the latter.
+	MediaType string `json:"media_type,omitempty"`
 }
 
 // maListPlaylists backs GET /ma/playlists (issue #138, pinned contract):
@@ -959,8 +982,14 @@ func (p *AppPlayer) maListPlaylists(ctx context.Context) (any, error) {
 	defer cancel()
 	playlists, err := p.maFetchPlaylists(pctx, p.maClientFor(cfg))
 	if err == nil {
+		// the cache stays in canonical BROWSE order (the background warmup
+		// stores it the same way) - stale-while-error never depends on the
+		// playlog. issue #138 round 4, defect S: the SERVED list is the
+		// browse result re-ordered by last-played recency (one lightweight
+		// playlog call inside the same budget; a failure degrades to browse
+		// order).
 		p.maUpdatePlaylistCache(playlists)
-		return map[string]any{"playlists": playlists}, nil
+		return map[string]any{"playlists": maApplyRecentPlaylistOrder(pctx, p.app.log, p.maClientFor(cfg), playlists)}, nil
 	}
 	if st := p.maStalePlaylists(); len(st) > 0 {
 		p.app.log.Warnf("ma: playlist browse failed (%v); serving the cached list from %s ago",
@@ -1069,7 +1098,11 @@ func (p *AppPlayer) maListPlaylistItems(ctx context.Context, itemID string) (any
 }
 
 // maListRecent backs GET /ma/recent (issue #138, pinned contract): the last
-// N played tracks from MA's play log. The play-log mapping is lightweight -
+// N played items from MA's play log - tracks AND playlists in recency order
+// (issue #138 round 4, defect B'): fullyPlayedOnly=false so partially played
+// items surface immediately instead of only after a track plays to the end
+// (the MA API default), and the media-type filter admits playlist rows like
+// MA's own "Zuletzt gespielt" view. The play-log mapping is lightweight -
 // title + artwork only, no artists (MA limitation) - so the UI renders
 // title-only cards for this pane in MA mode. Empty list when unconfigured; a
 // fetch failure ERRORS (-> HTTP 5xx) so the UI retries instead of caching an
@@ -1086,7 +1119,7 @@ func (p *AppPlayer) maListRecent(ctx context.Context, limit int) (any, error) {
 
 	pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
 	defer cancel()
-	items, err := p.maClientFor(cfg).RecentlyPlayed(pctx, limit, "")
+	items, err := p.maClientFor(cfg).RecentlyPlayed(pctx, limit, "", []string{"track", "playlist"}, false)
 	if err != nil {
 		p.app.log.Warnf("ma: recently_played_items failed: %v", err)
 		return nil, fmt.Errorf("music assistant playlog fetch failed: %w", err)

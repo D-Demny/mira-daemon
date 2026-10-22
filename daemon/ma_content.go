@@ -15,6 +15,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -59,6 +60,46 @@ func maBrowsePlaylists(ctx context.Context, log librespot.Logger, client *ma.Cli
 		return nil, fmt.Errorf("music assistant playlist browse failed for all %d providers", folders)
 	}
 	return playlists, nil
+}
+
+// maApplyRecentPlaylistOrder reorders a playlist list by last-played recency
+// (issue #138 round 4, defect S): playlists with a play-log entry come first
+// in most-recent order (the play log is timestamp DESC, so list position IS
+// the recency order); untouched ones keep their browse order after. The
+// playlog call runs on the caller's context; on ANY failure or an empty log
+// the input is returned unchanged - a sort hint must never break the list.
+func maApplyRecentPlaylistOrder(ctx context.Context, log librespot.Logger, client *ma.Client, playlists []MaPlaylist) []MaPlaylist {
+	if len(playlists) < 2 {
+		return playlists
+	}
+	recent, err := client.RecentlyPlayed(ctx, 50, "", []string{"playlist"}, false)
+	if err != nil {
+		log.Debugf("ma: playlog fetch for playlist ordering failed: %v - keeping browse order", err)
+		return playlists
+	}
+	order := make(map[string]int, len(recent))
+	for i := range recent {
+		id := recent[i].ItemID
+		if _, ok := order[id]; !ok {
+			order[id] = i // first (newest) occurrence wins
+		}
+	}
+	sorted := make([]MaPlaylist, 0, len(playlists))
+	rest := make([]MaPlaylist, 0)
+	for i := range playlists {
+		if _, ok := order[playlists[i].ItemID]; ok {
+			sorted = append(sorted, playlists[i])
+		} else {
+			rest = append(rest, playlists[i])
+		}
+	}
+	if len(sorted) == 0 {
+		return playlists
+	}
+	sort.SliceStable(sorted, func(a, b int) bool {
+		return order[sorted[a].ItemID] < order[sorted[b].ItemID]
+	})
+	return append(sorted, rest...)
 }
 
 // maMapDevices maps MA's players/all response to the /ma/devices contract
@@ -107,12 +148,17 @@ func maMapPlaylistItems(items []ma.TrackItem) []MaTrack {
 // maMapRecentItems maps music/recently_played_items entries to the UI
 // track-card shape. The play-log mapping is lightweight - title + artwork
 // only, no artists (MA 2.10.7 limitation), so the UI renders title-only
-// cards for the "Zuletzt" pane in MA mode.
+// cards for the "Zuletzt" pane in MA mode. Issue #138 round 4, defect B':
+// playlist rows carry MediaType "playlist" so the UI can open their track
+// list instead of playing them; tracks leave the field absent.
 func maMapRecentItems(items []ma.TrackItem) []MaTrack {
 	tracks := []MaTrack{}
 	for i := range items {
 		it := &items[i]
 		t := MaTrack{ID: it.ItemID, Name: it.Name, URI: it.URI, Artists: []string{}}
+		if it.MediaType == "playlist" {
+			t.MediaType = "playlist"
+		}
 		t.ImageURL = maImageURL(it.Image)
 		tracks = append(tracks, t)
 	}
