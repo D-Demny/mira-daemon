@@ -959,7 +959,7 @@ func (s *ConcreteApiServer) serveMaPreSession(w http.ResponseWriter, kind, itemI
 			s.log.Warnf("ma: pre-session playlist browse failed: %v", err)
 			return false
 		}
-		payload = map[string]any{"playlists": playlists}
+		payload = map[string]any{"playlists": maApplyRecentPlaylistOrder(ctx, s.log, client, playlists)}
 	case "playlist-items":
 		items, err := client.PlaylistTracks(ctx, itemID)
 		if err != nil {
@@ -968,7 +968,7 @@ func (s *ConcreteApiServer) serveMaPreSession(w http.ResponseWriter, kind, itemI
 		}
 		payload = map[string]any{"tracks": maMapPlaylistItems(items)}
 	case "recent":
-		items, err := client.RecentlyPlayed(ctx, limit, "")
+		items, err := client.RecentlyPlayed(ctx, limit, "", []string{"track", "playlist"}, false)
 		if err != nil {
 			s.log.Warnf("ma: pre-session playlog fetch failed: %v", err)
 			return false

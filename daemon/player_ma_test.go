@@ -552,9 +552,13 @@ func TestMaSend_VerbRouting(t *testing.T) {
 		wantArg map[string]any
 	}
 	cases := []caseT{
-		{"resume maps to play", "resume", nil, "players/cmd/play", nil},
+		// issue #138 round 4, defect A': the player below has no observed state
+		// (fresh test player = "" i.e. not playing) - resume/playpause must go
+		// through the pause-aware queue command, never the legacy players/cmd
+		// play path that restarts a paused track at 0.
+		{"resume maps to queue resume (not playing)", "resume", nil, "player_queues/resume", map[string]any{"queue_id": "wiim_uuid:A"}},
 		{"pause", "pause", nil, "players/cmd/pause", nil},
-		{"playpause", "playpause", nil, "players/cmd/play_pause", nil},
+		{"playpause (not playing) maps to queue resume", "playpause", nil, "player_queues/resume", map[string]any{"queue_id": "wiim_uuid:A"}},
 		{"next", "next", nil, "players/cmd/next", nil},
 		{"prev", "prev", nil, "players/cmd/previous", nil},
 		{"seek absolute ms->s", "seek", ApiRequestDataSeek{Position: 90000}, "players/cmd/seek", map[string]any{"position": float64(90)}},
@@ -575,7 +579,7 @@ func TestMaSend_VerbRouting(t *testing.T) {
 				t.Fatalf("command: got %v want %q", env["command"], tc.wantCmd)
 			}
 			args, _ := env["args"].(map[string]any)
-			if args["player_id"] != "wiim_uuid:A" && env["command"] != "player_queues/shuffle" {
+			if args["player_id"] != "wiim_uuid:A" && env["command"] != "player_queues/shuffle" && env["command"] != "player_queues/resume" {
 				t.Errorf("player_id: got %v", args["player_id"])
 			}
 			for k, want := range tc.wantArg {
@@ -585,6 +589,47 @@ func TestMaSend_VerbRouting(t *testing.T) {
 			}
 		})
 	}
+
+	// issue #138 round 4, defect A': pause-aware toggle - PAUSED resumes via
+	// the queue command (NOT players/cmd/play_pause, which restarts the track
+	// at 0), PLAYING pauses via the legacy command, and a resume tap while
+	// PLAYING is a no-op.
+	t.Run("paused playpause maps to queue resume", func(t *testing.T) {
+		p.maLastPlaybackState = "paused"
+		if err := p.maSend(ctx, "playpause", nil); err != nil {
+			t.Fatalf("maSend(playpause): %v", err)
+		}
+		env := *last
+		if env["command"] != "player_queues/resume" {
+			t.Fatalf("command: got %v want player_queues/resume", env["command"])
+		}
+		args, _ := env["args"].(map[string]any)
+		if args["queue_id"] != "wiim_uuid:A" {
+			t.Errorf("queue_id: got %v", args["queue_id"])
+		}
+	})
+
+	t.Run("playing playpause maps to pause", func(t *testing.T) {
+		p.maLastPlaybackState = "playing"
+		if err := p.maSend(ctx, "playpause", nil); err != nil {
+			t.Fatalf("maSend(playpause): %v", err)
+		}
+		env := *last
+		if env["command"] != "players/cmd/pause" {
+			t.Fatalf("command: got %v want players/cmd/pause", env["command"])
+		}
+	})
+
+	t.Run("resume while playing is a no-op", func(t *testing.T) {
+		p.maLastPlaybackState = "playing"
+		*last = map[string]any{} // clear capture
+		if err := p.maSend(ctx, "resume", nil); err != nil {
+			t.Fatalf("maSend(resume): %v", err)
+		}
+		if got := (*last)["command"]; got != nil {
+			t.Errorf("no command may be sent for a playing resume, got %v", got)
+		}
+	})
 
 	t.Run("seek relative is rejected without touching MA", func(t *testing.T) {
 		*last = map[string]any{} // clear capture
@@ -897,25 +942,29 @@ func TestMaSend_PlayUriRouting(t *testing.T) {
 		}
 	})
 
-	t.Run("play without uri keeps resume semantics", func(t *testing.T) {
+	t.Run("play without uri uses the pause-aware queue resume", func(t *testing.T) {
 		if err := p.maSend(ctx, "play", ApiRequestDataPlay{}); err != nil {
 			t.Fatalf("maSend(play): %v", err)
 		}
 		env := *last
-		if env["command"] != "players/cmd/play" {
-			t.Fatalf("command: got %v want players/cmd/play", env["command"])
+		// issue #138 round 4, defect A': resume semantics now mean MA's own
+		// (pause-aware) queue resume for every not-playing state.
+		if env["command"] != "player_queues/resume" {
+			t.Fatalf("command: got %v want player_queues/resume", env["command"])
 		}
 	})
 }
 
-// TestMaSend_IdleReplay pins the idle-resume semantics (issue #138 defect A,
-// round 3 A'): on an IDLE MA player a resume/play tap asks MA for its OWN
-// resume, which continues the parked current_item at the saved resume_pos -
-// mid-song after a hard stop, NOT from 0. Only when the native resume fails
+// TestMaSend_IdleReplay pins the not-playing-resume semantics (issue #138
+// defect A, round 3 A'; round 4 A'): on a NOT-playing MA player (IDLE or
+// PAUSED) a resume/play tap asks MA for its OWN queue resume, which
+// continues the parked current_item at the saved resume_pos - mid-song after
+// a hard stop, NOT from 0; pausing then unpausing forward-resumes at the
+// same position instead of restarting. Only when the native resume fails
 // (empty queue etc.) does it fall back to replaying the DISPLAYED track: in
 // the live queue -> play_index onto it; not in the queue -> play_media with
 // the single shown track; everything failed -> plain resume (never a dead
-// tap). PAUSED players keep the plain toggle/resume path untouched.
+// tap).
 func TestMaSend_IdleReplay(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -985,8 +1034,8 @@ func TestMaSend_IdleReplay(t *testing.T) {
 		})
 	})
 
-	t.Run("paused resume keeps the plain resume", func(t *testing.T) {
-		srv, envs := newMaRecordingServer(t, map[string]string{"players/cmd/play": `null`})
+	t.Run("paused resume uses MA's native queue resume", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, map[string]string{"player_queues/resume": `null`})
 		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
 		p.maActivePlayerId = "wiim_uuid:A"
 		pl := maPlayingPlayer()
@@ -996,7 +1045,10 @@ func TestMaSend_IdleReplay(t *testing.T) {
 		if err := p.maSend(ctx, "resume", nil); err != nil {
 			t.Fatalf("maSend(resume): %v", err)
 		}
-		assertOnlyCommands(t, *envs, []string{"players/cmd/play"}) // no queue resolution at all
+		// issue #138 round 4, defect A': the legacy players/cmd/play is NOT
+		// pause-aware (it restarts a paused track at 0) - unpause goes through
+		// player_queues/resume.
+		assertOnlyCommands(t, *envs, []string{"player_queues/resume"}) // no play_media restart
 	})
 
 	t.Run("idle playpause uses MA's native queue resume", func(t *testing.T) {
@@ -1009,8 +1061,8 @@ func TestMaSend_IdleReplay(t *testing.T) {
 		assertOnlyCommands(t, *envs, []string{"player_queues/resume"})
 	})
 
-	t.Run("paused playpause keeps the plain toggle", func(t *testing.T) {
-		srv, envs := newMaRecordingServer(t, map[string]string{"players/cmd/play_pause": `null`})
+	t.Run("paused playpause uses MA's native queue resume", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, map[string]string{"player_queues/resume": `null`})
 		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
 		p.maActivePlayerId = "wiim_uuid:A"
 		pl := maPlayingPlayer()
@@ -1020,7 +1072,10 @@ func TestMaSend_IdleReplay(t *testing.T) {
 		if err := p.maSend(ctx, "playpause", nil); err != nil {
 			t.Fatalf("maSend(playpause): %v", err)
 		}
-		assertOnlyCommands(t, *envs, []string{"players/cmd/play_pause"})
+		// issue #138 round 4, defect A': players/cmd/play_pause restarts the
+		// paused track at 0 (legacy cmd/play fall-through) - unpause goes
+		// through player_queues/resume instead.
+		assertOnlyCommands(t, *envs, []string{"player_queues/resume"})
 	})
 
 	t.Run("idle resume with nothing shown uses the native resume", func(t *testing.T) {
@@ -1098,13 +1153,16 @@ const maTestPlaylistTracks = `[
   {"item_id":"t3","provider":"spotify--x","name":"","media_type":"track"}
 ]`
 
-// maTestRecentItems mirrors the play-log mapping: lightweight entries, and
-// a non-track row that must be filtered out by the client.
+// maTestRecentItems mirrors the play-log mapping: lightweight entries, a
+// non-track/non-playlist row that must be filtered out by the client, and -
+// issue #138 round 4, defect B' - a playlist row in the exact live shape
+// (library item, numeric id, auto-generated uri).
 const maTestRecentItems = `[
   {"item_id":"t9","provider":"spotify--x","name":"Recently One","uri":"spotify--x://track/r1","media_type":"track",
    "image":{"type":"thumb","path":"https://i.scdn.co/image/r1","provider":"spotify--yofvZfhZ","remotely_accessible":true}},
   {"item_id":"a1","provider":"spotify--x","name":"Some Album","uri":"spotify--x://album/album","media_type":"album"},
-  {"item_id":"t8","provider":"local","name":"Recently Two","uri":"","media_type":"track"}
+  {"item_id":"t8","provider":"local","name":"Recently Two","uri":"","media_type":"track"},
+  {"item_id":"26","provider":"library","name":"DnB","uri":"library://playlist/26","media_type":"playlist"}
 ]`
 
 // newMaContentFakeServer serves canned per-command payloads (browse keyed by
@@ -1272,6 +1330,82 @@ func TestMaListPlaylists(t *testing.T) {
 	})
 }
 
+// TestMaListPlaylists_RecentOrder pins issue #138 round 4, defect S: the
+// /ma/playlists response is served in last-played recency (recently played
+// playlists first, newest order), untouched ones keep their browse order,
+// and a playlog failure degrades to browse order instead of breaking the
+// list.
+func TestMaListPlaylists_RecentOrder(t *testing.T) {
+	t.Parallel()
+
+	const browse = `[
+  {"item_id":"70","provider":"library","name":"A-list","uri":"library://playlist/70","media_type":"playlist"},
+  {"item_id":"26","provider":"library","name":"B-dnb","uri":"library://playlist/26","media_type":"playlist"},
+  {"item_id":"11","provider":"library","name":"C-jazz","uri":"library://playlist/11","media_type":"playlist"}
+]`
+
+	t.Run("recently played playlists come first in recency order", func(t *testing.T) {
+		routes := map[string]string{
+			"music/browse@root":                          maTestBrowseRoot,
+			"music/browse@builtin://playlists":           "[]",
+			"music/browse@spotify--yofvZfhZ://playlists": browse,
+			// the play log is timestamp DESC: 11 newest, then 70; 26 never
+			// played.
+			"music/recently_played_items": `[
+  {"item_id":"11","provider":"library","name":"C-jazz","uri":"library://playlist/11","media_type":"playlist"},
+  {"item_id":"70","provider":"library","name":"A-list","uri":"library://playlist/70","media_type":"playlist"}
+]`,
+		}
+		srv, last := newMaContentFakeServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+
+		payload, err := p.maListPlaylists(context.Background())
+		if err != nil {
+			t.Fatalf("maListPlaylists: %v", err)
+		}
+		pl := playlistsFromPayload(t, payload)
+		wantIDs := []string{"11", "70", "26"}
+		if len(pl) != len(wantIDs) {
+			t.Fatalf("want order %v, got %+v", wantIDs, pl)
+		}
+		for i, id := range wantIDs {
+			if pl[i].ItemID != id {
+				t.Errorf("playlist[%d]: got %s want %s", i, pl[i].ItemID, id)
+			}
+		}
+		args, _ := (*last)["args"].(map[string]any)
+		if args["fully_played_only"] != false {
+			t.Errorf("ordering playlog must include partial plays: fully_played_only=%v", args["fully_played_only"])
+		}
+	})
+
+	t.Run("playlog failure keeps the browse order", func(t *testing.T) {
+		routes := map[string]string{
+			"music/browse@root":                          maTestBrowseRoot,
+			"music/browse@builtin://playlists":           "[]",
+			"music/browse@spotify--yofvZfhZ://playlists": browse,
+			// recently_played_items unrouted -> 500
+		}
+		srv, _ := newMaContentFakeServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+
+		payload, err := p.maListPlaylists(context.Background())
+		if err != nil {
+			t.Fatalf("a playlog failure must not break the list: %v", err)
+		}
+		pl := playlistsFromPayload(t, payload)
+		wantIDs := []string{"70", "26", "11"} // browse order unchanged
+		if len(pl) != len(wantIDs) {
+			t.Fatalf("got %+v", pl)
+		}
+		for i, id := range wantIDs {
+			if pl[i].ItemID != id {
+				t.Errorf("playlist[%d]: got %s want %s (browse order)", i, pl[i].ItemID, id)
+			}
+		}
+	})
+}
+
 // TestMaListPlaylistItems pins the GET /ma/playlist-items contract (issue
 // #138): playlist-ordered track cards with absolute position; entries
 // without a uri are skipped; empty list on failure.
@@ -1340,7 +1474,7 @@ func TestMaListPlaylistItems(t *testing.T) {
 func TestMaListRecent(t *testing.T) {
 	t.Parallel()
 
-	t.Run("keeps playable track rows only", func(t *testing.T) {
+	t.Run("keeps track and playlist rows, pins partial-log args", func(t *testing.T) {
 		srv, last := newMaContentFakeServer(t, map[string]string{
 			"music/recently_played_items": maTestRecentItems,
 		})
@@ -1354,13 +1488,33 @@ func TestMaListRecent(t *testing.T) {
 		if args["limit"] != float64(20) {
 			t.Errorf("limit arg: %v", args["limit"])
 		}
+		// issue #138 round 4, defect B': partially played items must surface -
+		// fully_played_only is sent explicitly as false (the MA API default
+		// true is what kept skipped tracks out of "Zuletzt"); playlist rows are
+		// requested like in MA's own "Zuletzt gespielt" view.
+		if args["fully_played_only"] != false {
+			t.Errorf("fully_played_only: got %v want false", args["fully_played_only"])
+		}
+		wantTypes := []string{"track", "playlist"}
+		gotTypes, _ := args["media_types"].([]any)
+		if len(gotTypes) != len(wantTypes) {
+			t.Fatalf("media_types: got %v want %v", args["media_types"], wantTypes)
+		}
+		for i, w := range wantTypes {
+			if gotTypes[i] != w {
+				t.Errorf("media_types[%d]: got %v want %q", i, gotTypes[i], w)
+			}
+		}
 		tracks := tracksFromPayload(t, payload)
-		if len(tracks) != 1 {
-			t.Fatalf("want 1 track (album row + uri-less row filtered), got %d: %+v", len(tracks), tracks)
+		if len(tracks) != 2 {
+			t.Fatalf("want 2 rows (album row + uri-less row filtered), got %d: %+v", len(tracks), tracks)
 		}
 		if tracks[0].Name != "Recently One" || tracks[0].URI != "spotify--x://track/r1" ||
-			tracks[0].ImageURL != "https://i.scdn.co/image/r1" {
+			tracks[0].ImageURL != "https://i.scdn.co/image/r1" || tracks[0].MediaType != "" {
 			t.Errorf("track 0: %+v", tracks[0])
+		}
+		if tracks[1].Name != "DnB" || tracks[1].URI != "library://playlist/26" || tracks[1].MediaType != "playlist" {
+			t.Errorf("playlist row 1: %+v", tracks[1])
 		}
 	})
 

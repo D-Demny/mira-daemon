@@ -245,7 +245,6 @@ func TestControlCommands(t *testing.T) {
 	}{
 		{"play", func(c *Client, ctx context.Context) error { return c.Play(ctx, "p1") }, "players/cmd/play", map[string]any{"player_id": "p1"}},
 		{"pause", func(c *Client, ctx context.Context) error { return c.Pause(ctx, "p1") }, "players/cmd/pause", map[string]any{"player_id": "p1"}},
-		{"play_pause", func(c *Client, ctx context.Context) error { return c.PlayPause(ctx, "p1") }, "players/cmd/play_pause", map[string]any{"player_id": "p1"}},
 		{"next", func(c *Client, ctx context.Context) error { return c.Next(ctx, "p1") }, "players/cmd/next", map[string]any{"player_id": "p1"}},
 		{"previous", func(c *Client, ctx context.Context) error { return c.Previous(ctx, "p1") }, "players/cmd/previous", map[string]any{"player_id": "p1"}},
 		{"seek", func(c *Client, ctx context.Context) error { return c.Seek(ctx, "p1", 123) }, "players/cmd/seek", map[string]any{"player_id": "p1", "position": float64(123)}},
