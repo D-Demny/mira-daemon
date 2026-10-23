@@ -308,6 +308,12 @@ func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue, upcoming 
 	// same clock-offset evidence as the cluster path: local wall ms minus
 	// server timestamp, deduped by Timestamp (noteClusterTiming)
 	p.noteClusterTiming(rs)
+	// issue #46 part 2: stamp the projected position exactly like the cluster
+	// path (updateRemoteState) - the WS wire carries this RemoteState as-is
+	// and the UI prefers a present Position over local projection; an unset
+	// (0) value zeroed the displayed position on every 1/s event while the
+	// 3s REST poll kept answering the projected one.
+	rs.Position = rs.RemotePosition()
 
 	p.state.remoteState = rs
 	p.maOwnsRemoteState = true
@@ -445,6 +451,9 @@ func (p *AppPlayer) applyMaIdleState(pl *ma.Player) {
 	// same changed-track semantics as the active path: a stop mid-playback
 	// (same uri, state flipped) re-renders via ObserverStateChanged
 	trackChanged := prevState == nil || !p.maOwnsRemoteState || prevState.TrackUri != rs.TrackUri
+	// issue #46 part 2: same WS-wire contract as the active path - a paused
+	// state projects to its raw PositionAsOfTimestamp.
+	rs.Position = rs.RemotePosition()
 
 	p.state.remoteState = rs
 	p.maOwnsRemoteState = true

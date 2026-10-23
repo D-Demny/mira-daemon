@@ -189,6 +189,11 @@ func TestApplyMaState_Paused(t *testing.T) {
 	if rs.IsPlaying || !rs.IsPaused || rs.PlaybackSpeed != 0 {
 		t.Errorf("paused flags: %+v", rs)
 	}
+	// issue #46 part 2: the WS wire carries the stamped projected position;
+	// paused projects to the raw as-of value.
+	if rs.Position != 42500 {
+		t.Errorf("wire position: got %d want 42500", rs.Position)
+	}
 }
 
 // TestApplyMaState_QueuePositionWins pins issue #46 (defect A): for some
@@ -227,6 +232,12 @@ func TestApplyMaState_QueuePositionWins(t *testing.T) {
 	if rs.Timestamp != 1700000123250 { // epoch seconds -> unix ms
 		t.Errorf("queue timestamp: got %d want 1700000123250", rs.Timestamp)
 	}
+	// issue #46 part 2: paused via queue pair - the wire Position is the
+	// stamped projection, i.e. the frozen queue position (regression: an
+	// unset field serialized as 0 and zeroed the UI on every WS event).
+	if rs.Position != 21500 {
+		t.Errorf("wire position: got %d want 21500", rs.Position)
+	}
 }
 
 // TestApplyMaState_QueueFallbackToPlayerTop pins the issue #46 else-branch:
@@ -242,6 +253,36 @@ func TestApplyMaState_QueueFallbackToPlayerTop(t *testing.T) {
 	rs := p.state.remoteState
 	if rs.PositionAsOfTimestamp != 42500 || rs.Timestamp != 1700000000000 {
 		t.Errorf("player-top fallback: got %d/%d want 42500/1700000000000", rs.PositionAsOfTimestamp, rs.Timestamp)
+	}
+}
+
+// TestApplyMaState_WirePositionWhilePlaying pins issue #46 part 2 for the
+// active path: the WS wire must carry the projected position (the UI prefers
+// a present Position over its own projection). With no seeded clock offset
+// in the test the server-age term stays 0, so the stamp is as-of + a few ms
+// of local projection only.
+func TestApplyMaState_WirePositionWhilePlaying(t *testing.T) {
+	t.Parallel()
+	p := newMaTestPlayer(t, nil)
+	pl := maPlayingPlayer()
+	fresh := float64(time.Now().Add(-5*time.Second).UnixMilli()) / 1000.0
+	q := &ma.PlayerQueue{
+		QueueID:                "queue-1",
+		Items:                  3,
+		State:                  "playing",
+		CurrentIndex:           new(int(0)),
+		ElapsedTime:            new(float64(21.5)),
+		ElapsedTimeLastUpdated: &fresh,
+	}
+
+	p.applyMaState(pl, q, nil)
+
+	rs := p.state.remoteState
+	if rs == nil {
+		t.Fatal("remoteState must be set")
+	}
+	if rs.Position < 21500 || rs.Position > 23500 {
+		t.Errorf("wire position: got %d want ~21500 (as-of + local projection only)", rs.Position)
 	}
 }
 
@@ -278,6 +319,11 @@ func TestApplyMaIdleState_CurrentMediaPosition(t *testing.T) {
 		if rs.Timestamp != 1700000200750 {
 			t.Errorf("timestamp: got %d want 1700000200750", rs.Timestamp)
 		}
+		// issue #46 part 2: the idle path does not run noteClusterTiming, so
+		// without the explicit stamp the wire carried Position=0 here.
+		if rs.Position != 77500 {
+			t.Errorf("wire position: got %d want 77500", rs.Position)
+		}
 	})
 
 	t.Run("no nested pair keeps the last observed position", func(t *testing.T) {
@@ -290,6 +336,9 @@ func TestApplyMaIdleState_CurrentMediaPosition(t *testing.T) {
 		rs := p.state.remoteState
 		if rs.PositionAsOfTimestamp != 42500 {
 			t.Errorf("carry-over: got %d want 42500 (last live observation)", rs.PositionAsOfTimestamp)
+		}
+		if rs.Position != 42500 {
+			t.Errorf("wire position: got %d want 42500 (carried over)", rs.Position)
 		}
 	})
 }
