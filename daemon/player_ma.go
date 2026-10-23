@@ -92,14 +92,35 @@ func (p *AppPlayer) maClientFor(cfg *MaConfig) *ma.Client {
 }
 
 // maControlTarget resolves the client + selected player for a control
-// command. Unconfigured MA and "no player selected yet" are client errors
-// (ErrBadRequest -> HTTP 400) per the pinned contract.
-func (p *AppPlayer) maControlTarget() (*ma.Client, string, error) {
+// command. Unconfigured MA is a client error (ErrBadRequest -> HTTP 400) per
+// the pinned contract. When no player is selected yet it falls back to the
+// blob's "maDefaultDeviceId" (issue #48): if that id resolves via players/all
+// to a known player, the target is RETARGETED there - a PLAIN re-target
+// WITHOUT queue transfer (an explicit transfer goes through /ma/player/select
+// -> maTransferPlayback) - and persisted as the selection so the next poll
+// tick observes it. No default key, an unresolvable default, or a failed
+// players/all all keep the legacy "no player selected" 400. Run-loop only.
+func (p *AppPlayer) maControlTarget(ctx context.Context) (*ma.Client, string, error) {
 	cfg, _ := p.maResolved()
 	if cfg == nil {
 		return nil, "", ErrBadRequest
 	}
 	if p.maActivePlayerId == "" {
+		// issue #48: no player selected yet - fall back to the UI's MA default
+		// device before erroring. Plain re-target only (see header).
+		if def := maDefaultDeviceIdFromSettings(p.app.GetSettings()); def != "" {
+			client := p.maClientFor(cfg)
+			pctx, cancel := context.WithTimeout(ctx, maControlTimeout)
+			players, err := client.ListPlayers(pctx)
+			cancel()
+			if err != nil {
+				p.app.log.Debugf("ma: players/all for the default device failed: %v", err)
+			} else if resolved := p.maResolvePlayerID(def, players); resolved != "" {
+				p.maActivePlayerId = resolved
+				p.app.log.Infof("ma: no player selected - retargeting to default device %s", resolved)
+				return client, resolved, nil
+			}
+		}
 		return nil, "", ErrBadRequest
 	}
 	return p.maClientFor(cfg), p.maActivePlayerId, nil
@@ -237,7 +258,17 @@ func (p *AppPlayer) applyMaState(pl *ma.Player, queue *ma.PlayerQueue, upcoming 
 	if pl.PlaybackState == "playing" {
 		rs.PlaybackSpeed = 1
 	}
-	if pl.ElapsedTime != nil && pl.ElapsedTimeLastUpdated != nil {
+	if queue != nil && queue.ElapsedTime != nil && queue.ElapsedTimeLastUpdated != nil {
+		// issue #46: for some providers (live-verified 'sendspin') the
+		// player-top position pair is stale/zeroed garbage - the QUEUE pair
+		// is canonical there: live while playing, frozen at the paused
+		// position. Presence of both fields is the only gate: no check on
+		// queue.State or pl.PlaybackState (sendspin reports idle while
+		// paused yet must keep its position). MA reports seconds + epoch
+		// SECONDS; RemoteState uses unix MILLISECONDS throughout.
+		rs.PositionAsOfTimestamp = int64(*queue.ElapsedTime * 1000)
+		rs.Timestamp = int64(*queue.ElapsedTimeLastUpdated * 1000)
+	} else if pl.ElapsedTime != nil && pl.ElapsedTimeLastUpdated != nil {
 		// MA reports position in seconds and the observation instant in
 		// epoch SECONDS; RemoteState uses unix MILLISECONDS throughout.
 		rs.PositionAsOfTimestamp = int64(*pl.ElapsedTime * 1000)
@@ -368,7 +399,9 @@ func (p *AppPlayer) maFetchIdleFallback(pctx context.Context, client *ma.Client,
 // synthesized PAUSED RemoteState (issue #138, defects 1+2 - see
 // applyMaState): the speaker keeps showing as the current device with its
 // last known song, matching what MA's own webui shows after a stop ("the
-// song is merely paused"). The position freezes at the last observed value;
+// song is merely paused"). The position freezes at the last observed value -
+// or at the position the STALE current_media object itself carries when it
+// reports one (issue #46); otherwise the last live observation is kept.
 // NextTracks stay EMPTY on purpose - an idle queue has nothing upcoming and
 // new music starts from the content panes. No noteClusterTiming: the
 // synthetic timestamps are local, not server clock evidence. Run loop only.
@@ -395,6 +428,17 @@ func (p *AppPlayer) applyMaIdleState(pl *ma.Player) {
 		rs.TrackImageUrl = last.TrackImageUrl
 		rs.Duration = last.Duration
 		rs.PositionAsOfTimestamp = last.PositionAsOfTimestamp
+	}
+
+	if pl.CurrentMedia != nil &&
+		pl.CurrentMedia.ElapsedTime != nil &&
+		pl.CurrentMedia.ElapsedTimeLastUpdated != nil {
+		// issue #46: a provider that pauses by freezing its queue position
+		// (sendspin) keeps reporting it inside the STALE current_media object
+		// - that is the position to display. Presence of both fields is the
+		// only gate; no new MA fetch in this path.
+		rs.PositionAsOfTimestamp = int64(*pl.CurrentMedia.ElapsedTime * 1000)
+		rs.Timestamp = int64(*pl.CurrentMedia.ElapsedTimeLastUpdated * 1000)
 	}
 
 	prevState := p.state.remoteState
@@ -576,7 +620,7 @@ func maTargetToLevel(target int64) int {
 // maSend routes one control verb to the selected MA player (issue #134).
 // The verbs mirror the existing /player/* request types; see the switch.
 func (p *AppPlayer) maSend(ctx context.Context, verb string, data any) error {
-	client, playerID, err := p.maControlTarget()
+	client, playerID, err := p.maControlTarget(ctx)
 	if err != nil {
 		return err
 	}

@@ -1533,6 +1533,27 @@ func canRoutePhoneVolume(deviceType string) bool {
 	}
 }
 
+// trackIdFromTrackURI extracts the track id a /observer/status response uses
+// for track_id + lyrics_url from a remote-state track URI (issue #47):
+//   - legacy Spotify Connect form: three colon-separated parts, any scheme -
+//     the third part is the id (behavior unchanged);
+//   - Music Assistant media URIs look like "<provider>[-<instance>]://track/<id>"
+//     (e.g. "spotify--yofvZfhZ://track/4ml1Eq4wmcdfN0Q6pNEly7"): only the
+//     "track" domain yields an id, everything else (episodes, local files,
+//     streams) stays "" - their lyrics are out of scope.
+func trackIdFromTrackURI(uri string) string {
+	if parts := strings.SplitN(uri, ":", 3); len(parts) == 3 {
+		return parts[2]
+	}
+	if i := strings.Index(uri, "://"); i >= 0 {
+		rest := uri[i+len("://"):]
+		if j := strings.Index(rest, "/"); j > 0 && rest[:j] == "track" {
+			return rest[j+1:]
+		}
+	}
+	return ""
+}
+
 func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -1634,10 +1655,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 
 		rs := p.state.remoteState
-		trackId := ""
-		if parts := strings.SplitN(rs.TrackUri, ":", 3); len(parts) == 3 {
-			trackId = parts[2]
-		}
+		trackId := trackIdFromTrackURI(rs.TrackUri)
 		lyricsUrl := ""
 		if trackId != "" {
 			lyricsUrl = fmt.Sprintf("/lyrics/%s", trackId)

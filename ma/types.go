@@ -56,6 +56,13 @@ type CurrentMedia struct {
 	AlbumArtist string `json:"album_artist"`
 	ImageURL    string `json:"image_url"`
 	Duration    int    `json:"duration"` // seconds
+
+	// Playback position in seconds, as of ElapsedTimeLastUpdated (epoch
+	// SECONDS). Present on the current_media object of some providers -
+	// the idle-synthesis path reads it there (see applyMaIdleState, issue
+	// #46). Nullable like the player-level position fields.
+	ElapsedTime            *float64 `json:"elapsed_time"`
+	ElapsedTimeLastUpdated *float64 `json:"elapsed_time_last_updated"`
 }
 
 // MediaImage is MA's image object {type, path, provider}: for music items
@@ -222,4 +229,13 @@ type PlayerQueue struct {
 	CurrentItem    *QueueItem    `json:"current_item"`
 	NextItem       *QueueItem    `json:"next_item"` // nil at the end of the queue
 	Sources        []QueueSource `json:"sources"`
+
+	// Queue playback position in seconds, as of ElapsedTimeLastUpdated
+	// (epoch SECONDS) - the CANONICAL pair for providers whose player-top
+	// position is stale/zeroed garbage (verified live against 2.10.7's
+	// 'sendspin' provider: live while playing, FROZEN at the paused
+	// position while the queue is idle; issue #46). Nullable like the
+	// player-level position fields.
+	ElapsedTime            *float64 `json:"elapsed_time"`
+	ElapsedTimeLastUpdated *float64 `json:"elapsed_time_last_updated"`
 }
