@@ -85,3 +85,25 @@ func playbackSourceFromSettings(blob []byte) string {
 	}
 	return raw.PlaybackSource
 }
+
+// maDefaultDeviceIdFromSettings reads the "maDefaultDeviceId" field from the
+// UI settings blob (issue #48) - the Music Assistant counterpart of the
+// Spotify Connect "default_device_id", written camelCase like every other
+// key of this blob (a companion UI PR starts writing it). String only:
+// absent, null or a non-string value all yield "". The daemon never writes
+// the blob (same convention as above).
+func maDefaultDeviceIdFromSettings(blob []byte) string {
+	if len(blob) == 0 {
+		return ""
+	}
+	var raw struct {
+		MaDefaultDeviceId *string `json:"maDefaultDeviceId"`
+	}
+	if err := json.Unmarshal(blob, &raw); err != nil {
+		return ""
+	}
+	if raw.MaDefaultDeviceId == nil || *raw.MaDefaultDeviceId == "" {
+		return ""
+	}
+	return *raw.MaDefaultDeviceId
+}

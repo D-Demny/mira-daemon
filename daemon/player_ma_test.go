@@ -191,6 +191,109 @@ func TestApplyMaState_Paused(t *testing.T) {
 	}
 }
 
+// TestApplyMaState_QueuePositionWins pins issue #46 (defect A): for some
+// providers (live-verified 'sendspin') the PLAYER-TOP position pair is
+// stale/zeroed garbage - the QUEUE pair from player_queues/get is canonical
+// there: live while playing, frozen at the paused position. Presence of both
+// queue fields is the only gate: NO check on queue.State or pl.PlaybackState
+// (sendspin reports idle while paused yet must keep its position).
+func TestApplyMaState_QueuePositionWins(t *testing.T) {
+	t.Parallel()
+	p := newMaTestPlayer(t, nil)
+	pl := maPlayingPlayer()
+	pl.PlaybackState = "paused"
+	zero := float64(0)
+	pl.ElapsedTime = &zero // sendspin's stale/zeroed player-top (issue #46)
+	pl.ElapsedTimeLastUpdated = &zero
+
+	q := &ma.PlayerQueue{
+		QueueID:                "queue-1",
+		Items:                  3,
+		State:                  "idle", // stale provider state - must not gate
+		CurrentIndex:           new(int(0)),
+		ElapsedTime:            new(float64(21.5)),
+		ElapsedTimeLastUpdated: new(float64(1700000123.25)),
+	}
+
+	p.applyMaState(pl, q, nil)
+
+	rs := p.state.remoteState
+	if rs == nil {
+		t.Fatal("remoteState must be set")
+	}
+	if rs.PositionAsOfTimestamp != 21500 {
+		t.Errorf("queue position: got %d want 21500 (queue pair beats player-top)", rs.PositionAsOfTimestamp)
+	}
+	if rs.Timestamp != 1700000123250 { // epoch seconds -> unix ms
+		t.Errorf("queue timestamp: got %d want 1700000123250", rs.Timestamp)
+	}
+}
+
+// TestApplyMaState_QueueFallbackToPlayerTop pins the issue #46 else-branch:
+// a queue response WITHOUT the position pair (the older MA wire shape) keeps
+// the existing player-top mapping unchanged.
+func TestApplyMaState_QueueFallbackToPlayerTop(t *testing.T) {
+	t.Parallel()
+	p := newMaTestPlayer(t, nil)
+	pl := maPlayingPlayer() // player top: 42.5s @ 1700000000
+
+	p.applyMaState(pl, &ma.PlayerQueue{QueueID: "queue-2", Items: 1, State: "playing"}, nil)
+
+	rs := p.state.remoteState
+	if rs.PositionAsOfTimestamp != 42500 || rs.Timestamp != 1700000000000 {
+		t.Errorf("player-top fallback: got %d/%d want 42500/1700000000000", rs.PositionAsOfTimestamp, rs.Timestamp)
+	}
+}
+
+// TestApplyMaIdleState_CurrentMediaPosition pins issue #46 (defect B): a
+// provider that pauses by freezing its queue position (sendspin) keeps the
+// paused position inside the STALE current_media object of an IDLE poll -
+// the synthesized paused state must take it over the last live observation.
+// Without the nested pair, the old carry-over of the last track position
+// holds (and no new MA fetch is added in this path).
+func TestApplyMaIdleState_CurrentMediaPosition(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nested current_media pair wins", func(t *testing.T) {
+		p := newMaTestPlayer(t, nil)
+		pl := maPlayingPlayer()
+		pl.PlaybackState = "idle" // media intentionally still set (stale)
+		cm := *pl.CurrentMedia
+		cm.ElapsedTime = new(float64(77.5))
+		cm.ElapsedTimeLastUpdated = new(float64(1700000200.75))
+		pl.CurrentMedia = &cm
+
+		p.applyMaState(pl, nil, nil) // idle poll -> applyMaIdleState
+
+		rs := p.state.remoteState
+		if rs == nil {
+			t.Fatal("idle poll must keep remoteState")
+		}
+		if !rs.IsPaused || rs.IsPlaying {
+			t.Errorf("idle state: %+v", rs)
+		}
+		if rs.PositionAsOfTimestamp != 77500 {
+			t.Errorf("position: got %d want 77500 (from the current_media pair)", rs.PositionAsOfTimestamp)
+		}
+		if rs.Timestamp != 1700000200750 {
+			t.Errorf("timestamp: got %d want 1700000200750", rs.Timestamp)
+		}
+	})
+
+	t.Run("no nested pair keeps the last observed position", func(t *testing.T) {
+		p := newMaTestPlayer(t, nil)
+		p.applyMaState(maPlayingPlayer(), nil, nil) // seed: 42.5s live observation
+		pl := maPlayingPlayer()
+		pl.PlaybackState = "idle"
+		p.applyMaState(pl, nil, nil)
+
+		rs := p.state.remoteState
+		if rs.PositionAsOfTimestamp != 42500 {
+			t.Errorf("carry-over: got %d want 42500 (last live observation)", rs.PositionAsOfTimestamp)
+		}
+	})
+}
+
 // TestApplyMaState_IdleKeepsSelection (issue #138, defects 1+2): live MA
 // players keep a non-null (stale) current_media after going idle, so
 // PlaybackState gates first. An idle poll of the selected player must NOT
@@ -524,12 +627,165 @@ func TestMaSelectPlayer(t *testing.T) {
 // TestMaControlTarget_Errors pins the control-path guards.
 func TestMaControlTarget_Errors(t *testing.T) {
 	t.Parallel()
-	if _, _, err := (newMaTestPlayer(t, nil)).maControlTarget(); !errors.Is(err, ErrBadRequest) {
+	if _, _, err := (newMaTestPlayer(t, nil)).maControlTarget(context.Background()); !errors.Is(err, ErrBadRequest) {
 		t.Errorf("unconfigured: want ErrBadRequest, got %v", err)
 	}
 	p := newMaTestPlayer(t, maTestSettings("http://h:8095", "ma"))
-	if _, _, err := p.maControlTarget(); !errors.Is(err, ErrBadRequest) {
+	if _, _, err := p.maControlTarget(context.Background()); !errors.Is(err, ErrBadRequest) {
 		t.Errorf("no selection: want ErrBadRequest, got %v", err)
+	}
+}
+
+// ---------- issue #48: MA default device fallback in the control target ----------
+
+// TestMaControlTarget_DefaultDevice pins issue #48: with no player selected
+// yet, a control command RETARGETS to the blob's "maDefaultDeviceId" when it
+// resolves via players/all (bare id, "group:<master>" or a synced id -> its
+// master) - a PLAIN re-target (no queue transfer) that persists the resolved
+// id. No default key, a wrong-typed value, an unknown/stale id or a failed
+// players/all all keep the legacy ErrBadRequest and persist nothing.
+func TestMaControlTarget_DefaultDevice(t *testing.T) {
+	t.Parallel()
+	routes := map[string]string{"players/all": maTestGroupPlayersJSON}
+
+	// def == "" omits the key entirely (old UI blobs never carry it).
+	defaultSettings := func(url, def string) []byte {
+		if def == "" {
+			return maTestSettings(url, "ma")
+		}
+		return []byte(fmt.Sprintf(`{"ma":{"url":%q,"token":"tok"},"playbackSource":"ma","maDefaultDeviceId":%q}`, url, def))
+	}
+
+	okTarget := func(t *testing.T, p *AppPlayer, want string) {
+		t.Helper()
+		client, id, err := p.maControlTarget(context.Background())
+		if err != nil {
+			t.Fatalf("maControlTarget: %v", err)
+		}
+		if client == nil || id != want {
+			t.Fatalf("target: got (%v, %q) want (client, %q)", client, id, want)
+		}
+		if p.maActivePlayerId != want {
+			t.Errorf("retarget must persist the selection, got %q", p.maActivePlayerId)
+		}
+	}
+
+	badRequest := func(t *testing.T, p *AppPlayer) {
+		t.Helper()
+		if _, _, err := p.maControlTarget(context.Background()); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("want ErrBadRequest, got %v", err)
+		}
+		if p.maActivePlayerId != "" {
+			t.Errorf("failed fallback must not persist a selection, got %q", p.maActivePlayerId)
+		}
+	}
+
+	t.Run("bare default id resolves and is persisted", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, defaultSettings(srv.URL, "solo-1"))
+		okTarget(t, p, "solo-1")
+		assertOnlyCommands(t, *envs, []string{"players/all"})
+	})
+
+	t.Run("group default resolves to the master", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, defaultSettings(srv.URL, "group:wiim_uuid:A"))
+		okTarget(t, p, "wiim_uuid:A")
+		assertOnlyCommands(t, *envs, []string{"players/all"})
+	})
+
+	t.Run("synced default resolves to its master", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, defaultSettings(srv.URL, "wiim_uuid:B"))
+		okTarget(t, p, "wiim_uuid:A")
+		assertOnlyCommands(t, *envs, []string{"players/all"})
+	})
+
+	t.Run("stale default id keeps the bad request", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, defaultSettings(srv.URL, "does-not-exist"))
+		badRequest(t, p)
+		assertOnlyCommands(t, *envs, []string{"players/all"})
+	})
+
+	t.Run("no default key keeps the bad request", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		p := newMaTestPlayer(t, maTestSettings(srv.URL, "ma"))
+		badRequest(t, p)
+		assertOnlyCommands(t, *envs, nil) // no players/all may be sent at all
+	})
+
+	t.Run("wrong-typed default keeps the bad request", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, routes)
+		blob := []byte(fmt.Sprintf(`{"ma":{"url":%q,"token":"tok"},"playbackSource":"ma","maDefaultDeviceId":123}`, srv.URL))
+		p := newMaTestPlayer(t, blob)
+		badRequest(t, p)
+		assertOnlyCommands(t, *envs, nil) // the reader rejects non-strings without a lookup
+	})
+
+	t.Run("players/all failure keeps the bad request", func(t *testing.T) {
+		srv, envs := newMaRecordingServer(t, nil) // unrouted -> 500
+		p := newMaTestPlayer(t, defaultSettings(srv.URL, "solo-1"))
+		badRequest(t, p)
+		assertOnlyCommands(t, *envs, []string{"players/all"})
+	})
+}
+
+// ---------- issue #47: track id extraction for Music Assistant URIs ----------
+
+// TestTrackIdFromTrackURI pins the observer-status track-id rule (issue #47):
+// the legacy three-part Spotify Connect form keeps its behavior for ANY
+// scheme; Music Assistant media URIs yield the id only for the "track" domain
+// - non-track domains (episodes, local files, streams) stay "".
+func TestTrackIdFromTrackURI(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ in, want string }{
+		{"spotify:track:abc", "abc"},         // legacy 3-part form unchanged
+		{"spotify:album:def", "def"},         // any scheme: unchanged behavior
+		{"spotify:track:abc:def", "abc:def"}, // third part keeps remaining colons
+		{"spotify--yofvZfhZ://track/4ml1Eq4wmcdfN0Q6pNEly7", "4ml1Eq4wmcdfN0Q6pNEly7"}, // MA track URI (issue #47)
+		{"spotify://track/abc", "abc"},   // MA URI without instance suffix
+		{"local://episode/xyz", ""},      // non-track domain: out of scope
+		{"spotify--x://stream/live", ""}, // streams: out of scope
+		{"spotify--x://track/", ""},      // track domain without id
+		{"garbage", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := trackIdFromTrackURI(c.in); got != c.want {
+			t.Errorf("trackIdFromTrackURI(%q): got %q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestObserverStatus_MaTrackId pins issue #47 at the request level: an MA-mode
+// RemoteState with a provider track URI must yield a NON-EMPTY track_id plus
+// the matching lyrics_url - the old 3-part split parsed exactly zero MA URIs,
+// leaving lyrics dead in Music Assistant mode.
+func TestObserverStatus_MaTrackId(t *testing.T) {
+	t.Parallel()
+	p := newMaTestPlayer(t, nil)
+	p.state.remoteState = &RemoteState{
+		DeviceId:   "wiim_uuid:A",
+		DeviceName: "WiiM Wohnzimmer",
+		DeviceType: maDeviceType,
+		TrackUri:   "spotify--yofvZfhZ://track/4ml1Eq4wmcdfN0Q6pNEly7",
+		TrackName:  "Glide",
+	}
+
+	resp, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeObserverStatus})
+	if err != nil {
+		t.Fatalf("handleApiRequest: %v", err)
+	}
+	m, ok := resp.(map[string]any)
+	if !ok {
+		t.Fatalf("observer status must be a map: %T", resp)
+	}
+	if m["track_id"] != "4ml1Eq4wmcdfN0Q6pNEly7" {
+		t.Errorf("track_id: got %v want 4ml1Eq4wmcdfN0Q6pNEly7", m["track_id"])
+	}
+	if m["lyrics_url"] != "/lyrics/4ml1Eq4wmcdfN0Q6pNEly7" {
+		t.Errorf("lyrics_url: got %v want /lyrics/4ml1Eq4wmcdfN0Q6pNEly7", m["lyrics_url"])
 	}
 }
 
